@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.2.0
+// @version         1.2.1
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -35,10 +35,13 @@ media, downloads, clipboard, battery, and more.
     rates, and disk read, write and combined speeds.
 - Optional game overlay with FPS/CPU/RAM/GPU/disk cards.
 
-CPU temperature is read from the ACPI thermal zones exposed by the firmware
-(root\WMI — MSAcpi_ThermalZoneTemperature) and averaged across all zones. Some
-machines don't expose a CPU thermal zone (or gate it behind elevation), in
-which case "N/A" is shown.
+CPU temperature is read from the ACPI thermal zones exposed by the firmware,
+averaged across all zones. The mod first tries the "Thermal Zone Information"
+performance counters (no elevation needed), then falls back to the root\WMI
+MSAcpi_ThermalZoneTemperature class (often requires elevation). If the
+firmware exposes no thermal zone at all — common on desktop boards, whose CPU
+core sensors are only reachable through vendor kernel drivers — "N/A" is
+shown; that is a platform limitation, not a mod bug.
 */
 // ==/WindhawkModReadme==
 
@@ -2119,6 +2122,8 @@ static PDH_HCOUNTER g_gpuDedicatedCounter = NULL;
 static PDH_HCOUNTER g_gpuSharedCounter = NULL;
 static PDH_HCOUNTER g_diskReadCounter = NULL;
 static PDH_HCOUNTER g_diskWriteCounter = NULL;
+static PDH_HCOUNTER g_thermalHiPrecCounter = NULL;
+static PDH_HCOUNTER g_thermalTempCounter = NULL;
 
 static void InitPdhQuery() {
     if (g_pdhQuery == NULL) {
@@ -2128,6 +2133,12 @@ static void InitPdhQuery() {
             PdhAddEnglishCounterW(g_pdhQuery, L"\\GPU Adapter Memory(*)\\Shared Usage", 0, &g_gpuSharedCounter);
             PdhAddEnglishCounterW(g_pdhQuery, L"\\PhysicalDisk(_Total)\\Disk Read Bytes/sec", 0, &g_diskReadCounter);
             PdhAddEnglishCounterW(g_pdhQuery, L"\\PhysicalDisk(_Total)\\Disk Write Bytes/sec", 0, &g_diskWriteCounter);
+            // ACPI thermal zones via performance counters: readable without
+            // elevation, unlike the root\WMI MSAcpi class. "High Precision
+            // Temperature" is tenths of Kelvin (newer builds), "Temperature"
+            // whole Kelvin.
+            PdhAddEnglishCounterW(g_pdhQuery, L"\\Thermal Zone Information(*)\\High Precision Temperature", 0, &g_thermalHiPrecCounter);
+            PdhAddEnglishCounterW(g_pdhQuery, L"\\Thermal Zone Information(*)\\Temperature", 0, &g_thermalTempCounter);
             PdhCollectQueryData(g_pdhQuery);
         }
     }
@@ -2266,12 +2277,69 @@ static void UpdateNetworkRates(SystemSnapshot* next) {
     s_prevSampleTime = now;
 }
 
-// Average of all ACPI thermal zones (root\WMI - MSAcpi_ThermalZoneTemperature,
-// reported in tenths of Kelvin). Many consumer boards expose no CPU zone, or
-// gate the class behind elevation; a false return simply means "no data".
+// Average of the ACPI thermal zones exposed through the "Thermal Zone
+// Information" performance counters. Works without elevation whenever the
+// firmware exposes any zone at all. Returns false when no zone reports a
+// plausible value.
+static bool ReadPdhThermalZoneCelsius(float* celsius) {
+    struct Source {
+        PDH_HCOUNTER counter;
+        double divisor;  // counter units per Kelvin
+    };
+    const Source sources[] = {
+        {g_thermalHiPrecCounter, 10.0},
+        {g_thermalTempCounter, 1.0},
+    };
+
+    for (const Source& source : sources) {
+        if (!source.counter) {
+            continue;
+        }
+
+        DWORD bufferSize = 0;
+        DWORD itemCount = 0;
+        PdhGetFormattedCounterArrayW(source.counter, PDH_FMT_DOUBLE, &bufferSize, &itemCount, NULL);
+        if (bufferSize == 0) {
+            continue;
+        }
+
+        std::vector<BYTE> buffer(bufferSize);
+        PDH_FMT_COUNTERVALUE_ITEM_W* items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buffer.data());
+        if (PdhGetFormattedCounterArrayW(source.counter, PDH_FMT_DOUBLE, &bufferSize, &itemCount, items) != ERROR_SUCCESS) {
+            continue;
+        }
+
+        double sum = 0.0;
+        int zoneCount = 0;
+        for (DWORD i = 0; i < itemCount; ++i) {
+            const double c = items[i].FmtValue.doubleValue / source.divisor - 273.15;
+            // Some zones report 0 K or other filler values; keep only
+            // physically plausible readings.
+            if (c > -20.0 && c < 150.0) {
+                sum += c;
+                ++zoneCount;
+            }
+        }
+        if (zoneCount > 0) {
+            *celsius = static_cast<float>(sum / zoneCount);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Average of all ACPI thermal zones. Tries the unelevated performance
+// counters first, then falls back to root\WMI MSAcpi_ThermalZoneTemperature
+// (tenths of Kelvin; often requires elevation). Many desktop boards expose
+// no CPU zone at all; a false return simply means "no data" and the UI
+// shows N/A.
 static bool QueryCpuTemperature(float* celsius) {
     if (!celsius) {
         return false;
+    }
+
+    if (ReadPdhThermalZoneCelsius(celsius)) {
+        return true;
     }
 
     static ComPtr<IWbemServices> s_services;
