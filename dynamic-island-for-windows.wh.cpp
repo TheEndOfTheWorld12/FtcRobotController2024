@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.6.0
+// @version         1.6.1
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -47,6 +47,11 @@ publishes no equivalent of the ACPI thermal zones for GPUs: NVML for NVIDIA
 cards, ADL for AMD, and failing those the sensors LibreHardwareMonitor or
 OpenHardwareMonitor publish over WMI when either is running. Intel graphics
 expose nothing comparable, so those machines show "N/A".
+
+On NVIDIA cards NVML also supplies the dedicated VRAM figures directly,
+which is more dependable than pairing a performance counter with a display
+adapter; the counters remain the source everywhere else and for shared
+memory.
 
 CPU temperature is read from the ACPI thermal zones exposed by the firmware,
 averaged across all zones. The mod first tries the "Thermal Zone Information"
@@ -2764,63 +2769,112 @@ static bool QueryCpuTemperature(float* celsius) {
 // LoadLibrary/GetProcAddress so the mod still builds and runs on machines
 // where none of them exist.
 
-// NVIDIA, through NVML (ships with the driver as nvml.dll).
-static bool QueryGpuTemperatureNvml(float* celsius) {
-    using nvmlInit_t = int(*)();
-    using nvmlDeviceGetHandleByIndex_t = int(*)(unsigned int, void**);
-    using nvmlDeviceGetTemperature_t = int(*)(void*, int, unsigned int*);
+// NVIDIA, through NVML (ships with the driver as nvml.dll). NVML reports the
+// card's own sensors and memory directly, so it is both the temperature
+// source and — where present — the authoritative dedicated-VRAM source.
+struct NvmlFunctions {
+    int (*getHandleByIndex)(unsigned int, void**) = nullptr;
+    int (*getTemperature)(void*, int, unsigned int*) = nullptr;
+    int (*getMemoryInfo)(void*, void*) = nullptr;
+};
 
-    static bool s_tried = false;
-    static nvmlDeviceGetHandleByIndex_t s_getHandle = nullptr;
-    static nvmlDeviceGetTemperature_t s_getTemperature = nullptr;
+// nvmlMemory_t as declared by NVML v1: three 64-bit byte counts.
+struct NvmlMemory {
+    unsigned long long total;
+    unsigned long long free;
+    unsigned long long used;
+};
 
-    if (!s_tried) {
-        s_tried = true;
+static const NvmlFunctions& GetNvml() {
+    static NvmlFunctions functions;
+    static bool tried = false;
+
+    if (!tried) {
+        tried = true;
         HMODULE nvml = LoadLibraryW(L"nvml.dll");
         if (!nvml) {
             nvml = LoadLibraryW(
                 L"C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvml.dll");
         }
         if (nvml) {
+            using nvmlInit_t = int(*)();
             auto init = reinterpret_cast<nvmlInit_t>(GetProcAddress(nvml, "nvmlInit_v2"));
             if (!init) {
                 init = reinterpret_cast<nvmlInit_t>(GetProcAddress(nvml, "nvmlInit"));
             }
-            auto getHandle = reinterpret_cast<nvmlDeviceGetHandleByIndex_t>(
+
+            auto getHandle = reinterpret_cast<int (*)(unsigned int, void**)>(
                 GetProcAddress(nvml, "nvmlDeviceGetHandleByIndex_v2"));
             if (!getHandle) {
-                getHandle = reinterpret_cast<nvmlDeviceGetHandleByIndex_t>(
+                getHandle = reinterpret_cast<int (*)(unsigned int, void**)>(
                     GetProcAddress(nvml, "nvmlDeviceGetHandleByIndex"));
             }
-            auto getTemperature = reinterpret_cast<nvmlDeviceGetTemperature_t>(
-                GetProcAddress(nvml, "nvmlDeviceGetTemperature"));
 
-            if (init && getHandle && getTemperature && init() == 0) {
-                s_getHandle = getHandle;
-                s_getTemperature = getTemperature;
-                Wh_Log(L"NVML available for GPU temperature.");
+            auto getTemperature = reinterpret_cast<int (*)(void*, int, unsigned int*)>(
+                GetProcAddress(nvml, "nvmlDeviceGetTemperature"));
+            auto getMemory = reinterpret_cast<int (*)(void*, void*)>(
+                GetProcAddress(nvml, "nvmlDeviceGetMemoryInfo"));
+
+            if (init && getHandle && init() == 0) {
+                functions.getHandleByIndex = getHandle;
+                functions.getTemperature = getTemperature;
+                functions.getMemoryInfo = getMemory;
+                Wh_Log(L"NVML ready (temperature=%d, memory=%d).",
+                       getTemperature ? 1 : 0, getMemory ? 1 : 0);
             } else {
                 FreeLibrary(nvml);
             }
         }
     }
 
-    if (!s_getHandle || !s_getTemperature) {
+    return functions;
+}
+
+// Handle for the first NVIDIA device, or null when NVML is unavailable.
+static void* NvmlPrimaryDevice() {
+    const NvmlFunctions& nvml = GetNvml();
+    if (!nvml.getHandleByIndex) {
+        return nullptr;
+    }
+    void* device = nullptr;
+    if (nvml.getHandleByIndex(0, &device) != 0) {
+        return nullptr;
+    }
+    return device;
+}
+
+static bool QueryGpuTemperatureNvml(float* celsius) {
+    const NvmlFunctions& nvml = GetNvml();
+    void* device = NvmlPrimaryDevice();
+    if (!device || !nvml.getTemperature) {
         return false;
     }
 
-    void* device = nullptr;
-    if (s_getHandle(0, &device) != 0 || !device) {
-        return false;
-    }
     unsigned int temperature = 0;
-    if (s_getTemperature(device, 0 /* NVML_TEMPERATURE_GPU */, &temperature) != 0) {
+    if (nvml.getTemperature(device, 0 /* NVML_TEMPERATURE_GPU */, &temperature) != 0) {
         return false;
     }
     if (temperature == 0 || temperature > 150) {
         return false;
     }
     *celsius = static_cast<float>(temperature);
+    return true;
+}
+
+// Exact dedicated VRAM for the NVIDIA card, in bytes.
+static bool QueryNvmlDedicatedMemory(double* usedBytes, double* totalBytes) {
+    const NvmlFunctions& nvml = GetNvml();
+    void* device = NvmlPrimaryDevice();
+    if (!device || !nvml.getMemoryInfo) {
+        return false;
+    }
+
+    NvmlMemory memory = {};
+    if (nvml.getMemoryInfo(device, &memory) != 0 || memory.total == 0) {
+        return false;
+    }
+    *usedBytes = static_cast<double>(memory.used);
+    *totalBytes = static_cast<double>(memory.total);
     return true;
 }
 
@@ -3161,6 +3215,17 @@ void UpdateSystemSnapshot() {
                 ? ClampInt(static_cast<int>(
                       dedicatedUsed / (next.vramTotalGB * kBytesPerGB) * 100.0 + 0.5), 0, 100)
                 : -1;
+
+        // An NVIDIA card reports its own memory exactly, with no adapter
+        // matching required, so that reading wins when NVML is present.
+        double nvmlUsed = 0.0;
+        double nvmlTotal = 0.0;
+        if (QueryNvmlDedicatedMemory(&nvmlUsed, &nvmlTotal)) {
+            next.vramUsedGB = static_cast<float>(nvmlUsed / kBytesPerGB);
+            next.vramTotalGB = static_cast<float>(nvmlTotal / kBytesPerGB);
+            next.vramPercent =
+                ClampInt(static_cast<int>(nvmlUsed / nvmlTotal * 100.0 + 0.5), 0, 100);
+        }
 
         const float sharedUsedGB = static_cast<float>(sharedUsed / kBytesPerGB);
         next.sharedVramUsedGB = sharedUsedGB;
