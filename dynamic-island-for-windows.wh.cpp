@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.4.1
+// @version         1.4.2
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -34,7 +34,7 @@ media, downloads, clipboard, battery, and more.
   - **Network & Disk** — system-wide upload, download and combined transfer
     rates, and disk read, write and combined speeds.
 
-  Flip between pages with the up/down buttons on the right edge of the
+  Flip between pages with the bars along the top and bottom edges of the
   expanded pill, or by scrolling the wheel over it.
 - Optional game overlay with FPS/CPU/RAM/GPU/disk cards, toggled from the
   context menu or with a configurable hotkey (default Ctrl+Alt+G). While the
@@ -185,6 +185,7 @@ shown; that is a platform limitation, not a mod bug.
 #include <cstdint>
 #include <cwchar>
 #include <cstring>
+#include <initializer_list>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -227,15 +228,18 @@ constexpr int kMediaTabCount = kIdleTabCount + 1;
 // Page up/down buttons, centred horizontally at the top and bottom edges of
 // the expanded pill. The renderer and the click hit-test share these so they
 // always agree. The position dots stay on the right edge.
-constexpr float kPageNavButtonRadius = 10.0f;
-constexpr float kPageNavEdgeInset = 13.0f;
+// Each page control is a full-width bar hugging the pill's top or bottom
+// edge, so anywhere along that edge is clickable.
+constexpr float kPageNavStripHeight = 20.0f;
+constexpr float kPageNavStripInset = 10.0f;   // from the pill's left/right edge
+constexpr float kPageNavStripMargin = 2.0f;   // from the pill's top/bottom edge
 constexpr float kPageDotsRightInset = 10.0f;
 // The pill only shows the buttons once it has expanded past this height.
 constexpr float kExpandedPillHeight = 100.0f;
 
-// Vertical distance from the pill's centre to each button.
-float PageNavButtonOffset(float halfHeight) {
-    return std::max(halfHeight - kPageNavEdgeInset, 0.0f);
+// Vertical centre of a page control, measured from the pill's centre.
+float PageNavStripOffset(float halfHeight) {
+    return std::max(halfHeight - kPageNavStripMargin - kPageNavStripHeight * 0.5f, 0.0f);
 }
 
 enum class IslandKind {
@@ -2312,6 +2316,10 @@ static PDH_HCOUNTER g_gpuDedicatedCounter = NULL;
 static PDH_HCOUNTER g_gpuSharedCounter = NULL;
 static PDH_HCOUNTER g_gpuProcDedicatedCounter = NULL;
 static PDH_HCOUNTER g_gpuProcSharedCounter = NULL;
+static PDH_HCOUNTER g_gpuLocalCounter = NULL;
+static PDH_HCOUNTER g_gpuNonLocalCounter = NULL;
+static PDH_HCOUNTER g_gpuProcLocalCounter = NULL;
+static PDH_HCOUNTER g_gpuProcNonLocalCounter = NULL;
 static PDH_HCOUNTER g_diskReadCounter = NULL;
 static PDH_HCOUNTER g_diskWriteCounter = NULL;
 static PDH_HCOUNTER g_thermalHiPrecCounter = NULL;
@@ -2328,10 +2336,16 @@ static void InitPdhQuery() {
             PdhAddEnglishCounterW(g_pdhQuery, L"\\Processor Information(_Total)\\% Processor Utility", 0, &g_cpuUtilityCounter);
             PdhAddEnglishCounterW(g_pdhQuery, L"\\GPU Adapter Memory(*)\\Dedicated Usage", 0, &g_gpuDedicatedCounter);
             PdhAddEnglishCounterW(g_pdhQuery, L"\\GPU Adapter Memory(*)\\Shared Usage", 0, &g_gpuSharedCounter);
-            // Per-process equivalents, summed per adapter when the adapter-wide
-            // set reports nothing on this machine.
+            // Drivers vary in which of these they populate, so every source is
+            // registered and the first one that reports bytes is used.
+            // "Local" is on-card memory, "Non Local" is system memory the GPU
+            // borrows — the same split as dedicated vs shared.
+            PdhAddEnglishCounterW(g_pdhQuery, L"\\GPU Local Adapter Memory(*)\\Local Usage", 0, &g_gpuLocalCounter);
+            PdhAddEnglishCounterW(g_pdhQuery, L"\\GPU Non Local Adapter Memory(*)\\Non Local Usage", 0, &g_gpuNonLocalCounter);
             PdhAddEnglishCounterW(g_pdhQuery, L"\\GPU Process Memory(*)\\Dedicated Usage", 0, &g_gpuProcDedicatedCounter);
             PdhAddEnglishCounterW(g_pdhQuery, L"\\GPU Process Memory(*)\\Shared Usage", 0, &g_gpuProcSharedCounter);
+            PdhAddEnglishCounterW(g_pdhQuery, L"\\GPU Process Memory(*)\\Local Usage", 0, &g_gpuProcLocalCounter);
+            PdhAddEnglishCounterW(g_pdhQuery, L"\\GPU Process Memory(*)\\Non Local Usage", 0, &g_gpuProcNonLocalCounter);
             PdhAddEnglishCounterW(g_pdhQuery, L"\\PhysicalDisk(_Total)\\Disk Read Bytes/sec", 0, &g_diskReadCounter);
             PdhAddEnglishCounterW(g_pdhQuery, L"\\PhysicalDisk(_Total)\\Disk Write Bytes/sec", 0, &g_diskWriteCounter);
             // ACPI thermal zones via performance counters: readable without
@@ -2779,22 +2793,26 @@ void UpdateSystemSnapshot() {
             }
             return total;
         };
-        auto readGpuMemory = [&](PDH_HCOUNTER adapterCounter, PDH_HCOUNTER processCounter,
+        auto readGpuMemory = [&](std::initializer_list<PDH_HCOUNTER> sources,
                                  std::unordered_map<std::wstring, double>* byLuid) {
-            byLuid->clear();
-            if (SumGpuMemoryByAdapter(adapterCounter, byLuid) && totalBytes(*byLuid) > 0.0) {
-                return true;
+            for (PDH_HCOUNTER source : sources) {
+                byLuid->clear();
+                if (SumGpuMemoryByAdapter(source, byLuid) && totalBytes(*byLuid) > 0.0) {
+                    return true;
+                }
             }
             byLuid->clear();
-            return SumGpuMemoryByAdapter(processCounter, byLuid) && totalBytes(*byLuid) > 0.0;
+            return false;
         };
 
         std::unordered_map<std::wstring, double> dedicatedByLuid;
         std::unordered_map<std::wstring, double> sharedByLuid;
-        const bool haveDedicated =
-            readGpuMemory(g_gpuDedicatedCounter, g_gpuProcDedicatedCounter, &dedicatedByLuid);
-        const bool haveShared =
-            readGpuMemory(g_gpuSharedCounter, g_gpuProcSharedCounter, &sharedByLuid);
+        const bool haveDedicated = readGpuMemory({g_gpuDedicatedCounter, g_gpuLocalCounter,
+                                                  g_gpuProcDedicatedCounter, g_gpuProcLocalCounter},
+                                                 &dedicatedByLuid);
+        const bool haveShared = readGpuMemory({g_gpuSharedCounter, g_gpuNonLocalCounter,
+                                               g_gpuProcSharedCounter, g_gpuProcNonLocalCounter},
+                                              &sharedByLuid);
 
         std::wstring activeLuid;
         double dedicatedUsed = 0.0;
@@ -4414,13 +4432,13 @@ class Renderer {
 
         mutedBrush_->SetOpacity(0.45f);
         target_->DrawTextW(L"CPU  &  MEMORY", 14, smallTextFormat_.Get(),
-                           D2D1::RectF(left, rect.top + 12.0f, right, rect.top + 28.0f),
+                           D2D1::RectF(left, rect.top + 24.0f, right, rect.top + 40.0f),
                            mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
         wchar_t buf[96] = {};
 
         swprintf_s(buf, L"%d%%", state.system.cpuPercent);
-        DrawStatRow(left, right, rect.top + 34.0f, L"CPU Usage", buf,
+        DrawStatRow(left, right, rect.top + 44.0f, L"CPU Usage", buf,
                     state.system.cpuPercent / 100.0f, D2D1::ColorF(0.0f, 0.82f, 1.0f, 1.0f));
 
         std::wstring temp;
@@ -4432,17 +4450,17 @@ class Renderer {
         } else {
             temp = L"N/A";
         }
-        DrawStatRow(left, right, rect.top + 68.0f, L"CPU Temp", temp, -1.0f,
+        DrawStatRow(left, right, rect.top + 74.0f, L"CPU Temp", temp, -1.0f,
                     D2D1::ColorF(0, 0, 0, 0));
 
         swprintf_s(buf, L"%d%%  \u00b7  %.1f / %.1f GB", state.system.memoryPercent,
                    state.system.ramUsedGB, state.system.ramTotalGB);
-        DrawStatRow(left, right, rect.top + 102.0f, L"RAM", buf,
+        DrawStatRow(left, right, rect.top + 104.0f, L"RAM", buf,
                     state.system.memoryPercent / 100.0f, D2D1::ColorF(0.83f, 0.0f, 1.0f, 1.0f));
 
         swprintf_s(buf, L"%d%%  \u00b7  %.1f / %.1f GB", state.system.commitPercent,
                    state.system.commitUsedGB, state.system.commitTotalGB);
-        DrawStatRow(left, right, rect.top + 136.0f, L"Committed", buf,
+        DrawStatRow(left, right, rect.top + 134.0f, L"Committed", buf,
                     state.system.commitPercent / 100.0f, D2D1::ColorF(1.0f, 0.48f, 0.0f, 1.0f));
     }
 
@@ -4453,7 +4471,7 @@ class Renderer {
 
         mutedBrush_->SetOpacity(0.45f);
         target_->DrawTextW(L"GPU  &  VRAM", 12, smallTextFormat_.Get(),
-                           D2D1::RectF(left, rect.top + 12.0f, right, rect.top + 28.0f),
+                           D2D1::RectF(left, rect.top + 24.0f, right, rect.top + 40.0f),
                            mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
         wchar_t buf[96] = {};
@@ -4467,7 +4485,7 @@ class Renderer {
         } else {
             gpuValue = L"--";
         }
-        DrawStatRow(left, right, rect.top + 44.0f, L"GPU Usage", gpuValue, gpuFill,
+        DrawStatRow(left, right, rect.top + 52.0f, L"GPU Usage", gpuValue, gpuFill,
                     D2D1::ColorF(0.0f, 1.0f, 0.60f, 1.0f));
 
         std::wstring vramValue;
@@ -4477,10 +4495,13 @@ class Renderer {
                        state.system.vramUsedGB, state.system.vramTotalGB);
             vramValue = buf;
             vramFill = state.system.vramPercent / 100.0f;
+        } else if (state.system.vramUsedGB > 0.0f) {
+            swprintf_s(buf, L"%.1f GB used", state.system.vramUsedGB);
+            vramValue = buf;
         } else {
             vramValue = L"N/A";
         }
-        DrawStatRow(left, right, rect.top + 90.0f, L"Dedicated VRAM", vramValue, vramFill,
+        DrawStatRow(left, right, rect.top + 92.0f, L"Dedicated VRAM", vramValue, vramFill,
                     D2D1::ColorF(0.0f, 0.82f, 1.0f, 1.0f));
 
         std::wstring sharedValue;
@@ -4490,10 +4511,13 @@ class Renderer {
                        state.system.sharedVramUsedGB, state.system.sharedVramTotalGB);
             sharedValue = buf;
             sharedFill = state.system.sharedVramPercent / 100.0f;
+        } else if (state.system.sharedVramUsedGB > 0.0f) {
+            swprintf_s(buf, L"%.1f GB used", state.system.sharedVramUsedGB);
+            sharedValue = buf;
         } else {
             sharedValue = L"N/A";
         }
-        DrawStatRow(left, right, rect.top + 136.0f, L"Shared VRAM", sharedValue, sharedFill,
+        DrawStatRow(left, right, rect.top + 132.0f, L"Shared VRAM", sharedValue, sharedFill,
                     D2D1::ColorF(0.83f, 0.0f, 1.0f, 1.0f));
     }
 
@@ -4508,11 +4532,11 @@ class Renderer {
 
         mutedBrush_->SetOpacity(0.45f);
         target_->DrawTextW(L"NETWORK", 7, smallTextFormat_.Get(),
-                           D2D1::RectF(left, rect.top + 14.0f, leftColR, rect.top + 30.0f),
+                           D2D1::RectF(left, rect.top + 24.0f, leftColR, rect.top + 40.0f),
                            mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
         mutedBrush_->SetOpacity(0.45f);
         target_->DrawTextW(L"DISK", 4, smallTextFormat_.Get(),
-                           D2D1::RectF(rightColL, rect.top + 14.0f, right, rect.top + 30.0f),
+                           D2D1::RectF(rightColL, rect.top + 24.0f, right, rect.top + 40.0f),
                            mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
         ComPtr<ID2D1SolidColorBrush> divider;
@@ -4520,68 +4544,64 @@ class Renderer {
         if (divider) {
             const float dividerX = leftColR + colGap * 0.5f;
             target_->FillRoundedRectangle(
-                D2D1::RoundedRect(D2D1::RectF(dividerX - 0.75f, rect.top + 36.0f,
-                                              dividerX + 0.75f, rect.bottom - 26.0f),
+                D2D1::RoundedRect(D2D1::RectF(dividerX - 0.75f, rect.top + 46.0f,
+                                              dividerX + 0.75f, rect.bottom - 30.0f),
                                   0.5f, 0.5f), divider.Get());
         }
 
         const double netCombined = state.system.netUpBps + state.system.netDownBps;
         const double diskCombined = state.system.diskReadBps + state.system.diskWriteBps;
 
-        DrawStatRow(left, leftColR, rect.top + 44.0f, L"Upload",
+        DrawStatRow(left, leftColR, rect.top + 50.0f, L"Upload",
                     FormatBytesPerSec(state.system.netUpBps), -1.0f, D2D1::ColorF(0, 0, 0, 0));
-        DrawStatRow(left, leftColR, rect.top + 82.0f, L"Download",
+        DrawStatRow(left, leftColR, rect.top + 86.0f, L"Download",
                     FormatBytesPerSec(state.system.netDownBps), -1.0f, D2D1::ColorF(0, 0, 0, 0));
-        DrawStatRow(left, leftColR, rect.top + 120.0f, L"Combined",
+        DrawStatRow(left, leftColR, rect.top + 122.0f, L"Combined",
                     FormatBytesPerSec(netCombined), -1.0f, D2D1::ColorF(0, 0, 0, 0));
 
-        DrawStatRow(rightColL, right, rect.top + 44.0f, L"Read",
+        DrawStatRow(rightColL, right, rect.top + 50.0f, L"Read",
                     FormatBytesPerSec(state.system.diskReadBps), -1.0f, D2D1::ColorF(0, 0, 0, 0));
-        DrawStatRow(rightColL, right, rect.top + 82.0f, L"Write",
+        DrawStatRow(rightColL, right, rect.top + 86.0f, L"Write",
                     FormatBytesPerSec(state.system.diskWriteBps), -1.0f, D2D1::ColorF(0, 0, 0, 0));
-        DrawStatRow(rightColL, right, rect.top + 120.0f, L"Combined",
+        DrawStatRow(rightColL, right, rect.top + 122.0f, L"Combined",
                     FormatBytesPerSec(diskCombined), -1.0f, D2D1::ColorF(0, 0, 0, 0));
     }
 
-    // A chevron button; dimmed when there is no page in that direction.
-    void DrawPageNavButton(D2D1_POINT_2F center, bool up, bool enabled) {
+    // A full-width bar along one edge of the pill with a chevron in the
+    // middle; dimmed when there is no page in that direction.
+    void DrawPageNavStrip(D2D1_RECT_F rect, bool up, bool enabled) {
+        const float halfStrip = kPageNavStripHeight * 0.5f;
+        const float cy = up ? rect.top + kPageNavStripMargin + halfStrip
+                            : rect.bottom - kPageNavStripMargin - halfStrip;
+        D2D1_RECT_F strip = D2D1::RectF(rect.left + kPageNavStripInset, cy - halfStrip,
+                                        rect.right - kPageNavStripInset, cy + halfStrip);
+
         ComPtr<ID2D1SolidColorBrush> bg;
         target_->CreateSolidColorBrush(
-            D2D1::ColorF(1, 1, 1, (enabled ? 0.10f : 0.04f) * settingsOpacity_), &bg);
+            D2D1::ColorF(1, 1, 1, (enabled ? 0.07f : 0.025f) * settingsOpacity_), &bg);
         if (bg) {
-            target_->FillEllipse(
-                D2D1::Ellipse(center, kPageNavButtonRadius, kPageNavButtonRadius), bg.Get());
+            target_->FillRoundedRectangle(D2D1::RoundedRect(strip, halfStrip, halfStrip),
+                                          bg.Get());
         }
 
-        ComPtr<ID2D1SolidColorBrush> rim;
-        target_->CreateSolidColorBrush(
-            D2D1::ColorF(1, 1, 1, (enabled ? 0.16f : 0.06f) * settingsOpacity_), &rim);
-        if (rim) {
-            target_->DrawEllipse(
-                D2D1::Ellipse(center, kPageNavButtonRadius, kPageNavButtonRadius), rim.Get(), 1.0f);
-        }
-
-        const float w = 3.8f;
-        const float h = 2.4f;
-        const float tipY = center.y + (up ? -h : h);
-        const float baseY = center.y + (up ? h : -h);
-        textBrush_->SetOpacity(enabled ? 0.92f : 0.28f);
-        target_->DrawLine(D2D1::Point2F(center.x - w, baseY), D2D1::Point2F(center.x, tipY),
-                          textBrush_.Get(), 1.7f);
-        target_->DrawLine(D2D1::Point2F(center.x, tipY), D2D1::Point2F(center.x + w, baseY),
-                          textBrush_.Get(), 1.7f);
+        const float cx = (strip.left + strip.right) * 0.5f;
+        const float w = 4.6f;
+        const float h = 2.8f;
+        const float tipY = cy + (up ? -h : h);
+        const float baseY = cy + (up ? h : -h);
+        textBrush_->SetOpacity(enabled ? 0.92f : 0.26f);
+        target_->DrawLine(D2D1::Point2F(cx - w, baseY), D2D1::Point2F(cx, tipY),
+                          textBrush_.Get(), 1.8f);
+        target_->DrawLine(D2D1::Point2F(cx, tipY), D2D1::Point2F(cx + w, baseY),
+                          textBrush_.Get(), 1.8f);
         textBrush_->SetOpacity(0.90f);
     }
 
-    // Page buttons at the top and bottom centre, with the position dots kept
-    // on the right edge (shifted clear of the privacy dots).
+    // Page controls along the top and bottom edges, with the position dots
+    // kept on the right edge (shifted clear of the privacy dots).
     void DrawPageNav(const SharedState& state, D2D1_RECT_F rect, int tab, int count) {
-        const float cx = (rect.left + rect.right) * 0.5f;
-        const float cy = (rect.top + rect.bottom) * 0.5f;
-        const float offset = PageNavButtonOffset((rect.bottom - rect.top) * 0.5f);
-
-        DrawPageNavButton(D2D1::Point2F(cx, cy - offset), true, tab > 0);
-        DrawPageNavButton(D2D1::Point2F(cx, cy + offset), false, tab < count - 1);
+        DrawPageNavStrip(rect, true, tab > 0);
+        DrawPageNavStrip(rect, false, tab < count - 1);
 
         ComPtr<ID2D1SolidColorBrush> activeDot, inactiveDot;
         target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.85f * settingsOpacity_), &activeDot);
@@ -4590,6 +4610,7 @@ class Renderer {
             return;
         }
 
+        const float cy = (rect.top + rect.bottom) * 0.5f;
         const float shiftX = PrivacyShiftX(state.system.micActive, state.system.cameraActive);
         const float dotX = rect.right - kPageDotsRightInset - shiftX;
         const float spacing = 8.0f;
@@ -6583,14 +6604,16 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 const float sizeScale = std::max(g_settings.sizeScale, 0.01f);
                 const float pillHeight = (height - kRenderPadY * 2.0f) / sizeScale;
                 if (pillHeight > kExpandedPillHeight) {
+                    const float pillHalfWidth =
+                        (width - kRenderPadX * 2.0f) / sizeScale * 0.5f;
                     const float unX = (xPos - width * 0.5f) / sizeScale;
                     const float unY = (yPos - height * 0.5f) / sizeScale;
-                    const float offset = PageNavButtonOffset(pillHeight * 0.5f);
-                    const float hitRadius = kPageNavButtonRadius + 4.0f;
+                    const float offset = PageNavStripOffset(pillHeight * 0.5f);
+                    const float halfStrip = kPageNavStripHeight * 0.5f;
 
-                    auto hitButton = [&](float buttonY) {
-                        const float dy = unY - buttonY;
-                        return unX * unX + dy * dy <= hitRadius * hitRadius;
+                    auto hitButton = [&](float stripY) {
+                        return std::fabs(unX) <= pillHalfWidth - kPageNavStripInset &&
+                               std::fabs(unY - stripY) <= halfStrip;
                     };
 
                     const int tabCount = mediaActive ? kMediaTabCount : kIdleTabCount;
