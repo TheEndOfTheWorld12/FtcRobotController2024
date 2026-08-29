@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.5.1
+// @version         1.6.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -28,9 +28,10 @@ media, downloads, clipboard, battery, and more.
     °C and °F), physical RAM usage (percent plus used/total GB) and commit
     charge (percent of memory committed by apps — backed by RAM or the page
     file — plus used/total GB).
-  - **GPU & VRAM** — GPU usage, dedicated VRAM usage (percent plus used/total
-    GB) and shared GPU memory usage (system RAM used as extra GPU memory:
-    percent plus used GB / total pool size in GB).
+  - **GPU & VRAM** — GPU usage, GPU temperature (°C and °F), dedicated VRAM
+    usage (percent plus used/total GB) and shared GPU memory usage (system
+    RAM used as extra GPU memory: percent plus used GB / total pool size in
+    GB).
   - **Network & Disk** — system-wide upload, download and combined transfer
     rates, and disk read, write and combined speeds.
 
@@ -40,6 +41,12 @@ media, downloads, clipboard, battery, and more.
   context menu or with a configurable hotkey (default Ctrl+Alt+G). While the
   overlay is on it acts as the pill's collapsed look — hovering or clicking
   still expands into the regular dashboard pages.
+
+GPU temperature comes from the graphics vendor's own library, since Windows
+publishes no equivalent of the ACPI thermal zones for GPUs: NVML for NVIDIA
+cards, ADL for AMD, and failing those the sensors LibreHardwareMonitor or
+OpenHardwareMonitor publish over WMI when either is running. Intel graphics
+expose nothing comparable, so those machines show "N/A".
 
 CPU temperature is read from the ACPI thermal zones exposed by the firmware,
 averaged across all zones. The mod first tries the "Thermal Zone Information"
@@ -184,6 +191,7 @@ shown; that is a platform limitation, not a mod bug.
 #include <cmath>
 #include <cstdint>
 #include <cwchar>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <mutex>
@@ -432,6 +440,8 @@ struct SystemSnapshot {
     // CPU temperature: average of all ACPI thermal zones.
     bool hasCpuTemp = false;
     float cpuTempC = 0.0f;
+    bool hasGpuTemp = false;
+    float gpuTempC = 0.0f;
 };
 
 // The privacy dots sit at the same right edge, so page controls shift left
@@ -2749,6 +2759,255 @@ static bool QueryCpuTemperature(float* celsius) {
 }
 
 
+// GPU temperature has no Windows-wide source the way CPU thermal zones do,
+// so each vendor's own library is asked in turn. Everything is resolved with
+// LoadLibrary/GetProcAddress so the mod still builds and runs on machines
+// where none of them exist.
+
+// NVIDIA, through NVML (ships with the driver as nvml.dll).
+static bool QueryGpuTemperatureNvml(float* celsius) {
+    using nvmlInit_t = int(*)();
+    using nvmlDeviceGetHandleByIndex_t = int(*)(unsigned int, void**);
+    using nvmlDeviceGetTemperature_t = int(*)(void*, int, unsigned int*);
+
+    static bool s_tried = false;
+    static nvmlDeviceGetHandleByIndex_t s_getHandle = nullptr;
+    static nvmlDeviceGetTemperature_t s_getTemperature = nullptr;
+
+    if (!s_tried) {
+        s_tried = true;
+        HMODULE nvml = LoadLibraryW(L"nvml.dll");
+        if (!nvml) {
+            nvml = LoadLibraryW(
+                L"C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvml.dll");
+        }
+        if (nvml) {
+            auto init = reinterpret_cast<nvmlInit_t>(GetProcAddress(nvml, "nvmlInit_v2"));
+            if (!init) {
+                init = reinterpret_cast<nvmlInit_t>(GetProcAddress(nvml, "nvmlInit"));
+            }
+            auto getHandle = reinterpret_cast<nvmlDeviceGetHandleByIndex_t>(
+                GetProcAddress(nvml, "nvmlDeviceGetHandleByIndex_v2"));
+            if (!getHandle) {
+                getHandle = reinterpret_cast<nvmlDeviceGetHandleByIndex_t>(
+                    GetProcAddress(nvml, "nvmlDeviceGetHandleByIndex"));
+            }
+            auto getTemperature = reinterpret_cast<nvmlDeviceGetTemperature_t>(
+                GetProcAddress(nvml, "nvmlDeviceGetTemperature"));
+
+            if (init && getHandle && getTemperature && init() == 0) {
+                s_getHandle = getHandle;
+                s_getTemperature = getTemperature;
+                Wh_Log(L"NVML available for GPU temperature.");
+            } else {
+                FreeLibrary(nvml);
+            }
+        }
+    }
+
+    if (!s_getHandle || !s_getTemperature) {
+        return false;
+    }
+
+    void* device = nullptr;
+    if (s_getHandle(0, &device) != 0 || !device) {
+        return false;
+    }
+    unsigned int temperature = 0;
+    if (s_getTemperature(device, 0 /* NVML_TEMPERATURE_GPU */, &temperature) != 0) {
+        return false;
+    }
+    if (temperature == 0 || temperature > 150) {
+        return false;
+    }
+    *celsius = static_cast<float>(temperature);
+    return true;
+}
+
+void* __stdcall AdlAllocCallback(int size) {
+    return size > 0 ? std::malloc(static_cast<size_t>(size)) : nullptr;
+}
+
+// AMD, through ADL (atiadlxx.dll). Adapter indices are probed directly so the
+// version-sensitive AdapterInfo layout never has to be declared here.
+static bool QueryGpuTemperatureAdl(float* celsius) {
+    using ADL2_Main_Control_Create_t = int(__stdcall*)(void* (__stdcall*)(int), int, void**);
+    using ADL2_Adapter_NumberOfAdapters_Get_t = int(__stdcall*)(void*, int*);
+    using ADL2_OverdriveN_Temperature_Get_t = int(__stdcall*)(void*, int, int, int*);
+    using ADL2_Overdrive6_Temperature_Get_t = int(__stdcall*)(void*, int, int*);
+
+    static bool s_tried = false;
+    static void* s_context = nullptr;
+    static int s_adapterCount = 0;
+    static ADL2_OverdriveN_Temperature_Get_t s_overdriveN = nullptr;
+    static ADL2_Overdrive6_Temperature_Get_t s_overdrive6 = nullptr;
+
+    if (!s_tried) {
+        s_tried = true;
+        HMODULE adl = LoadLibraryW(L"atiadlxx.dll");
+        if (!adl) {
+            adl = LoadLibraryW(L"atiadlxy.dll");
+        }
+        if (adl) {
+            auto create = reinterpret_cast<ADL2_Main_Control_Create_t>(
+                GetProcAddress(adl, "ADL2_Main_Control_Create"));
+            auto count = reinterpret_cast<ADL2_Adapter_NumberOfAdapters_Get_t>(
+                GetProcAddress(adl, "ADL2_Adapter_NumberOfAdapters_Get"));
+            s_overdriveN = reinterpret_cast<ADL2_OverdriveN_Temperature_Get_t>(
+                GetProcAddress(adl, "ADL2_OverdriveN_Temperature_Get"));
+            s_overdrive6 = reinterpret_cast<ADL2_Overdrive6_Temperature_Get_t>(
+                GetProcAddress(adl, "ADL2_Overdrive6_Temperature_Get"));
+
+            if (create && (s_overdriveN || s_overdrive6) &&
+                create(AdlAllocCallback, 1, &s_context) == 0 && s_context) {
+                if (!count || count(s_context, &s_adapterCount) != 0) {
+                    s_adapterCount = 0;
+                }
+                s_adapterCount = ClampInt(s_adapterCount, 0, 16);
+                Wh_Log(L"ADL available for GPU temperature (%d adapters).", s_adapterCount);
+            } else {
+                s_context = nullptr;
+                s_overdriveN = nullptr;
+                s_overdrive6 = nullptr;
+                FreeLibrary(adl);
+            }
+        }
+    }
+
+    if (!s_context) {
+        return false;
+    }
+
+    // Probe a few indices: the first adapter that answers wins.
+    const int probe = s_adapterCount > 0 ? s_adapterCount : 8;
+    for (int index = 0; index < probe; ++index) {
+        int milliCelsius = 0;
+        if (s_overdriveN &&
+            s_overdriveN(s_context, index, 1 /* core */, &milliCelsius) == 0 &&
+            milliCelsius > 0) {
+            const float value = milliCelsius / 1000.0f;
+            if (value > 0.0f && value < 150.0f) {
+                *celsius = value;
+                return true;
+            }
+        }
+        if (s_overdrive6 && s_overdrive6(s_context, index, &milliCelsius) == 0 &&
+            milliCelsius > 0) {
+            const float value = milliCelsius / 1000.0f;
+            if (value > 0.0f && value < 150.0f) {
+                *celsius = value;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Any vendor, if LibreHardwareMonitor or OpenHardwareMonitor is running: both
+// publish their sensors over WMI.
+static bool QueryGpuTemperatureHardwareMonitor(float* celsius) {
+    static bool s_connectFailed = false;
+    static ComPtr<IWbemServices> s_services;
+
+    if (s_connectFailed) {
+        return false;
+    }
+
+    if (!s_services) {
+        ComPtr<IWbemLocator> locator;
+        if (FAILED(CoCreateInstance(CLSID_WbemLocator, nullptr, CLSCTX_INPROC_SERVER,
+                                    IID_PPV_ARGS(&locator)))) {
+            s_connectFailed = true;
+            return false;
+        }
+
+        for (const wchar_t* ns : {L"ROOT\\LibreHardwareMonitor", L"ROOT\\OpenHardwareMonitor"}) {
+            BSTR nsName = SysAllocString(ns);
+            HRESULT hr = locator->ConnectServer(nsName, nullptr, nullptr, nullptr, 0, nullptr,
+                                                nullptr, s_services.GetAddressOf());
+            SysFreeString(nsName);
+            if (SUCCEEDED(hr) && s_services) {
+                CoSetProxyBlanket(s_services.Get(), RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE,
+                                  nullptr, RPC_C_AUTHN_LEVEL_CALL,
+                                  RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE);
+                Wh_Log(L"Reading GPU temperature from %s.", ns);
+                break;
+            }
+            s_services.Reset();
+        }
+
+        if (!s_services) {
+            s_connectFailed = true;
+            return false;
+        }
+    }
+
+    BSTR language = SysAllocString(L"WQL");
+    BSTR query = SysAllocString(
+        L"SELECT Identifier, Value FROM Sensor WHERE SensorType='Temperature'");
+    ComPtr<IEnumWbemClassObject> enumerator;
+    HRESULT hr = s_services->ExecQuery(
+        language, query, WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, nullptr,
+        &enumerator);
+    SysFreeString(language);
+    SysFreeString(query);
+    if (FAILED(hr) || !enumerator) {
+        return false;
+    }
+
+    for (;;) {
+        ComPtr<IWbemClassObject> object;
+        ULONG returned = 0;
+        if (enumerator->Next(500, 1, object.GetAddressOf(), &returned) != S_OK || !returned) {
+            break;
+        }
+
+        VARIANT identifier;
+        VariantInit(&identifier);
+        bool isGpu = false;
+        if (SUCCEEDED(object->Get(L"Identifier", 0, &identifier, nullptr, nullptr)) &&
+            identifier.vt == VT_BSTR && identifier.bstrVal) {
+            const std::wstring id = ToLowerCopy(identifier.bstrVal);
+            isGpu = id.find(L"gpu") != std::wstring::npos;
+        }
+        VariantClear(&identifier);
+        if (!isGpu) {
+            continue;
+        }
+
+        VARIANT value;
+        VariantInit(&value);
+        bool ok = false;
+        if (SUCCEEDED(object->Get(L"Value", 0, &value, nullptr, nullptr))) {
+            float reading = 0.0f;
+            if (value.vt == VT_R4) {
+                reading = value.fltVal;
+            } else if (value.vt == VT_R8) {
+                reading = static_cast<float>(value.dblVal);
+            } else if (value.vt == VT_I4) {
+                reading = static_cast<float>(value.lVal);
+            }
+            if (reading > 0.0f && reading < 150.0f) {
+                *celsius = reading;
+                ok = true;
+            }
+        }
+        VariantClear(&value);
+        if (ok) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool QueryGpuTemperature(float* celsius) {
+    if (!celsius) {
+        return false;
+    }
+    return QueryGpuTemperatureNvml(celsius) || QueryGpuTemperatureAdl(celsius) ||
+           QueryGpuTemperatureHardwareMonitor(celsius);
+}
+
 void UpdateSystemSnapshot() {
     SystemSnapshot next;
     {
@@ -3009,6 +3268,16 @@ void UpdateSystemSnapshot() {
     }
     next.hasCpuTemp = s_hasCpuTemp;
     next.cpuTempC = s_cpuTempC;
+
+    static double s_nextGpuTemperaturePoll = 0.0;
+    static bool s_hasGpuTemp = false;
+    static float s_gpuTempC = 0.0f;
+    if (tempNow >= s_nextGpuTemperaturePoll) {
+        s_hasGpuTemp = QueryGpuTemperature(&s_gpuTempC);
+        s_nextGpuTemperaturePoll = tempNow + 5.0;
+    }
+    next.hasGpuTemp = s_hasGpuTemp;
+    next.gpuTempC = s_gpuTempC;
 
     static ComPtr<IAudioEndpointVolume> s_volume;
     if (!s_volume) {
@@ -4525,8 +4794,19 @@ class Renderer {
         } else {
             gpuValue = L"--";
         }
-        DrawStatRow(left, right, rect.top + 62.0f, L"GPU Usage", gpuValue, gpuFill,
+        DrawStatRow(left, right, rect.top + 56.0f, L"GPU Usage", gpuValue, gpuFill,
                     D2D1::ColorF(0.0f, 1.0f, 0.60f, 1.0f));
+
+        std::wstring gpuTemp;
+        if (state.system.hasGpuTemp) {
+            swprintf_s(buf, L"%.1f\u00B0C  /  %.1f\u00B0F", state.system.gpuTempC,
+                       state.system.gpuTempC * 9.0f / 5.0f + 32.0f);
+            gpuTemp = buf;
+        } else {
+            gpuTemp = L"N/A";
+        }
+        DrawStatRow(left, right, rect.top + 86.0f, L"GPU Temp", gpuTemp, -1.0f,
+                    D2D1::ColorF(0, 0, 0, 0));
 
         std::wstring vramValue;
         float vramFill = -1.0f;
@@ -4541,7 +4821,7 @@ class Renderer {
         } else {
             vramValue = L"N/A";
         }
-        DrawStatRow(left, right, rect.top + 102.0f, L"Dedicated VRAM", vramValue, vramFill,
+        DrawStatRow(left, right, rect.top + 116.0f, L"Dedicated VRAM", vramValue, vramFill,
                     D2D1::ColorF(0.0f, 0.82f, 1.0f, 1.0f));
 
         std::wstring sharedValue;
@@ -4557,7 +4837,7 @@ class Renderer {
         } else {
             sharedValue = L"N/A";
         }
-        DrawStatRow(left, right, rect.top + 142.0f, L"Shared VRAM", sharedValue, sharedFill,
+        DrawStatRow(left, right, rect.top + 146.0f, L"Shared VRAM", sharedValue, sharedFill,
                     D2D1::ColorF(0.83f, 0.0f, 1.0f, 1.0f));
     }
 
@@ -7081,6 +7361,7 @@ DWORD WINAPI RenderThreadProc(void*) {
         static int prevVramPct = -2;
         static int prevSharedVramPct = -2;
         static float prevCpuTemp = -1000.0f;
+        static float prevGpuTemp = -1000.0f;
 
         if (snapshot.media.artGeneration != prevArtGen ||
             snapshot.media.sourceIconGeneration != prevSrcIconGen ||
@@ -7101,7 +7382,8 @@ DWORD WINAPI RenderThreadProc(void*) {
             snapshot.system.diskWriteBps != prevDiskWrite ||
             snapshot.system.vramPercent != prevVramPct ||
             snapshot.system.sharedVramPercent != prevSharedVramPct ||
-            snapshot.system.cpuTempC != prevCpuTemp) {
+            snapshot.system.cpuTempC != prevCpuTemp ||
+            snapshot.system.gpuTempC != prevGpuTemp) {
             needsRender = true;
             prevArtGen = snapshot.media.artGeneration;
             prevSrcIconGen = snapshot.media.sourceIconGeneration;
@@ -7123,6 +7405,7 @@ DWORD WINAPI RenderThreadProc(void*) {
             prevVramPct = snapshot.system.vramPercent;
             prevSharedVramPct = snapshot.system.sharedVramPercent;
             prevCpuTemp = snapshot.system.cpuTempC;
+            prevGpuTemp = snapshot.system.gpuTempC;
         }
 
         if (needsRender) {
