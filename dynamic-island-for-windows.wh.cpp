@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.4.2
+// @version         1.5.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -236,6 +236,17 @@ constexpr float kPageNavStripMargin = 2.0f;   // from the pill's top/bottom edge
 constexpr float kPageDotsRightInset = 10.0f;
 // The pill only shows the buttons once it has expanded past this height.
 constexpr float kExpandedPillHeight = 100.0f;
+// Height of the expanded pill, sized so page content clears both bars.
+constexpr float kExpandedPillContentHeight = 200.0f;
+// Clearance kept between page content and the bars.
+constexpr float kPageNavContentGap = 10.0f;
+// First and last y a page may draw content at.
+constexpr float kPageContentTop =
+    kPageNavStripMargin + kPageNavStripHeight + kPageNavContentGap;
+constexpr float kPageContentBottom =
+    kExpandedPillContentHeight - kPageNavStripMargin - kPageNavStripHeight - kPageNavContentGap;
+static_assert(kPageContentTop + 100.0f < kPageContentBottom,
+              "expanded pill is too short to hold a page between the nav bars");
 
 // Vertical centre of a page control, measured from the pill's centre.
 float PageNavStripOffset(float halfHeight) {
@@ -2852,21 +2863,39 @@ void UpdateSystemSnapshot() {
             }
         }
 
+        // A capacity smaller than the measured usage means the counters and
+        // the DXGI description are talking about different GPUs (common on
+        // hybrid graphics, where the matched adapter is the integrated one).
+        // Prefer an adapter that can actually hold the reading.
+        const float dedicatedUsedGB = static_cast<float>(dedicatedUsed / kBytesPerGB);
+        if (chosen && dedicatedUsedGB > chosen->dedicatedGB) {
+            const GpuAdapterInfo* roomier = chosen;
+            for (const GpuAdapterInfo& adapter : adapters) {
+                if (adapter.dedicatedGB > roomier->dedicatedGB) {
+                    roomier = &adapter;
+                }
+            }
+            chosen = roomier;
+        }
+
         if (chosen) {
             next.vramTotalGB = chosen->dedicatedGB;
             next.sharedVramTotalGB = chosen->sharedGB;
         }
 
-        next.vramUsedGB = static_cast<float>(dedicatedUsed / kBytesPerGB);
+        // Percentages are only shown when the capacity can hold the reading;
+        // otherwise the row falls back to a plain "x.x GB used".
+        next.vramUsedGB = dedicatedUsedGB;
         next.vramPercent =
-            (haveDedicated && next.vramTotalGB > 0.0f)
+            (haveDedicated && next.vramTotalGB > 0.0f && dedicatedUsedGB <= next.vramTotalGB)
                 ? ClampInt(static_cast<int>(
                       dedicatedUsed / (next.vramTotalGB * kBytesPerGB) * 100.0 + 0.5), 0, 100)
                 : -1;
 
-        next.sharedVramUsedGB = static_cast<float>(sharedUsed / kBytesPerGB);
+        const float sharedUsedGB = static_cast<float>(sharedUsed / kBytesPerGB);
+        next.sharedVramUsedGB = sharedUsedGB;
         next.sharedVramPercent =
-            (haveShared && next.sharedVramTotalGB > 0.0f)
+            (haveShared && next.sharedVramTotalGB > 0.0f && sharedUsedGB <= next.sharedVramTotalGB)
                 ? ClampInt(static_cast<int>(
                       sharedUsed / (next.sharedVramTotalGB * kBytesPerGB) * 100.0 + 0.5), 0, 100)
                 : -1;
@@ -4254,8 +4283,8 @@ class Renderer {
     void DrawCalendarDashboard(const SharedState& state, D2D1_RECT_F rect, const Settings& settings, double now, float scale, SYSTEMTIME& local) {
         ComPtr<ID2D1SolidColorBrush> calBg;
         target_->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.04f * settingsOpacity_), &calBg);
-        D2D1_RECT_F leftBlock = D2D1::RectF(rect.left + 22.0f * scale, rect.top + 16.0f * scale,
-                                            rect.left + 115.0f * scale, rect.bottom - 22.0f * scale);
+        D2D1_RECT_F leftBlock = D2D1::RectF(rect.left + 22.0f * scale, rect.top + 34.0f * scale,
+                                            rect.left + 115.0f * scale, rect.bottom - 36.0f * scale);
         target_->FillRoundedRectangle(D2D1::RoundedRect(leftBlock, 12.0f * scale, 12.0f * scale), calBg.Get());
 
         ComPtr<ID2D1SolidColorBrush> calHeader;
@@ -4292,7 +4321,7 @@ class Renderer {
 
         // Right Grid
         const float gridStart = rect.left + 144.0f * scale;
-        const float gridTop = rect.top + 30.0f * scale;
+        const float gridTop = rect.top + 44.0f * scale;
         const float colW = 31.0f * scale;
         const float rowH = 18.0f * scale;
         const wchar_t* days[] = {L"S", L"M", L"T", L"W", L"T", L"F", L"S"};
@@ -4360,8 +4389,8 @@ class Renderer {
         ComPtr<ID2D1SolidColorBrush> divider;
         target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.12f * settingsOpacity_), &divider);
         target_->FillRoundedRectangle(
-            D2D1::RoundedRect(D2D1::RectF(rect.left + 190.0f * scale, rect.top + 30.0f * scale,
-                                           rect.left + 191.5f * scale, rect.bottom - 34.0f * scale),
+            D2D1::RoundedRect(D2D1::RectF(rect.left + 190.0f * scale, rect.top + 36.0f * scale,
+                                           rect.left + 191.5f * scale, rect.bottom - 38.0f * scale),
                               0.5f * scale, 0.5f * scale), divider.Get());
 
         std::wstring line3 = hasWeather ? L"Wind: " + state.weather.windSpeed + (settings.weatherFahrenheit ? L" mph " : L" km/h ") + state.weather.windDir : L"Updated recently";
@@ -4432,13 +4461,13 @@ class Renderer {
 
         mutedBrush_->SetOpacity(0.45f);
         target_->DrawTextW(L"CPU  &  MEMORY", 14, smallTextFormat_.Get(),
-                           D2D1::RectF(left, rect.top + 24.0f, right, rect.top + 40.0f),
+                           D2D1::RectF(left, rect.top + 32.0f, right, rect.top + 48.0f),
                            mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
         wchar_t buf[96] = {};
 
         swprintf_s(buf, L"%d%%", state.system.cpuPercent);
-        DrawStatRow(left, right, rect.top + 44.0f, L"CPU Usage", buf,
+        DrawStatRow(left, right, rect.top + 56.0f, L"CPU Usage", buf,
                     state.system.cpuPercent / 100.0f, D2D1::ColorF(0.0f, 0.82f, 1.0f, 1.0f));
 
         std::wstring temp;
@@ -4450,17 +4479,17 @@ class Renderer {
         } else {
             temp = L"N/A";
         }
-        DrawStatRow(left, right, rect.top + 74.0f, L"CPU Temp", temp, -1.0f,
+        DrawStatRow(left, right, rect.top + 86.0f, L"CPU Temp", temp, -1.0f,
                     D2D1::ColorF(0, 0, 0, 0));
 
         swprintf_s(buf, L"%d%%  \u00b7  %.1f / %.1f GB", state.system.memoryPercent,
                    state.system.ramUsedGB, state.system.ramTotalGB);
-        DrawStatRow(left, right, rect.top + 104.0f, L"RAM", buf,
+        DrawStatRow(left, right, rect.top + 116.0f, L"RAM", buf,
                     state.system.memoryPercent / 100.0f, D2D1::ColorF(0.83f, 0.0f, 1.0f, 1.0f));
 
         swprintf_s(buf, L"%d%%  \u00b7  %.1f / %.1f GB", state.system.commitPercent,
                    state.system.commitUsedGB, state.system.commitTotalGB);
-        DrawStatRow(left, right, rect.top + 134.0f, L"Committed", buf,
+        DrawStatRow(left, right, rect.top + 146.0f, L"Committed", buf,
                     state.system.commitPercent / 100.0f, D2D1::ColorF(1.0f, 0.48f, 0.0f, 1.0f));
     }
 
@@ -4471,7 +4500,7 @@ class Renderer {
 
         mutedBrush_->SetOpacity(0.45f);
         target_->DrawTextW(L"GPU  &  VRAM", 12, smallTextFormat_.Get(),
-                           D2D1::RectF(left, rect.top + 24.0f, right, rect.top + 40.0f),
+                           D2D1::RectF(left, rect.top + 32.0f, right, rect.top + 48.0f),
                            mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
         wchar_t buf[96] = {};
@@ -4485,7 +4514,7 @@ class Renderer {
         } else {
             gpuValue = L"--";
         }
-        DrawStatRow(left, right, rect.top + 52.0f, L"GPU Usage", gpuValue, gpuFill,
+        DrawStatRow(left, right, rect.top + 62.0f, L"GPU Usage", gpuValue, gpuFill,
                     D2D1::ColorF(0.0f, 1.0f, 0.60f, 1.0f));
 
         std::wstring vramValue;
@@ -4501,7 +4530,7 @@ class Renderer {
         } else {
             vramValue = L"N/A";
         }
-        DrawStatRow(left, right, rect.top + 92.0f, L"Dedicated VRAM", vramValue, vramFill,
+        DrawStatRow(left, right, rect.top + 102.0f, L"Dedicated VRAM", vramValue, vramFill,
                     D2D1::ColorF(0.0f, 0.82f, 1.0f, 1.0f));
 
         std::wstring sharedValue;
@@ -4517,7 +4546,7 @@ class Renderer {
         } else {
             sharedValue = L"N/A";
         }
-        DrawStatRow(left, right, rect.top + 132.0f, L"Shared VRAM", sharedValue, sharedFill,
+        DrawStatRow(left, right, rect.top + 142.0f, L"Shared VRAM", sharedValue, sharedFill,
                     D2D1::ColorF(0.83f, 0.0f, 1.0f, 1.0f));
     }
 
@@ -4532,11 +4561,11 @@ class Renderer {
 
         mutedBrush_->SetOpacity(0.45f);
         target_->DrawTextW(L"NETWORK", 7, smallTextFormat_.Get(),
-                           D2D1::RectF(left, rect.top + 24.0f, leftColR, rect.top + 40.0f),
+                           D2D1::RectF(left, rect.top + 32.0f, leftColR, rect.top + 48.0f),
                            mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
         mutedBrush_->SetOpacity(0.45f);
         target_->DrawTextW(L"DISK", 4, smallTextFormat_.Get(),
-                           D2D1::RectF(rightColL, rect.top + 24.0f, right, rect.top + 40.0f),
+                           D2D1::RectF(rightColL, rect.top + 32.0f, right, rect.top + 48.0f),
                            mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
         ComPtr<ID2D1SolidColorBrush> divider;
@@ -4544,26 +4573,26 @@ class Renderer {
         if (divider) {
             const float dividerX = leftColR + colGap * 0.5f;
             target_->FillRoundedRectangle(
-                D2D1::RoundedRect(D2D1::RectF(dividerX - 0.75f, rect.top + 46.0f,
-                                              dividerX + 0.75f, rect.bottom - 30.0f),
+                D2D1::RoundedRect(D2D1::RectF(dividerX - 0.75f, rect.top + 54.0f,
+                                              dividerX + 0.75f, rect.bottom - 38.0f),
                                   0.5f, 0.5f), divider.Get());
         }
 
         const double netCombined = state.system.netUpBps + state.system.netDownBps;
         const double diskCombined = state.system.diskReadBps + state.system.diskWriteBps;
 
-        DrawStatRow(left, leftColR, rect.top + 50.0f, L"Upload",
+        DrawStatRow(left, leftColR, rect.top + 60.0f, L"Upload",
                     FormatBytesPerSec(state.system.netUpBps), -1.0f, D2D1::ColorF(0, 0, 0, 0));
-        DrawStatRow(left, leftColR, rect.top + 86.0f, L"Download",
+        DrawStatRow(left, leftColR, rect.top + 98.0f, L"Download",
                     FormatBytesPerSec(state.system.netDownBps), -1.0f, D2D1::ColorF(0, 0, 0, 0));
-        DrawStatRow(left, leftColR, rect.top + 122.0f, L"Combined",
+        DrawStatRow(left, leftColR, rect.top + 136.0f, L"Combined",
                     FormatBytesPerSec(netCombined), -1.0f, D2D1::ColorF(0, 0, 0, 0));
 
-        DrawStatRow(rightColL, right, rect.top + 50.0f, L"Read",
+        DrawStatRow(rightColL, right, rect.top + 60.0f, L"Read",
                     FormatBytesPerSec(state.system.diskReadBps), -1.0f, D2D1::ColorF(0, 0, 0, 0));
-        DrawStatRow(rightColL, right, rect.top + 86.0f, L"Write",
+        DrawStatRow(rightColL, right, rect.top + 98.0f, L"Write",
                     FormatBytesPerSec(state.system.diskWriteBps), -1.0f, D2D1::ColorF(0, 0, 0, 0));
-        DrawStatRow(rightColL, right, rect.top + 122.0f, L"Combined",
+        DrawStatRow(rightColL, right, rect.top + 136.0f, L"Combined",
                     FormatBytesPerSec(diskCombined), -1.0f, D2D1::ColorF(0, 0, 0, 0));
     }
 
@@ -5222,8 +5251,8 @@ class Renderer {
             if (tab == 0) {
                 // Expanded Apple DI media: large square art on left, text center.
                 const float artSize = 64.0f;
-                D2D1_RECT_F artRect = D2D1::RectF(rect.left + 24.0f, rect.top + 20.0f,
-                                                  rect.left + 24.0f + artSize, rect.top + 20.0f + artSize);
+                D2D1_RECT_F artRect = D2D1::RectF(rect.left + 24.0f, rect.top + 34.0f,
+                                                  rect.left + 24.0f + artSize, rect.top + 34.0f + artSize);
                 DrawAlbumArt(state.media, artRect, now, 16.0f, true);
 
                 float shiftX = 0.0f;
@@ -5236,20 +5265,20 @@ class Renderer {
                 const float waveW = 32.0f;
                 const float waveH = 20.0f;
                 D2D1_RECT_F waveRect = D2D1::RectF(rect.right - 24.0f - shiftX - waveW,
-                                                   rect.top + 20.0f + (artSize - waveH) * 0.5f,
+                                                   rect.top + 34.0f + (artSize - waveH) * 0.5f,
                                                    rect.right - 24.0f - shiftX,
-                                                   rect.top + 20.0f + (artSize + waveH) * 0.5f);
+                                                   rect.top + 34.0f + (artSize + waveH) * 0.5f);
 
                 const float textLeft = artRect.right + 18.0f;
                 const float textRight = waveRect.left - 16.0f;
 
                 // Title — bold, prominent.
-                D2D1_RECT_F titleRect = D2D1::RectF(textLeft, rect.top + 34.0f, textRight, rect.top + 54.0f);
+                D2D1_RECT_F titleRect = D2D1::RectF(textLeft, rect.top + 48.0f, textRight, rect.top + 68.0f);
                 DrawMarqueeText(state.media.title.empty() ? L"Unknown" : state.media.title,
                                 titleRect, textFormat_.Get(), textBrush_.Get(), now, 42.0f);
 
                 // Artist — muted below title.
-                D2D1_RECT_F artistRect = D2D1::RectF(textLeft, rect.top + 54.0f, textRight, rect.top + 74.0f);
+                D2D1_RECT_F artistRect = D2D1::RectF(textLeft, rect.top + 68.0f, textRight, rect.top + 88.0f);
                 mutedBrush_->SetOpacity(0.55f);
                 DrawMarqueeText(state.media.artist.empty() ? L"" : state.media.artist,
                                 artistRect, smallTextFormat_.Get(), mutedBrush_.Get(), now, 30.0f);
@@ -5265,7 +5294,7 @@ class Renderer {
                 }
 
                 // Timeline (Scrubber)
-                const float scrubberY = rect.top + 114.0f;
+                const float scrubberY = rect.top + 118.0f;
                 double currentPosition = state.media.positionTicks / 10000000.0;
                 double duration = state.media.endTicks / 10000000.0;
                 if (state.media.playing && state.media.lastUpdatedTicks > 0) {
@@ -5374,9 +5403,9 @@ class Renderer {
     }
 
     void DrawMediaControls(bool playing, D2D1_POINT_2F prev, D2D1_POINT_2F play, D2D1_POINT_2F next) {
-        DrawMediaButton(prev, 16.0f, 0, false);
-        DrawMediaButton(play, 22.0f, playing ? 1 : 2, true);
-        DrawMediaButton(next, 16.0f, 3, false);
+        DrawMediaButton(prev, 15.0f, 0, false);
+        DrawMediaButton(play, 20.0f, playing ? 1 : 2, true);
+        DrawMediaButton(next, 15.0f, 3, false);
     }
 
     void DrawMediaButton(D2D1_POINT_2F center, float radius, int kind, bool primary) {
@@ -6501,7 +6530,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     float unX = (xPos - cx) / totalScale;
                     float unY = (yPos - cy) / totalScale;
 
-                    if (unY > 56.0f - 30.0f && unY < 56.0f + 30.0f) {
+                    if (unY > 48.0f - 26.0f && unY < 48.0f + 26.0f) {
                         int cmd = -1;
                         if (unX > -84.0f && unX < -44.0f) cmd = 0; // Prev
                         else if (unX > -24.0f && unX < 24.0f) cmd = 1; // Play/Pause
@@ -6555,7 +6584,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     float unX = (xPos - cx) / totalScale;
                     float unY = (yPos - cy) / totalScale;
 
-                    if (unY > 56.0f - 30.0f && unY < 56.0f + 30.0f) {
+                    if (unY > 48.0f - 26.0f && unY < 48.0f + 26.0f) {
                         // Check button clicks in expanded media view
                         int cmd = -1;
                         if (unX > -84.0f && unX < -44.0f) cmd = 0; // Prev
@@ -6867,7 +6896,7 @@ DWORD WINAPI RenderThreadProc(void*) {
         if (primary.kind == IslandKind::Idle) {
             if (pinned || isHoverExpanded) {
                 primary.width = 380.0f * g_settings.sizeScale;
-                primary.height = 184.0f * g_settings.sizeScale;
+                primary.height = kExpandedPillContentHeight * g_settings.sizeScale;
             } else if (isHidden && !privacyActive) {
                 primary.width = 0.0f;
                 primary.height = 0.0f;
@@ -6890,10 +6919,12 @@ DWORD WINAPI RenderThreadProc(void*) {
             secondary.reset();
         }
         if (primary.kind == IslandKind::Media) {
-            bool recentArtChange = (NowSeconds() - g_state.media.artChangedAt) < 4.0;
-            if (isHoverExpanded || pinned || recentArtChange) {
+            // Expansion is deliberate only: hovering or pinning. New tracks
+            // used to pop the pill open on their own, which interrupts
+            // whatever is underneath it.
+            if (isHoverExpanded || pinned) {
                 primary.width = 380.0f * g_settings.sizeScale;
-                primary.height = 184.0f * g_settings.sizeScale;
+                primary.height = kExpandedPillContentHeight * g_settings.sizeScale;
             }
         }
 
