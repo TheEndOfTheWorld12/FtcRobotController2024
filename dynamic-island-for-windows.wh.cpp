@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.2.3
+// @version         1.2.4
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -6210,25 +6210,44 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
 
         case WM_MOUSEWHEEL: {
-            static ULONGLONG lastScrollTime = 0;
-            ULONGLONG now = GetTickCount64();
-            if (now - lastScrollTime < 150) return 0; // 150ms debounce
-            lastScrollTime = now;
+            // One page per scroll gesture: precision touchpads and free-
+            // spinning wheels deliver a stream of events for one flick, which
+            // used to skip several pages. Accumulate deltas until a full
+            // wheel notch, turn a single page, then swallow the rest of the
+            // gesture until the events pause for a moment.
+            static ULONGLONG s_lastWheelEventTime = 0;
+            static int s_wheelAccumulator = 0;
+            static bool s_gestureConsumed = false;
 
-            bool mediaActive = false;
-            {
-                std::lock_guard lock(g_stateMutex);
-                mediaActive = g_settings.media && g_state.media.available;
+            const ULONGLONG now = GetTickCount64();
+            if (now - s_lastWheelEventTime > 300) {
+                // Quiet gap: this event starts a new gesture.
+                s_wheelAccumulator = 0;
+                s_gestureConsumed = false;
             }
-            int tabCount = mediaActive ? kMediaTabCount : kIdleTabCount;
-            int delta = GET_WHEEL_DELTA_WPARAM(wParam);
-            if (delta > 0) {
-                if (g_idleTab > 0) g_idleTab--;
-            } else if (delta < 0) {
-                if (g_idleTab < tabCount - 1) g_idleTab++;
+            s_lastWheelEventTime = now;
+
+            if (s_gestureConsumed) {
+                return 0;
             }
 
-            g_layoutDirty = true;
+            s_wheelAccumulator += GET_WHEEL_DELTA_WPARAM(wParam);
+            if (s_wheelAccumulator >= WHEEL_DELTA || s_wheelAccumulator <= -WHEEL_DELTA) {
+                bool mediaActive = false;
+                {
+                    std::lock_guard lock(g_stateMutex);
+                    mediaActive = g_settings.media && g_state.media.available;
+                }
+                int tabCount = mediaActive ? kMediaTabCount : kIdleTabCount;
+                if (s_wheelAccumulator > 0) {
+                    if (g_idleTab > 0) g_idleTab--;
+                } else {
+                    if (g_idleTab < tabCount - 1) g_idleTab++;
+                }
+                s_gestureConsumed = true;
+                s_wheelAccumulator = 0;
+                g_layoutDirty = true;
+            }
             return 0;
         }
 
