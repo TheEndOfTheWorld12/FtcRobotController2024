@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.6.2
+// @version         1.7.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -22,16 +22,18 @@ media, downloads, clipboard, battery, and more.
 - Clipboard, notification, volume, Caps/Num lock, device connect/disconnect and
   battery alerts.
 - Idle dashboard with calendar and live weather (wttr.in).
-- **System stats pages** (scroll on the pill, or click its left/right half,
-  to flip between pages):
+- **System stats pages** (flip between them with the bars along the top and
+  bottom edges of the expanded pill, or by scrolling the wheel over it):
   - **CPU & Memory** — CPU usage, average ACPI CPU temperature (shown in both
     °C and °F), physical RAM usage (percent plus used/total GB) and commit
     charge (percent of memory committed by apps — backed by RAM or the page
     file — plus used/total GB).
-  - **GPU & VRAM** — GPU usage, GPU temperature (°C and °F), dedicated VRAM
+  - **GPU & VRAM** — one page per graphics adapter, each headed with that
+    GPU's name, showing its usage, temperature (°C and °F), dedicated VRAM
     usage (percent plus used/total GB) and shared GPU memory usage (system
     RAM used as extra GPU memory: percent plus used GB / total pool size in
-    GB).
+    GB). A hybrid laptop therefore gets a page for its integrated GPU and
+    another for its discrete one, each reading only its own adapter.
   - **Network & Disk** — system-wide upload, download and combined transfer
     rates, and disk read, write and combined speeds.
 
@@ -234,10 +236,8 @@ constexpr UINT WM_APP_NEW_EVENT = WM_APP + 0x443;
 constexpr float kRenderPadX = 28.0f;
 constexpr float kRenderPadY = 22.0f;
 
-// Idle dashboard pages: calendar, weather, CPU+RAM, GPU+VRAM, network & disk.
-constexpr int kIdleTabCount = 5;
-// The expanded media view adds its own page in front of the idle pages.
-constexpr int kMediaTabCount = kIdleTabCount + 1;
+// Dashboard page counts are decided at runtime, because one page is shown per
+// graphics adapter: see IdleTabCount() and MediaTabCount() below.
 
 // Page up/down buttons, centred horizontally at the top and bottom edges of
 // the expanded pill. The renderer and the click hit-test share these so they
@@ -412,6 +412,22 @@ struct DeviceSnapshot {
     double expiresAt = 0.0;
 };
 
+// One graphics adapter's live figures. Each becomes its own dashboard page,
+// so a hybrid laptop never mixes the integrated and discrete GPUs in one
+// reading.
+struct GpuStats {
+    std::wstring name;
+    int usagePercent = -1;
+    bool hasTemp = false;
+    float tempC = 0.0f;
+    int dedicatedPercent = -1;
+    float dedicatedUsedGB = 0.0f;
+    float dedicatedTotalGB = 0.0f;
+    int sharedPercent = -1;
+    float sharedUsedGB = 0.0f;
+    float sharedTotalGB = 0.0f;
+};
+
 struct SystemSnapshot {
     int volumePercent = 0;
     bool volumeMuted = false;
@@ -437,17 +453,12 @@ struct SystemSnapshot {
     float commitUsedGB = 0.0f;
     float commitTotalGB = 0.0f;
     // GPU memory. Percent values are -1 while unknown.
-    int vramPercent = -1;
-    float vramUsedGB = 0.0f;
-    float vramTotalGB = 0.0f;
-    int sharedVramPercent = -1;
-    float sharedVramUsedGB = 0.0f;
-    float sharedVramTotalGB = 0.0f;
+    // Per-GPU figures; one page is shown for each entry.
+    std::vector<GpuStats> gpus;
     // CPU temperature: average of all ACPI thermal zones.
     bool hasCpuTemp = false;
     float cpuTempC = 0.0f;
-    bool hasGpuTemp = false;
-    float gpuTempC = 0.0f;
+
 };
 
 // The privacy dots sit at the same right edge, so page controls shift left
@@ -2474,6 +2485,7 @@ static double ReadPdhCounterValue(PDH_HCOUNTER counter) {
 // One hardware GPU as DXGI reports it, with its LUID rendered the way PDH
 // GPU counter instance names embed it ("luid_0x........_0x........").
 struct GpuAdapterInfo {
+    std::wstring name;
     std::wstring luid;
     LUID luidRaw = {};
     float dedicatedGB = 0.0f;
@@ -2509,6 +2521,7 @@ static const std::vector<GpuAdapterInfo>& GetGpuAdapters() {
                            static_cast<unsigned int>(desc.AdapterLuid.LowPart));
 
                 GpuAdapterInfo info;
+                info.name = desc.Description;
                 info.luid = luid;
                 info.luidRaw = desc.AdapterLuid;
                 info.dedicatedGB = static_cast<float>(desc.DedicatedVideoMemory / kBytesPerGB);
@@ -2525,6 +2538,24 @@ static const std::vector<GpuAdapterInfo>& GetGpuAdapters() {
     }
 
     return s_adapters;
+}
+
+// Pages: calendar, weather, CPU & memory, one per GPU, then network & disk.
+// At least one GPU page is always shown, even when nothing is enumerated, so
+// the layout stays predictable.
+constexpr size_t kMaxGpuPages = 4;
+
+int GpuPageCount() {
+    const size_t count = GetGpuAdapters().size();
+    return count == 0 ? 1 : static_cast<int>(std::min(count, kMaxGpuPages));
+}
+
+int IdleTabCount() {
+    return 3 + GpuPageCount() + 1;
+}
+
+int MediaTabCount() {
+    return IdleTabCount() + 1;
 }
 
 // Extracts the "luid_0x..._0x..." token from a PDH GPU instance name such as
@@ -2810,7 +2841,7 @@ struct D3DKMT_ADAPTER_PERFDATA {
 // KMTQAITYPE_ADAPTERPERFDATA
 constexpr int kAdapterPerfDataQuery = 62;
 
-static bool QueryGpuTemperatureD3DKMT(float* celsius) {
+static bool QueryAdapterTemperatureD3DKMT(const LUID& adapterLuid, float* celsius) {
     using D3DKMTOpenAdapterFromLuid_t = LONG(__stdcall*)(D3DKMT_OPENADAPTERFROMLUID*);
     using D3DKMTQueryAdapterInfo_t = LONG(__stdcall*)(D3DKMT_QUERYADAPTERINFO*);
     using D3DKMTCloseAdapter_t = LONG(__stdcall*)(D3DKMT_CLOSEADAPTER*);
@@ -2838,55 +2869,40 @@ static bool QueryGpuTemperatureD3DKMT(float* celsius) {
         return false;
     }
 
-    // Prefer the adapter with the most dedicated memory — the discrete GPU on
-    // a hybrid laptop — but accept any adapter that answers.
-    const std::vector<GpuAdapterInfo>& adapters = GetGpuAdapters();
-    std::vector<const GpuAdapterInfo*> ordered;
-    ordered.reserve(adapters.size());
-    for (const GpuAdapterInfo& adapter : adapters) {
-        ordered.push_back(&adapter);
+    D3DKMT_OPENADAPTERFROMLUID open = {};
+    open.AdapterLuid = adapterLuid;
+    if (openAdapter(&open) != 0 || open.hAdapter == 0) {
+        return false;
     }
-    std::sort(ordered.begin(), ordered.end(),
-              [](const GpuAdapterInfo* a, const GpuAdapterInfo* b) {
-                  return a->dedicatedGB > b->dedicatedGB;
-              });
 
-    for (const GpuAdapterInfo* adapter : ordered) {
-        D3DKMT_OPENADAPTERFROMLUID open = {};
-        open.AdapterLuid = adapter->luidRaw;
-        if (openAdapter(&open) != 0 || open.hAdapter == 0) {
-            continue;
-        }
+    D3DKMT_ADAPTER_PERFDATA perfData = {};
+    D3DKMT_QUERYADAPTERINFO query = {};
+    query.hAdapter = open.hAdapter;
+    query.Type = kAdapterPerfDataQuery;
+    query.pPrivateDriverData = &perfData;
+    query.PrivateDriverDataSize = sizeof(perfData);
+    const bool ok = queryInfo(&query) == 0;
 
-        D3DKMT_ADAPTER_PERFDATA perfData = {};
-        D3DKMT_QUERYADAPTERINFO query = {};
-        query.hAdapter = open.hAdapter;
-        query.Type = kAdapterPerfDataQuery;
-        query.pPrivateDriverData = &perfData;
-        query.PrivateDriverDataSize = sizeof(perfData);
-        const bool ok = queryInfo(&query) == 0;
-
-        if (closeAdapter) {
-            D3DKMT_CLOSEADAPTER close = {};
-            close.hAdapter = open.hAdapter;
-            closeAdapter(&close);
-        }
-
-        if (!ok || perfData.Temperature == 0) {
-            continue;
-        }
-
-        // Drivers report deci-degrees; a few report whole degrees.
-        float value = static_cast<float>(perfData.Temperature);
-        if (value > 200.0f) {
-            value /= 10.0f;
-        }
-        if (value > 0.0f && value < 150.0f) {
-            *celsius = value;
-            return true;
-        }
+    if (closeAdapter) {
+        D3DKMT_CLOSEADAPTER close = {};
+        close.hAdapter = open.hAdapter;
+        closeAdapter(&close);
     }
-    return false;
+
+    if (!ok || perfData.Temperature == 0) {
+        return false;
+    }
+
+    // Drivers report deci-degrees; a few report whole degrees.
+    float value = static_cast<float>(perfData.Temperature);
+    if (value > 200.0f) {
+        value /= 10.0f;
+    }
+    if (value <= 0.0f || value >= 150.0f) {
+        return false;
+    }
+    *celsius = value;
+    return true;
 }
 
 // NVIDIA, through NVML (ships with the driver as nvml.dll). NVML reports the
@@ -3174,12 +3190,29 @@ static bool QueryGpuTemperatureHardwareMonitor(float* celsius) {
     return false;
 }
 
-static bool QueryGpuTemperature(float* celsius) {
+// Temperature for one adapter: the driver's own figure where it publishes
+// one, else the matching vendor library, else a hardware-monitor sensor when
+// this is the only adapter (those readings cannot be attributed otherwise).
+static bool QueryAdapterTemperature(const GpuAdapterInfo& adapter, bool soleAdapter,
+                                    float* celsius) {
     if (!celsius) {
         return false;
     }
-    return QueryGpuTemperatureD3DKMT(celsius) || QueryGpuTemperatureNvml(celsius) ||
-           QueryGpuTemperatureAdl(celsius) || QueryGpuTemperatureHardwareMonitor(celsius);
+    if (QueryAdapterTemperatureD3DKMT(adapter.luidRaw, celsius)) {
+        return true;
+    }
+
+    const std::wstring name = ToLowerCopy(adapter.name);
+    if (name.find(L"nvidia") != std::wstring::npos &&
+        QueryGpuTemperatureNvml(celsius)) {
+        return true;
+    }
+    if ((name.find(L"amd") != std::wstring::npos ||
+         name.find(L"radeon") != std::wstring::npos) &&
+        QueryGpuTemperatureAdl(celsius)) {
+        return true;
+    }
+    return soleAdapter && QueryGpuTemperatureHardwareMonitor(celsius);
 }
 
 void UpdateSystemSnapshot() {
@@ -3214,22 +3247,17 @@ void UpdateSystemSnapshot() {
             next.diskWriteBps = diskWrite;
         }
 
-        // GPU usage: every adapter's 3D engines. Deliberately not filtered
-        // to one adapter — on hybrid-graphics machines the work moves
-        // between the iGPU and the discrete GPU, and pinning to one of them
-        // reports 0% while the other is busy.
-        const double gpu = SumPdhCounterArray(g_gpuCounter, L"engtype_3D");
-        if (gpu >= 0.0) {
-            next.gpuPercent = ClampInt(static_cast<int>(gpu), 0, 100);
+        // GPU usage across every adapter's 3D engines: the single figure the
+        // game overlay shows.
+        const double gpuTotal = SumPdhCounterArray(g_gpuCounter, L"engtype_3D");
+        if (gpuTotal >= 0.0) {
+            next.gpuPercent = ClampInt(static_cast<int>(gpuTotal), 0, 100);
         }
 
-        // VRAM. Counters are totalled per adapter LUID; whichever adapter
-        // holds the most memory is reported, using its own measured usage.
-        // The adapter-wide counter set exists on some machines but reports
-        // nothing but zeros, so a set that yields no bytes at all is treated
-        // as no data and the per-process counters are summed instead. When
-        // neither source has bytes the row shows N/A rather than a
-        // misleading 0%.
+        // Everything else is gathered per adapter so each GPU's page shows one
+        // machine's worth of consistent numbers.
+        std::unordered_map<std::wstring, double> dedicatedByLuid;
+        std::unordered_map<std::wstring, double> sharedByLuid;
         auto totalBytes = [](const std::unordered_map<std::wstring, double>& byLuid) {
             double total = 0.0;
             for (const auto& entry : byLuid) {
@@ -3248,126 +3276,97 @@ void UpdateSystemSnapshot() {
             byLuid->clear();
             return false;
         };
-
-        std::unordered_map<std::wstring, double> dedicatedByLuid;
-        std::unordered_map<std::wstring, double> sharedByLuid;
-        const bool haveDedicated = readGpuMemory({g_gpuDedicatedCounter, g_gpuLocalCounter,
-                                                  g_gpuProcDedicatedCounter, g_gpuProcLocalCounter},
-                                                 &dedicatedByLuid);
-        const bool haveShared = readGpuMemory({g_gpuSharedCounter, g_gpuNonLocalCounter,
-                                               g_gpuProcSharedCounter, g_gpuProcNonLocalCounter},
-                                              &sharedByLuid);
-
-        // The busiest adapter in each pool. Dedicated and shared are resolved
-        // independently: a machine can report them against different GPUs,
-        // and forcing both onto one adapter leaves the other paired with a
-        // capacity that cannot hold its reading.
-        auto busiestAdapter = [](const std::unordered_map<std::wstring, double>& byLuid,
-                                 std::wstring* luidOut) {
-            double most = 0.0;
-            luidOut->clear();
-            for (const auto& entry : byLuid) {
-                if (entry.second > most || luidOut->empty()) {
-                    most = entry.second;
-                    *luidOut = entry.first;
-                }
-            }
-            return most;
-        };
-
-        std::wstring dedicatedLuid;
-        std::wstring sharedLuid;
-        const double dedicatedUsed = busiestAdapter(dedicatedByLuid, &dedicatedLuid);
-        const double sharedUsed = busiestAdapter(sharedByLuid, &sharedLuid);
+        readGpuMemory({g_gpuDedicatedCounter, g_gpuLocalCounter,
+                       g_gpuProcDedicatedCounter, g_gpuProcLocalCounter}, &dedicatedByLuid);
+        readGpuMemory({g_gpuSharedCounter, g_gpuNonLocalCounter,
+                       g_gpuProcSharedCounter, g_gpuProcNonLocalCounter}, &sharedByLuid);
 
         const std::vector<GpuAdapterInfo>& adapters = GetGpuAdapters();
+        const bool soleAdapter = adapters.size() == 1;
 
-        // Pairs a reading with a capacity: the adapter the counters name when
-        // it is large enough, else the roomiest one for that pool, so a
-        // reading is never shown against a capacity it exceeds.
-        auto pickAdapter = [&](const std::wstring& luid, double usedBytes,
-                               bool dedicatedPool) -> const GpuAdapterInfo* {
-            auto capacityOf = [&](const GpuAdapterInfo& adapter) {
-                return dedicatedPool ? adapter.dedicatedGB : adapter.sharedGB;
-            };
+        next.gpus.clear();
+        for (const GpuAdapterInfo& adapter : adapters) {
+            if (next.gpus.size() >= kMaxGpuPages) {
+                break;
+            }
 
-            const GpuAdapterInfo* named = nullptr;
-            for (const GpuAdapterInfo& adapter : adapters) {
-                if (!luid.empty() && _wcsicmp(adapter.luid.c_str(), luid.c_str()) == 0) {
-                    named = &adapter;
-                    break;
+            GpuStats stats;
+            stats.name = adapter.name;
+
+            int matched = 0;
+            const double usage =
+                SumPdhCounterArray(g_gpuCounter, L"engtype_3D", adapter.luid.c_str(), &matched);
+            if (usage >= 0.0 && matched > 0) {
+                stats.usagePercent = ClampInt(static_cast<int>(usage), 0, 100);
+            }
+
+            float temperature = 0.0f;
+            if (QueryAdapterTemperature(adapter, soleAdapter, &temperature)) {
+                stats.hasTemp = true;
+                stats.tempC = temperature;
+            }
+
+            // Capacities come from the adapter description; usage from the
+            // counters keyed by the same LUID, so the two always agree.
+            stats.dedicatedTotalGB = adapter.dedicatedGB;
+            stats.sharedTotalGB = adapter.sharedGB;
+
+            auto dedicatedIt = dedicatedByLuid.find(adapter.luid);
+            if (dedicatedIt != dedicatedByLuid.end()) {
+                stats.dedicatedUsedGB = static_cast<float>(dedicatedIt->second / kBytesPerGB);
+                stats.dedicatedPercent =
+                    (stats.dedicatedTotalGB > 0.0f &&
+                     stats.dedicatedUsedGB <= stats.dedicatedTotalGB)
+                        ? ClampInt(static_cast<int>(
+                              stats.dedicatedUsedGB / stats.dedicatedTotalGB * 100.0f + 0.5f),
+                              0, 100)
+                        : -1;
+            }
+
+            auto sharedIt = sharedByLuid.find(adapter.luid);
+            if (sharedIt != sharedByLuid.end()) {
+                stats.sharedUsedGB = static_cast<float>(sharedIt->second / kBytesPerGB);
+                stats.sharedPercent =
+                    (stats.sharedTotalGB > 0.0f && stats.sharedUsedGB <= stats.sharedTotalGB)
+                        ? ClampInt(static_cast<int>(
+                              stats.sharedUsedGB / stats.sharedTotalGB * 100.0f + 0.5f), 0, 100)
+                        : -1;
+            }
+
+            // An NVIDIA card reports its own memory exactly, which beats
+            // pairing a counter with a display adapter.
+            if (ToLowerCopy(adapter.name).find(L"nvidia") != std::wstring::npos) {
+                double nvmlUsed = 0.0;
+                double nvmlTotal = 0.0;
+                if (QueryNvmlDedicatedMemory(&nvmlUsed, &nvmlTotal) && nvmlTotal > 0.0) {
+                    stats.dedicatedUsedGB = static_cast<float>(nvmlUsed / kBytesPerGB);
+                    stats.dedicatedTotalGB = static_cast<float>(nvmlTotal / kBytesPerGB);
+                    stats.dedicatedPercent =
+                        ClampInt(static_cast<int>(nvmlUsed / nvmlTotal * 100.0 + 0.5), 0, 100);
                 }
             }
 
-            const float usedGB = static_cast<float>(usedBytes / kBytesPerGB);
-            if (named && capacityOf(*named) >= usedGB) {
-                return named;
-            }
-
-            const GpuAdapterInfo* roomiest = nullptr;
-            for (const GpuAdapterInfo& adapter : adapters) {
-                if (!roomiest || capacityOf(adapter) > capacityOf(*roomiest)) {
-                    roomiest = &adapter;
-                }
-            }
-            if (roomiest && capacityOf(*roomiest) >= usedGB) {
-                return roomiest;
-            }
-            return named ? named : roomiest;
-        };
-
-        const GpuAdapterInfo* dedicatedAdapter = pickAdapter(dedicatedLuid, dedicatedUsed, true);
-        const GpuAdapterInfo* sharedAdapter = pickAdapter(sharedLuid, sharedUsed, false);
-        if (dedicatedAdapter) {
-            next.vramTotalGB = dedicatedAdapter->dedicatedGB;
-        }
-        if (sharedAdapter) {
-            next.sharedVramTotalGB = sharedAdapter->sharedGB;
+            next.gpus.push_back(std::move(stats));
         }
 
-        const float dedicatedUsedGB = static_cast<float>(dedicatedUsed / kBytesPerGB);
-
-        // Percentages are only shown when the capacity can hold the reading;
-        // otherwise the row falls back to a plain "x.x GB used".
-        next.vramUsedGB = dedicatedUsedGB;
-        next.vramPercent =
-            (haveDedicated && next.vramTotalGB > 0.0f && dedicatedUsedGB <= next.vramTotalGB)
-                ? ClampInt(static_cast<int>(
-                      dedicatedUsed / (next.vramTotalGB * kBytesPerGB) * 100.0 + 0.5), 0, 100)
-                : -1;
-
-        // An NVIDIA card reports its own memory exactly, with no adapter
-        // matching required, so that reading wins when NVML is present.
-        double nvmlUsed = 0.0;
-        double nvmlTotal = 0.0;
-        if (QueryNvmlDedicatedMemory(&nvmlUsed, &nvmlTotal)) {
-            next.vramUsedGB = static_cast<float>(nvmlUsed / kBytesPerGB);
-            next.vramTotalGB = static_cast<float>(nvmlTotal / kBytesPerGB);
-            next.vramPercent =
-                ClampInt(static_cast<int>(nvmlUsed / nvmlTotal * 100.0 + 0.5), 0, 100);
+        if (next.gpus.empty()) {
+            GpuStats stats;
+            stats.name = L"GPU";
+            stats.usagePercent = next.gpuPercent;
+            next.gpus.push_back(std::move(stats));
         }
-
-        const float sharedUsedGB = static_cast<float>(sharedUsed / kBytesPerGB);
-        next.sharedVramUsedGB = sharedUsedGB;
-        next.sharedVramPercent =
-            (haveShared && next.sharedVramTotalGB > 0.0f && sharedUsedGB <= next.sharedVramTotalGB)
-                ? ClampInt(static_cast<int>(
-                      sharedUsed / (next.sharedVramTotalGB * kBytesPerGB) * 100.0 + 0.5), 0, 100)
-                : -1;
 
         static double s_nextGpuLog = 0.0;
         if (NowSeconds() >= s_nextGpuLog) {
             s_nextGpuLog = NowSeconds() + 30.0;
-            Wh_Log(L"GPU counters: engine=%.1f%%, dedicated data=%d (adapters=%u), "
-                   L"shared data=%d, active=%s, matched DXGI=%s, "
-                   L"dedicated=%.2f/%.2f GB, shared=%.2f/%.2f GB",
-                   gpu, haveDedicated ? 1 : 0,
-                   static_cast<unsigned int>(dedicatedByLuid.size()),
-                   haveShared ? 1 : 0,
-                   dedicatedLuid.empty() ? L"(none)" : dedicatedLuid.c_str(),
-                   dedicatedAdapter ? dedicatedAdapter->luid.c_str() : L"(none)",
-                   next.vramUsedGB, next.vramTotalGB,
-                   next.sharedVramUsedGB, next.sharedVramTotalGB);
+            for (const GpuStats& stats : next.gpus) {
+                Wh_Log(L"GPU \"%s\": usage=%d%%, temp=%s, dedicated=%.2f/%.2f GB, "
+                       L"shared=%.2f/%.2f GB",
+                       stats.name.c_str(), stats.usagePercent,
+                       stats.hasTemp ? L"yes" : L"no",
+                       stats.dedicatedUsedGB, stats.dedicatedTotalGB,
+                       stats.sharedUsedGB, stats.sharedTotalGB);
+            }
         }
     }
 
@@ -3454,15 +3453,6 @@ void UpdateSystemSnapshot() {
     next.hasCpuTemp = s_hasCpuTemp;
     next.cpuTempC = s_cpuTempC;
 
-    static double s_nextGpuTemperaturePoll = 0.0;
-    static bool s_hasGpuTemp = false;
-    static float s_gpuTempC = 0.0f;
-    if (tempNow >= s_nextGpuTemperaturePoll) {
-        s_hasGpuTemp = QueryGpuTemperature(&s_gpuTempC);
-        s_nextGpuTemperaturePoll = tempNow + 5.0;
-    }
-    next.hasGpuTemp = s_hasGpuTemp;
-    next.gpuTempC = s_gpuTempC;
 
     static ComPtr<IAudioEndpointVolume> s_volume;
     if (!s_volume) {
@@ -4958,13 +4948,32 @@ class Renderer {
                     state.system.commitPercent / 100.0f, D2D1::ColorF(1.0f, 0.48f, 0.0f, 1.0f));
     }
 
-    // Page: GPU usage, dedicated VRAM and shared GPU memory.
-    void DrawGpuDashboard(const SharedState& state, D2D1_RECT_F rect) {
+    // Page: one adapter's usage, temperature and memory.
+    void DrawGpuDashboard(const SharedState& state, D2D1_RECT_F rect, int gpuIndex) {
         const float left = rect.left + 24.0f;
         const float right = rect.right - 34.0f;
 
+        static const GpuStats kNoGpu;
+        const bool valid = gpuIndex >= 0 &&
+                           gpuIndex < static_cast<int>(state.system.gpus.size());
+        const GpuStats& gpu = valid ? state.system.gpus[gpuIndex] : kNoGpu;
+
+        // Heading names the adapter, numbered when there is more than one.
+        std::wstring heading;
+        if (state.system.gpus.size() > 1) {
+            wchar_t prefix[16] = {};
+            swprintf_s(prefix, L"GPU %d  \u00b7  ", gpuIndex + 1);
+            heading = prefix;
+        }
+        heading += gpu.name.empty() ? std::wstring(L"GPU") : gpu.name;
+        if (heading.size() > 38) {
+            heading.resize(38);
+            heading += L"...";
+        }
+
         mutedBrush_->SetOpacity(0.45f);
-        target_->DrawTextW(L"GPU  &  VRAM", 12, smallTextFormat_.Get(),
+        target_->DrawTextW(heading.c_str(), static_cast<UINT32>(heading.size()),
+                           smallTextFormat_.Get(),
                            D2D1::RectF(left, rect.top + 32.0f, right, rect.top + 48.0f),
                            mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
@@ -4972,10 +4981,10 @@ class Renderer {
 
         std::wstring gpuValue;
         float gpuFill = -1.0f;
-        if (state.system.gpuPercent >= 0) {
-            swprintf_s(buf, L"%d%%", state.system.gpuPercent);
+        if (gpu.usagePercent >= 0) {
+            swprintf_s(buf, L"%d%%", gpu.usagePercent);
             gpuValue = buf;
-            gpuFill = state.system.gpuPercent / 100.0f;
+            gpuFill = gpu.usagePercent / 100.0f;
         } else {
             gpuValue = L"--";
         }
@@ -4983,9 +4992,9 @@ class Renderer {
                     D2D1::ColorF(0.0f, 1.0f, 0.60f, 1.0f));
 
         std::wstring gpuTemp;
-        if (state.system.hasGpuTemp) {
-            swprintf_s(buf, L"%.1f\u00B0C  /  %.1f\u00B0F", state.system.gpuTempC,
-                       state.system.gpuTempC * 9.0f / 5.0f + 32.0f);
+        if (gpu.hasTemp) {
+            swprintf_s(buf, L"%.1f\u00B0C  /  %.1f\u00B0F", gpu.tempC,
+                       gpu.tempC * 9.0f / 5.0f + 32.0f);
             gpuTemp = buf;
         } else {
             gpuTemp = L"N/A";
@@ -4995,13 +5004,13 @@ class Renderer {
 
         std::wstring vramValue;
         float vramFill = -1.0f;
-        if (state.system.vramTotalGB > 0.0f && state.system.vramPercent >= 0) {
-            swprintf_s(buf, L"%d%%  \u00b7  %.1f / %.1f GB", state.system.vramPercent,
-                       state.system.vramUsedGB, state.system.vramTotalGB);
+        if (gpu.dedicatedTotalGB > 0.0f && gpu.dedicatedPercent >= 0) {
+            swprintf_s(buf, L"%d%%  \u00b7  %.1f / %.1f GB", gpu.dedicatedPercent,
+                       gpu.dedicatedUsedGB, gpu.dedicatedTotalGB);
             vramValue = buf;
-            vramFill = state.system.vramPercent / 100.0f;
-        } else if (state.system.vramUsedGB > 0.0f) {
-            swprintf_s(buf, L"%.1f GB used", state.system.vramUsedGB);
+            vramFill = gpu.dedicatedPercent / 100.0f;
+        } else if (gpu.dedicatedUsedGB > 0.0f) {
+            swprintf_s(buf, L"%.1f GB used", gpu.dedicatedUsedGB);
             vramValue = buf;
         } else {
             vramValue = L"N/A";
@@ -5011,13 +5020,13 @@ class Renderer {
 
         std::wstring sharedValue;
         float sharedFill = -1.0f;
-        if (state.system.sharedVramTotalGB > 0.0f && state.system.sharedVramPercent >= 0) {
-            swprintf_s(buf, L"%d%%  \u00b7  %.1f / %.1f GB", state.system.sharedVramPercent,
-                       state.system.sharedVramUsedGB, state.system.sharedVramTotalGB);
+        if (gpu.sharedTotalGB > 0.0f && gpu.sharedPercent >= 0) {
+            swprintf_s(buf, L"%d%%  \u00b7  %.1f / %.1f GB", gpu.sharedPercent,
+                       gpu.sharedUsedGB, gpu.sharedTotalGB);
             sharedValue = buf;
-            sharedFill = state.system.sharedVramPercent / 100.0f;
-        } else if (state.system.sharedVramUsedGB > 0.0f) {
-            swprintf_s(buf, L"%.1f GB used", state.system.sharedVramUsedGB);
+            sharedFill = gpu.sharedPercent / 100.0f;
+        } else if (gpu.sharedUsedGB > 0.0f) {
+            swprintf_s(buf, L"%.1f GB used", gpu.sharedUsedGB);
             sharedValue = buf;
         } else {
             sharedValue = L"N/A";
@@ -5127,11 +5136,31 @@ class Renderer {
         }
     }
 
+    // Shared page dispatch for the idle pill and the expanded media view:
+    // calendar, weather, CPU & memory, one page per GPU, then network & disk.
+    void DrawDashboardPage(const SharedState& state, D2D1_RECT_F rect,
+                           const Settings& settings, double now, float scale,
+                           SYSTEMTIME& local, bool hasWeather, const std::wstring& wIcon,
+                           const std::wstring& wText, int tab) {
+        const int gpuPages = GpuPageCount();
+        if (tab == 0) {
+            DrawCalendarDashboard(state, rect, settings, now, scale, local);
+        } else if (tab == 1) {
+            DrawWeatherDashboard(state, rect, settings, now, scale, hasWeather, wIcon, wText);
+        } else if (tab == 2) {
+            DrawCpuRamDashboard(state, rect);
+        } else if (tab < 3 + gpuPages) {
+            DrawGpuDashboard(state, rect, tab - 3);
+        } else {
+            DrawNetDiskDashboard(state, rect);
+        }
+    }
+
     void DrawIdleDashboard(const SharedState& state, D2D1_RECT_F rect, const Settings& settings,
                            double now) {
         // While the game overlay is toggled on it replaces only the pill's
         // collapsed look (the overlay is 64 units tall; the expanded panel is
-        // 184) — an expanded pill still shows the regular dashboard pages.
+        // 200) — an expanded pill still shows the regular dashboard pages.
         const bool overlayMode =
             settings.gameOverlay || Wh_GetIntValue(L"GameOverlayPinned", 0) != 0;
         if (overlayMode && (rect.bottom - rect.top) < 100.0f) {
@@ -5188,29 +5217,14 @@ class Renderer {
         }
 
         // Expanded Mode
-        int tab = g_idleTab % kIdleTabCount;
-        if (tab < 0) tab += kIdleTabCount;
+        const int tabCount = IdleTabCount();
+        int tab = g_idleTab % tabCount;
+        if (tab < 0) tab += tabCount;
 
-        switch (tab) {
-            case 0:
-                DrawCalendarDashboard(state, rect, settings, now, scale, local);
-                break;
-            case 1:
-                DrawWeatherDashboard(state, rect, settings, now, scale, hasWeather, wIcon, wText);
-                break;
-            case 2:
-                DrawCpuRamDashboard(state, rect);
-                break;
-            case 3:
-                DrawGpuDashboard(state, rect);
-                break;
-            case 4:
-            default:
-                DrawNetDiskDashboard(state, rect);
-                break;
-        }
+        DrawDashboardPage(state, rect, settings, now, scale, local, hasWeather, wIcon, wText,
+                          tab);
 
-        DrawPageNav(state, rect, tab, kIdleTabCount);
+        DrawPageNav(state, rect, tab, tabCount);
 
         target_->PopAxisAlignedClip();
     }
@@ -5721,8 +5735,9 @@ class Renderer {
         if (expandedAlpha > 0.01f && mask && layer) {
             target_->PushLayer(D2D1::LayerParameters(rect, mask.Get(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1::IdentityMatrix(), expandedAlpha, nullptr, D2D1_LAYER_OPTIONS_NONE), layer.Get());
 
-            int tab = g_idleTab % kMediaTabCount;
-            if (tab < 0) tab += kMediaTabCount;
+            const int tabCount = MediaTabCount();
+            int tab = g_idleTab % tabCount;
+            if (tab < 0) tab += tabCount;
 
             if (tab == 0) {
                 // Expanded Apple DI media: large square art on left, text center.
@@ -5820,26 +5835,23 @@ class Renderer {
                                   D2D1::Point2F(cx - 64.0f, cy),
                                   D2D1::Point2F(cx, cy),
                                   D2D1::Point2F(cx + 64.0f, cy));
-            } else if (tab == 1) {
-                SYSTEMTIME local = {}; GetLocalTime(&local);
-                DrawCalendarDashboard(state, rect, g_settings, now, 1.0f, local);
-            } else if (tab == 2) {
-                bool hasWeather = state.weather.hasData && (now - state.weather.lastUpdated < 3600.0);
-                std::wstring wIcon = L"🌡️"; std::wstring wText = L"Loading...";
+            } else {
+                SYSTEMTIME local = {};
+                GetLocalTime(&local);
+                bool hasWeather =
+                    state.weather.hasData && (now - state.weather.lastUpdated < 3600.0);
+                std::wstring wIcon = L"🌡️";
+                std::wstring wText = L"Loading...";
                 if (hasWeather) {
                     wText = state.weather.weatherDesc;
                     GetWeatherIconAndText(state.weather.weatherCode, wIcon, wText);
                 }
-                DrawWeatherDashboard(state, rect, g_settings, now, 1.0f, hasWeather, wIcon, wText);
-            } else if (tab == 3) {
-                DrawCpuRamDashboard(state, rect);
-            } else if (tab == 4) {
-                DrawGpuDashboard(state, rect);
-            } else {
-                DrawNetDiskDashboard(state, rect);
+                // The media page sits in front of the shared pages.
+                DrawDashboardPage(state, rect, g_settings, now, 1.0f, local, hasWeather,
+                                  wIcon, wText, tab - 1);
             }
 
-            DrawPageNav(state, rect, tab, kMediaTabCount);
+            DrawPageNav(state, rect, tab, tabCount);
 
             target_->PopLayer();
         }
@@ -6998,7 +7010,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 const float height = static_cast<float>(clientRect.bottom - clientRect.top);
                 const float width = static_cast<float>(clientRect.right - clientRect.left);
 
-                if (mediaActive && height > 60.0f && (g_idleTab % kMediaTabCount) == 0) {
+                if (mediaActive && height > 60.0f && (g_idleTab % MediaTabCount()) == 0) {
                     float totalScale = (GetDpiForWindow(hwnd) / 96.0f) * g_settings.sizeScale;
                     float cx = width / 2.0f;
                     float cy = height / 2.0f;
@@ -7052,7 +7064,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 const float height = static_cast<float>(clientRect.bottom - clientRect.top);
                 const float width = static_cast<float>(clientRect.right - clientRect.left);
 
-                if (mediaActive && height > 60.0f && (g_idleTab % kMediaTabCount) == 0) {
+                if (mediaActive && height > 60.0f && (g_idleTab % MediaTabCount()) == 0) {
                     float totalScale = (GetDpiForWindow(hwnd) / 96.0f) * g_settings.sizeScale;
                     float cx = width / 2.0f;
                     float cy = height / 2.0f;
@@ -7121,7 +7133,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                                std::fabs(unY - stripY) <= halfStrip;
                     };
 
-                    const int tabCount = mediaActive ? kMediaTabCount : kIdleTabCount;
+                    const int tabCount = mediaActive ? MediaTabCount() : IdleTabCount();
                     if (hitButton(-offset)) {
                         if (g_idleTab > 0) {
                             g_idleTab--;
@@ -7169,7 +7181,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 std::lock_guard lock(g_stateMutex);
                 mediaActive = g_settings.media && g_state.media.available;
             }
-            const int tabCount = mediaActive ? kMediaTabCount : kIdleTabCount;
+            const int tabCount = mediaActive ? MediaTabCount() : IdleTabCount();
             const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
             if (delta > 0) {
                 if (g_idleTab > 0) {
@@ -7543,10 +7555,23 @@ DWORD WINAPI RenderThreadProc(void*) {
         static double prevNetDown = -1.0;
         static double prevDiskRead = -1.0;
         static double prevDiskWrite = -1.0;
-        static int prevVramPct = -2;
-        static int prevSharedVramPct = -2;
         static float prevCpuTemp = -1000.0f;
-        static float prevGpuTemp = -1000.0f;
+        static double prevGpuDigest = -1.0;
+
+        // The GPU pages are built from a variable-length list of adapters, so
+        // fold every value they display into a single number and redraw when it
+        // moves.
+        double gpuDigest = static_cast<double>(snapshot.system.gpus.size());
+        for (const GpuStats& gpu : snapshot.system.gpus) {
+            gpuDigest = gpuDigest * 31.0 + gpu.usagePercent;
+            gpuDigest = gpuDigest * 31.0 + (gpu.hasTemp ? gpu.tempC : -1000.0f);
+            gpuDigest = gpuDigest * 31.0 + gpu.dedicatedPercent;
+            gpuDigest = gpuDigest * 31.0 + gpu.dedicatedUsedGB;
+            gpuDigest = gpuDigest * 31.0 + gpu.dedicatedTotalGB;
+            gpuDigest = gpuDigest * 31.0 + gpu.sharedPercent;
+            gpuDigest = gpuDigest * 31.0 + gpu.sharedUsedGB;
+            gpuDigest = gpuDigest * 31.0 + gpu.sharedTotalGB;
+        }
 
         if (snapshot.media.artGeneration != prevArtGen ||
             snapshot.media.sourceIconGeneration != prevSrcIconGen ||
@@ -7565,10 +7590,8 @@ DWORD WINAPI RenderThreadProc(void*) {
             snapshot.system.netDownBps != prevNetDown ||
             snapshot.system.diskReadBps != prevDiskRead ||
             snapshot.system.diskWriteBps != prevDiskWrite ||
-            snapshot.system.vramPercent != prevVramPct ||
-            snapshot.system.sharedVramPercent != prevSharedVramPct ||
             snapshot.system.cpuTempC != prevCpuTemp ||
-            snapshot.system.gpuTempC != prevGpuTemp) {
+            gpuDigest != prevGpuDigest) {
             needsRender = true;
             prevArtGen = snapshot.media.artGeneration;
             prevSrcIconGen = snapshot.media.sourceIconGeneration;
@@ -7587,10 +7610,8 @@ DWORD WINAPI RenderThreadProc(void*) {
             prevNetDown = snapshot.system.netDownBps;
             prevDiskRead = snapshot.system.diskReadBps;
             prevDiskWrite = snapshot.system.diskWriteBps;
-            prevVramPct = snapshot.system.vramPercent;
-            prevSharedVramPct = snapshot.system.sharedVramPercent;
             prevCpuTemp = snapshot.system.cpuTempC;
-            prevGpuTemp = snapshot.system.gpuTempC;
+            prevGpuDigest = gpuDigest;
         }
 
         if (needsRender) {
