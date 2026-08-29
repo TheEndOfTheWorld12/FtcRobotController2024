@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.2.1
+// @version         1.2.2
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -2124,11 +2124,16 @@ static PDH_HCOUNTER g_diskReadCounter = NULL;
 static PDH_HCOUNTER g_diskWriteCounter = NULL;
 static PDH_HCOUNTER g_thermalHiPrecCounter = NULL;
 static PDH_HCOUNTER g_thermalTempCounter = NULL;
+static PDH_HCOUNTER g_cpuUtilityCounter = NULL;
 
 static void InitPdhQuery() {
     if (g_pdhQuery == NULL) {
         if (PdhOpenQueryW(NULL, 0, &g_pdhQuery) == ERROR_SUCCESS) {
             PdhAddEnglishCounterW(g_pdhQuery, L"\\GPU Engine(*)\\Utilization Percentage", 0, &g_gpuCounter);
+            // The metric Task Manager shows on Windows 10/11: frequency-
+            // normalized utilization, noticeably higher than raw "% Processor
+            // Time" on CPUs that boost. Falls back to GetSystemTimes below.
+            PdhAddEnglishCounterW(g_pdhQuery, L"\\Processor Information(_Total)\\% Processor Utility", 0, &g_cpuUtilityCounter);
             PdhAddEnglishCounterW(g_pdhQuery, L"\\GPU Adapter Memory(*)\\Dedicated Usage", 0, &g_gpuDedicatedCounter);
             PdhAddEnglishCounterW(g_pdhQuery, L"\\GPU Adapter Memory(*)\\Shared Usage", 0, &g_gpuSharedCounter);
             PdhAddEnglishCounterW(g_pdhQuery, L"\\PhysicalDisk(_Total)\\Disk Read Bytes/sec", 0, &g_diskReadCounter);
@@ -2144,10 +2149,16 @@ static void InitPdhQuery() {
     }
 }
 
-// Sums the instances of a wildcard counter. When nameFilter is set, only
-// instances whose name contains that substring are counted (e.g. the
-// "engtype_3D" GPU engines). Returns -1.0 on failure.
-static double SumPdhCounterArray(PDH_HCOUNTER counter, const wchar_t* nameFilter) {
+// Sums the instances of a wildcard counter. The optional nameFilter and
+// nameFilter2 keep only instances whose name contains both substrings (e.g.
+// the "engtype_3D" engines belonging to one adapter LUID). matchedOut
+// receives how many instances passed the filters. Returns -1.0 on failure.
+static double SumPdhCounterArray(PDH_HCOUNTER counter, const wchar_t* nameFilter,
+                                 const wchar_t* nameFilter2 = nullptr,
+                                 int* matchedOut = nullptr) {
+    if (matchedOut) {
+        *matchedOut = 0;
+    }
     if (!counter) {
         return -1.0;
     }
@@ -2166,11 +2177,22 @@ static double SumPdhCounterArray(PDH_HCOUNTER counter, const wchar_t* nameFilter
     }
 
     double total = 0.0;
+    int matched = 0;
     for (DWORD i = 0; i < itemCount; i++) {
-        if (nameFilter && (!items[i].szName || !wcsstr(items[i].szName, nameFilter))) {
+        if (!items[i].szName) {
+            continue;
+        }
+        if (nameFilter && !wcsstr(items[i].szName, nameFilter)) {
+            continue;
+        }
+        if (nameFilter2 && !wcsstr(items[i].szName, nameFilter2)) {
             continue;
         }
         total += items[i].FmtValue.doubleValue;
+        ++matched;
+    }
+    if (matchedOut) {
+        *matchedOut = matched;
     }
     return total;
 }
@@ -2191,13 +2213,18 @@ static double ReadPdhCounterValue(PDH_HCOUNTER counter) {
     return value.doubleValue;
 }
 
-// Queries DXGI once for the dedicated VRAM size and shared system memory pool
-// of the most capable hardware adapter (largest dedicated VRAM). The PDH "GPU
-// Adapter Memory" counters provide live usage; DXGI provides the totals.
-static void GetVramTotals(float* dedicatedTotalGB, float* sharedTotalGB) {
+// Queries DXGI once for the primary hardware adapter (largest dedicated
+// VRAM): its dedicated VRAM size, shared system memory pool size, and its
+// LUID formatted the way PDH GPU counter instance names embed it
+// ("luid_0xHHHHHHHH_0xLLLLLLLL"). The LUID lets the live usage counters be
+// filtered to the same adapter the totals describe, so used never comes from
+// one GPU while total comes from another on multi-GPU/iGPU systems.
+static void GetPrimaryGpuInfo(float* dedicatedTotalGB, float* sharedTotalGB,
+                              const wchar_t** luidFilter) {
     static bool s_queried = false;
     static float s_dedicatedGB = 0.0f;
     static float s_sharedGB = 0.0f;
+    static wchar_t s_luid[40] = {};
 
     if (!s_queried) {
         s_queried = true;
@@ -2220,6 +2247,9 @@ static void GetVramTotals(float* dedicatedTotalGB, float* sharedTotalGB) {
                 if (dedicated >= s_dedicatedGB) {
                     s_dedicatedGB = dedicated;
                     s_sharedGB = static_cast<float>(desc.SharedSystemMemory / kBytesPerGB);
+                    swprintf_s(s_luid, L"luid_0x%08X_0x%08X",
+                               static_cast<unsigned int>(desc.AdapterLuid.HighPart),
+                               static_cast<unsigned int>(desc.AdapterLuid.LowPart));
                 }
             }
         }
@@ -2230,6 +2260,9 @@ static void GetVramTotals(float* dedicatedTotalGB, float* sharedTotalGB) {
     }
     if (sharedTotalGB) {
         *sharedTotalGB = s_sharedGB;
+    }
+    if (luidFilter) {
+        *luidFilter = s_luid[0] ? s_luid : nullptr;
     }
 }
 
@@ -2432,11 +2465,17 @@ void UpdateSystemSnapshot() {
 
     constexpr double kBytesPerGB = 1024.0 * 1024.0 * 1024.0;
 
+    bool cpuFromPdh = false;
+
     InitPdhQuery();
     if (g_pdhQuery && PdhCollectQueryData(g_pdhQuery) == ERROR_SUCCESS) {
-        const double gpu = SumPdhCounterArray(g_gpuCounter, L"engtype_3D");
-        if (gpu >= 0.0) {
-            next.gpuPercent = ClampInt(static_cast<int>(gpu), 0, 100);
+        // "% Processor Utility" is what Task Manager displays: it is
+        // normalized by base frequency, so on a boosting CPU it reads much
+        // higher than the raw time-based number. Task Manager caps it at 100.
+        const double cpuUtility = ReadPdhCounterValue(g_cpuUtilityCounter);
+        if (cpuUtility >= 0.0) {
+            next.cpuPercent = ClampInt(static_cast<int>(cpuUtility + 0.5), 0, 100);
+            cpuFromPdh = true;
         }
 
         const double diskRead = ReadPdhCounterValue(g_diskReadCounter);
@@ -2450,18 +2489,38 @@ void UpdateSystemSnapshot() {
 
         float dedicatedTotalGB = 0.0f;
         float sharedTotalGB = 0.0f;
-        GetVramTotals(&dedicatedTotalGB, &sharedTotalGB);
+        const wchar_t* gpuLuid = nullptr;
+        GetPrimaryGpuInfo(&dedicatedTotalGB, &sharedTotalGB, &gpuLuid);
         next.vramTotalGB = dedicatedTotalGB;
         next.sharedVramTotalGB = sharedTotalGB;
 
-        const double dedicatedUsed = SumPdhCounterArray(g_gpuDedicatedCounter, nullptr);
+        // Filter the usage counters to the adapter the DXGI totals describe;
+        // if the instance naming doesn't carry that LUID (older builds), fall
+        // back to summing every adapter as before.
+        int matched = 0;
+        double gpu = SumPdhCounterArray(g_gpuCounter, L"engtype_3D", gpuLuid, &matched);
+        if (gpuLuid && matched == 0) {
+            gpu = SumPdhCounterArray(g_gpuCounter, L"engtype_3D");
+        }
+        if (gpu >= 0.0) {
+            next.gpuPercent = ClampInt(static_cast<int>(gpu), 0, 100);
+        }
+
+        double dedicatedUsed = SumPdhCounterArray(g_gpuDedicatedCounter, gpuLuid, nullptr, &matched);
+        if (gpuLuid && matched == 0) {
+            dedicatedUsed = SumPdhCounterArray(g_gpuDedicatedCounter, nullptr);
+        }
         if (dedicatedUsed >= 0.0) {
             next.vramUsedGB = static_cast<float>(dedicatedUsed / kBytesPerGB);
             next.vramPercent = dedicatedTotalGB > 0.0f
                 ? ClampInt(static_cast<int>(dedicatedUsed / (dedicatedTotalGB * kBytesPerGB) * 100.0 + 0.5), 0, 100)
                 : -1;
         }
-        const double sharedUsed = SumPdhCounterArray(g_gpuSharedCounter, nullptr);
+
+        double sharedUsed = SumPdhCounterArray(g_gpuSharedCounter, gpuLuid, nullptr, &matched);
+        if (gpuLuid && matched == 0) {
+            sharedUsed = SumPdhCounterArray(g_gpuSharedCounter, nullptr);
+        }
         if (sharedUsed >= 0.0) {
             next.sharedVramUsedGB = static_cast<float>(sharedUsed / kBytesPerGB);
             next.sharedVramPercent = sharedTotalGB > 0.0f
@@ -2529,7 +2588,10 @@ void UpdateSystemSnapshot() {
 
         const ULONGLONG total = (kernelNow - kernelPrev) + (userNow - userPrev);
         const ULONGLONG idleDelta = idleNow - idlePrev;
-        if (total > 0 && kernelPrev != 0) {
+        // Time-based fallback, only used when the "% Processor Utility"
+        // counter is unavailable (it needs one collection to warm up, and
+        // doesn't exist before Windows 10).
+        if (!cpuFromPdh && total > 0 && kernelPrev != 0) {
             next.cpuPercent = ClampInt(static_cast<int>((total - idleDelta) * 100 / total), 0, 100);
         }
 
