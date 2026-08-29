@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.2.2
+// @version         1.2.3
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -1700,6 +1700,24 @@ float SampleAudioAmplitude(BYTE* data, UINT32 frames, WAVEFORMATEX* format) {
             const double v = s[i] / 32768.0;
             sum += v * v;
         }
+    } else if (format->wBitsPerSample == 32) {
+        // Integer 32-bit (or 24-in-32) PCM mix formats exposed by some
+        // driver/APO configurations.
+        auto* s = reinterpret_cast<int32_t*>(data);
+        for (size_t i = 0; i < samples; ++i) {
+            const double v = s[i] / 2147483648.0;
+            sum += v * v;
+        }
+    } else if (format->wBitsPerSample == 24) {
+        // Packed 24-bit PCM, little-endian.
+        const uint8_t* b = data;
+        for (size_t i = 0; i < samples; ++i) {
+            int32_t raw = (static_cast<int32_t>(b[i * 3]) << 8) |
+                          (static_cast<int32_t>(b[i * 3 + 1]) << 16) |
+                          (static_cast<int32_t>(b[i * 3 + 2]) << 24);
+            const double v = (raw >> 8) / 8388608.0;
+            sum += v * v;
+        }
     }
 
     const double rms = samples ? std::sqrt(sum / samples) : 0.0;
@@ -2003,6 +2021,11 @@ DWORD WINAPI AudioThreadProc(void*) {
             hr = client->Start();
         }
 
+        LPWSTR openedDeviceId = nullptr;
+        if (SUCCEEDED(hr) && device) {
+            device->GetId(&openedDeviceId);
+        }
+
         if (FAILED(hr)) {
             if (mixFormat) {
                 CoTaskMemFree(mixFormat);
@@ -2011,7 +2034,28 @@ DWORD WINAPI AudioThreadProc(void*) {
             continue;
         }
 
+        int defaultDevicePoll = 0;
         while (WaitForSingleObject(g_stopEvent, 16) == WAIT_TIMEOUT) {
+            // The loopback capture stays bound to whichever device was the
+            // default when it was opened. If the user switches outputs
+            // (headphones, Bluetooth, HDMI), audio moves to the new default
+            // and this capture hears only silence — so re-check roughly once
+            // a second and reopen on the current default when it changes.
+            if (++defaultDevicePoll >= 64) {
+                defaultDevicePoll = 0;
+                ComPtr<IMMDevice> currentDefault;
+                LPWSTR currentId = nullptr;
+                if (openedDeviceId && enumerator &&
+                    SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &currentDefault)) &&
+                    currentDefault && SUCCEEDED(currentDefault->GetId(&currentId))) {
+                    const bool deviceChanged = wcscmp(currentId, openedDeviceId) != 0;
+                    CoTaskMemFree(currentId);
+                    if (deviceChanged) {
+                        break;
+                    }
+                }
+            }
+
             UINT32 packetFrames = 0;
             if (FAILED(capture->GetNextPacketSize(&packetFrames))) {
                 break;
@@ -2051,6 +2095,9 @@ DWORD WINAPI AudioThreadProc(void*) {
         }
 
         client->Stop();
+        if (openedDeviceId) {
+            CoTaskMemFree(openedDeviceId);
+        }
         if (mixFormat) {
             CoTaskMemFree(mixFormat);
         }
@@ -5248,11 +5295,32 @@ class Renderer {
         // Use a step size of 4 samples (approx 40ms) so bars aren't identical
         const size_t step = 4;
 
+        // If the loopback capture hears nothing while media is playing (the
+        // source renders in exclusive mode, or the capture is between device
+        // reopens), fall back to a gentle synthetic pulse so the bars still
+        // read as "playing" instead of freezing. Real audio data takes over
+        // again the moment the capture delivers signal.
+        bool hasSignal = false;
+        for (float sample : state.waveform) {
+            if (sample > 0.004f) {
+                hasSignal = true;
+                break;
+            }
+        }
+        const double now = NowSeconds();
+
         for (size_t i = 0; i < count; ++i) {
-            const size_t offset = (count - i) * step;
-            const size_t source = (state.waveformWrite + state.waveform.size() - offset) %
-                                  state.waveform.size();
-            const float amp = Clamp(state.waveform[source], 0.03f, 1.0f);
+            float amp;
+            if (hasSignal) {
+                const size_t offset = (count - i) * step;
+                const size_t source = (state.waveformWrite + state.waveform.size() - offset) %
+                                      state.waveform.size();
+                amp = Clamp(state.waveform[source], 0.03f, 1.0f);
+            } else {
+                amp = Clamp(0.22f + 0.18f * static_cast<float>(
+                                std::sin(now * 3.6 + static_cast<double>(i) * 1.1)),
+                            0.05f, 1.0f);
+            }
             const float h = std::max(3.0f, amp * maxH);
             const float x = rect.left + i * (barWidth + gap);
             D2D1_RECT_F bar = D2D1::RectF(x, centerY - h * 0.5f, x + barWidth, centerY + h * 0.5f);
