@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.3.0
+// @version         1.3.1
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -489,9 +489,13 @@ std::atomic<double> g_lastNudgeTime = 0.0;
 // handled on the keyboard thread (RegisterHotKey delivers WM_HOTKEY to the
 // registering thread's message queue).
 constexpr UINT WM_APP_HOTKEY_CHANGED = WM_APP + 0x445;
+constexpr UINT WM_APP_TOGGLE_OVERLAY = WM_APP + 0x446;
 constexpr int kGameOverlayHotkeyId = 1;
 std::atomic<UINT> g_overlayHotkeyModifiers = 0;
 std::atomic<UINT> g_overlayHotkeyVk = 0;
+// False when RegisterHotKey was refused (another app already owns the combo);
+// the low-level keyboard hook then detects the chord itself.
+std::atomic<bool> g_overlayHotkeyRegistered = false;
 DWORD g_keyboardThreadId = 0;
 
 constexpr GUID kSubTypeIeeeFloat = {
@@ -6078,10 +6082,38 @@ HANDLE g_keyboardThread = nullptr;
 
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION) {
+        auto* kbd = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+
         if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
-            auto* kbd = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
             if (kbd->vkCode == VK_CAPITAL || kbd->vkCode == VK_NUMLOCK) {
                 PostMessageW(g_hwnd, WM_APP_CAPSLOCK, kbd->vkCode, 0);
+            }
+        }
+
+        // Fallback path for the game overlay hotkey: when RegisterHotKey was
+        // refused (another app holds the combo) no WM_HOTKEY ever arrives, so
+        // recognize the chord here instead. Auto-repeat is suppressed until
+        // the key is released.
+        static bool s_overlayChordHeld = false;
+        const UINT overlayVk = g_overlayHotkeyVk.load();
+        if (overlayVk != 0 && !g_overlayHotkeyRegistered.load() &&
+            kbd->vkCode == overlayVk) {
+            if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
+                const UINT mods = g_overlayHotkeyModifiers.load();
+                auto down = [](int vk) {
+                    return (GetAsyncKeyState(vk) & 0x8000) != 0;
+                };
+                const bool modsHeld =
+                    (!(mods & MOD_CONTROL) || down(VK_CONTROL)) &&
+                    (!(mods & MOD_ALT) || down(VK_MENU)) &&
+                    (!(mods & MOD_SHIFT) || down(VK_SHIFT)) &&
+                    (!(mods & MOD_WIN) || down(VK_LWIN) || down(VK_RWIN));
+                if (modsHeld && !s_overlayChordHeld) {
+                    s_overlayChordHeld = true;
+                    PostThreadMessageW(g_keyboardThreadId, WM_APP_TOGGLE_OVERLAY, 0, 0);
+                }
+            } else if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
+                s_overlayChordHeld = false;
             }
         }
     }
@@ -6093,24 +6125,38 @@ DWORD WINAPI KeyboardThreadProc(void*) {
 
     auto registerOverlayHotkey = []() {
         UnregisterHotKey(nullptr, kGameOverlayHotkeyId);
+        g_overlayHotkeyRegistered = false;
         const UINT modifiers = g_overlayHotkeyModifiers.load();
         const UINT vk = g_overlayHotkeyVk.load();
-        if (vk != 0 &&
-            !RegisterHotKey(nullptr, kGameOverlayHotkeyId, modifiers | MOD_NOREPEAT, vk)) {
-            Wh_Log(L"Failed to register game overlay hotkey (already taken by another app?).");
+        if (vk == 0) {
+            return;
+        }
+        if (RegisterHotKey(nullptr, kGameOverlayHotkeyId, modifiers | MOD_NOREPEAT, vk)) {
+            g_overlayHotkeyRegistered = true;
+        } else {
+            Wh_Log(L"Game overlay hotkey is held by another app; using the "
+                   L"keyboard hook to detect it instead.");
         }
     };
     registerOverlayHotkey();
 
+    // Toggle between the normal pill and the game overlay, same as the
+    // context menu item.
+    auto toggleGameOverlay = []() {
+        Wh_SetIntValue(L"GameOverlayPinned",
+                       Wh_GetIntValue(L"GameOverlayPinned", 0) ? 0 : 1);
+        g_layoutDirty = true;
+        TriggerNudge();
+    };
+
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
         if (msg.message == WM_HOTKEY && msg.wParam == kGameOverlayHotkeyId) {
-            // Toggle between the normal pill and the game overlay, same as
-            // the context menu item.
-            Wh_SetIntValue(L"GameOverlayPinned",
-                           Wh_GetIntValue(L"GameOverlayPinned", 0) ? 0 : 1);
-            g_layoutDirty = true;
-            TriggerNudge();
+            toggleGameOverlay();
+            continue;
+        }
+        if (msg.message == WM_APP_TOGGLE_OVERLAY) {
+            toggleGameOverlay();
             continue;
         }
         if (msg.message == WM_APP_HOTKEY_CHANGED) {
