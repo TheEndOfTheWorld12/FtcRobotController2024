@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.3.2
+// @version         1.3.3
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -6766,13 +6766,21 @@ DWORD WINAPI RenderThreadProc(void*) {
                 primary.height = 0.0f;
             }
         }
-        // The game overlay is the pill's collapsed presentation while it is
-        // toggled on — hover/click expansion still opens the regular
-        // dashboard pages, so don't force the overlay size when expanded.
-        if (primary.kind == IslandKind::Idle && !pinned && !isHoverExpanded &&
-            (g_settings.gameOverlay || Wh_GetIntValue(L"GameOverlayPinned", 0) != 0)) {
+        // While the game overlay is toggled on it becomes the pill's collapsed
+        // presentation, taking over from the idle dashboard AND from the media
+        // pill — otherwise the overlay would stay hidden for as long as
+        // something is playing. Brief alerts (clipboard, notifications,
+        // volume, battery...) still interrupt and then hand the pill back.
+        // Hover/pin expansion is untouched, so the full dashboard pages remain
+        // one hover away.
+        const bool overlayMode =
+            g_settings.gameOverlay || Wh_GetIntValue(L"GameOverlayPinned", 0) != 0;
+        if (overlayMode && !pinned && !isHoverExpanded &&
+            (primary.kind == IslandKind::Idle || primary.kind == IslandKind::Media)) {
+            primary.kind = IslandKind::Idle;
             primary.width = 372.0f * g_settings.sizeScale;
             primary.height = 64.0f * g_settings.sizeScale;
+            secondary.reset();
         }
         if (primary.kind == IslandKind::Media) {
             bool recentArtChange = (NowSeconds() - g_state.media.artChangedAt) < 4.0;
@@ -6879,6 +6887,11 @@ DWORD WINAPI RenderThreadProc(void*) {
         // Animated activities that require continuous rendering
         if (primary.kind == IslandKind::Media || primary.kind == IslandKind::BatteryLow ||
             primary.kind == IslandKind::Clipboard || primary.kind == IslandKind::Notification) {
+            needsRender = true;
+        }
+
+        // The game overlay shows a live FPS readout, so keep it refreshing.
+        if (overlayMode) {
             needsRender = true;
         }
 
