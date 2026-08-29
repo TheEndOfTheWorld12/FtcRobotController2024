@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.2.4
+// @version         1.3.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -33,7 +33,10 @@ media, downloads, clipboard, battery, and more.
     percent plus used GB / total pool size in GB).
   - **Network & Disk** — system-wide upload, download and combined transfer
     rates, and disk read, write and combined speeds.
-- Optional game overlay with FPS/CPU/RAM/GPU/disk cards.
+- Optional game overlay with FPS/CPU/RAM/GPU/disk cards, toggled from the
+  context menu or with a configurable hotkey (default Ctrl+Alt+G). While the
+  overlay is on it acts as the pill's collapsed look — hovering or clicking
+  still expands into the regular dashboard pages.
 
 CPU temperature is read from the ACPI thermal zones exposed by the firmware,
 averaged across all zones. The mod first tries the "Thermal Zone Information"
@@ -113,6 +116,9 @@ shown; that is a platform limitation, not a mod bug.
     $name: Progress module
   - GameOverlay: false
     $name: Game overlay
+  - GameOverlayHotkey: "Ctrl+Alt+G"
+    $name: Game overlay hotkey
+    $description: Toggles the game overlay from anywhere. Examples - Ctrl+Alt+G, Ctrl+Shift+F9, Win+End. Set to none to disable.
   - ShowMetricText: true
     $name: Show metric labels
   - WeatherCity: ""
@@ -258,6 +264,7 @@ struct Settings {
     float pillOpacity = 0.96f;
     bool gameOverlay = false;
     bool showMetricText = true;
+    std::wstring gameOverlayHotkey;
     std::wstring weatherCity;
     bool weatherFahrenheit = false;
     int autoHideIdleSeconds = 0;
@@ -478,6 +485,15 @@ UINT g_shellHookMessage = 0;
 bool g_volumeInitialized = false;
 std::atomic<double> g_lastNudgeTime = 0.0;
 
+// Game overlay toggle hotkey — parsed from settings here, registered and
+// handled on the keyboard thread (RegisterHotKey delivers WM_HOTKEY to the
+// registering thread's message queue).
+constexpr UINT WM_APP_HOTKEY_CHANGED = WM_APP + 0x445;
+constexpr int kGameOverlayHotkeyId = 1;
+std::atomic<UINT> g_overlayHotkeyModifiers = 0;
+std::atomic<UINT> g_overlayHotkeyVk = 0;
+DWORD g_keyboardThreadId = 0;
+
 constexpr GUID kSubTypeIeeeFloat = {
     0x00000003,
     0x0000,
@@ -597,6 +613,85 @@ D2D1_COLOR_F GetSystemAccentColor() {
     return D2D1::ColorF(0x4cc9f0);
 }
 
+// Parses a hotkey description like "Ctrl+Alt+G", "Ctrl+Shift+F10" or
+// "Win+End" into RegisterHotKey modifiers and a virtual key. Returns false
+// (leaving both outputs zero) for empty, "none", or unrecognized input.
+bool ParseHotkeySetting(std::wstring text, UINT* modifiers, UINT* vk) {
+    *modifiers = 0;
+    *vk = 0;
+
+    text.erase(std::remove(text.begin(), text.end(), L' '), text.end());
+    if (text.empty() || EqualsNoCase(text, L"none")) {
+        return false;
+    }
+
+    size_t start = 0;
+    while (start < text.size()) {
+        const size_t plus = text.find(L'+', start);
+        const std::wstring token = text.substr(
+            start, plus == std::wstring::npos ? std::wstring::npos : plus - start);
+        start = plus == std::wstring::npos ? text.size() : plus + 1;
+
+        if (EqualsNoCase(token, L"ctrl") || EqualsNoCase(token, L"control")) {
+            *modifiers |= MOD_CONTROL;
+        } else if (EqualsNoCase(token, L"alt")) {
+            *modifiers |= MOD_ALT;
+        } else if (EqualsNoCase(token, L"shift")) {
+            *modifiers |= MOD_SHIFT;
+        } else if (EqualsNoCase(token, L"win") || EqualsNoCase(token, L"windows")) {
+            *modifiers |= MOD_WIN;
+        } else if (token.size() == 1 &&
+                   ((towupper(token[0]) >= L'A' && towupper(token[0]) <= L'Z') ||
+                    (token[0] >= L'0' && token[0] <= L'9'))) {
+            *vk = static_cast<UINT>(towupper(token[0]));
+        } else if (token.size() >= 2 && (token[0] == L'F' || token[0] == L'f') &&
+                   token[1] >= L'0' && token[1] <= L'9') {
+            const int fn = _wtoi(token.c_str() + 1);
+            if (fn >= 1 && fn <= 24) {
+                *vk = VK_F1 + fn - 1;
+            }
+        } else if (EqualsNoCase(token, L"space")) {
+            *vk = VK_SPACE;
+        } else if (EqualsNoCase(token, L"tab")) {
+            *vk = VK_TAB;
+        } else if (EqualsNoCase(token, L"home")) {
+            *vk = VK_HOME;
+        } else if (EqualsNoCase(token, L"end")) {
+            *vk = VK_END;
+        } else if (EqualsNoCase(token, L"insert") || EqualsNoCase(token, L"ins")) {
+            *vk = VK_INSERT;
+        } else if (EqualsNoCase(token, L"delete") || EqualsNoCase(token, L"del")) {
+            *vk = VK_DELETE;
+        } else if (EqualsNoCase(token, L"up")) {
+            *vk = VK_UP;
+        } else if (EqualsNoCase(token, L"down")) {
+            *vk = VK_DOWN;
+        } else if (EqualsNoCase(token, L"left")) {
+            *vk = VK_LEFT;
+        } else if (EqualsNoCase(token, L"right")) {
+            *vk = VK_RIGHT;
+        } else if (EqualsNoCase(token, L"pageup") || EqualsNoCase(token, L"pgup")) {
+            *vk = VK_PRIOR;
+        } else if (EqualsNoCase(token, L"pagedown") || EqualsNoCase(token, L"pgdn")) {
+            *vk = VK_NEXT;
+        } else if (EqualsNoCase(token, L"pause")) {
+            *vk = VK_PAUSE;
+        } else if (EqualsNoCase(token, L"backspace")) {
+            *vk = VK_BACK;
+        } else if (EqualsNoCase(token, L"enter") || EqualsNoCase(token, L"return")) {
+            *vk = VK_RETURN;
+        } else if (EqualsNoCase(token, L"esc") || EqualsNoCase(token, L"escape")) {
+            *vk = VK_ESCAPE;
+        }
+    }
+
+    if (*vk == 0) {
+        *modifiers = 0;
+        return false;
+    }
+    return true;
+}
+
 void LoadSettings() {
     Settings next;
 
@@ -651,6 +746,7 @@ void LoadSettings() {
                              0.35f, 1.0f);
     next.gameOverlay = Wh_GetIntSetting(L"Modules.GameOverlay") != 0;
     next.showMetricText = Wh_GetIntSetting(L"Modules.ShowMetricText") != 0;
+    next.gameOverlayHotkey = GetStringSettingCopy(L"Modules.GameOverlayHotkey");
     next.weatherCity = GetStringSettingCopy(L"Modules.WeatherCity");
     next.weatherFahrenheit = Wh_GetIntSetting(L"Modules.WeatherFahrenheit") != 0;
     const std::wstring hideSec = GetStringSettingCopy(L"Appearance.AutoHideIdleSeconds");
@@ -702,6 +798,19 @@ void LoadSettings() {
     g_layoutDirty = true;
     if (cityChanged && g_settingsChangedEvent) {
         SetEvent(g_settingsChangedEvent);
+    }
+
+    // Publish the parsed game-overlay hotkey and tell the keyboard thread to
+    // re-register it when it changed.
+    UINT hotkeyModifiers = 0;
+    UINT hotkeyVk = 0;
+    ParseHotkeySetting(next.gameOverlayHotkey, &hotkeyModifiers, &hotkeyVk);
+    const bool hotkeyChanged = hotkeyModifiers != g_overlayHotkeyModifiers.load() ||
+                               hotkeyVk != g_overlayHotkeyVk.load();
+    g_overlayHotkeyModifiers = hotkeyModifiers;
+    g_overlayHotkeyVk = hotkeyVk;
+    if (hotkeyChanged && g_keyboardThreadId != 0) {
+        PostThreadMessageW(g_keyboardThreadId, WM_APP_HOTKEY_CHANGED, 0, 0);
     }
 }
 
@@ -4252,7 +4361,12 @@ class Renderer {
 
     void DrawIdleDashboard(const SharedState& state, D2D1_RECT_F rect, const Settings& settings,
                            double now) {
-        if (settings.gameOverlay || Wh_GetIntValue(L"GameOverlayPinned", 0) != 0) {
+        // While the game overlay is toggled on it replaces only the pill's
+        // collapsed look (the overlay is 64 units tall; the expanded panel is
+        // 184) — an expanded pill still shows the regular dashboard pages.
+        const bool overlayMode =
+            settings.gameOverlay || Wh_GetIntValue(L"GameOverlayPinned", 0) != 0;
+        if (overlayMode && (rect.bottom - rect.top) < 100.0f) {
             DrawGameOverlay(state, rect, 1.0f);
             return;
         }
@@ -5957,7 +6071,6 @@ std::vector<IslandKind> ChooseActivities(const SharedState& state, const Setting
 constexpr UINT WM_APP_CAPSLOCK = WM_APP + 0x444;
 HHOOK g_keyboardHook = nullptr;
 HANDLE g_keyboardThread = nullptr;
-DWORD g_keyboardThreadId = 0;
 
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION) {
@@ -5973,11 +6086,38 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 
 DWORD WINAPI KeyboardThreadProc(void*) {
     g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, nullptr, 0);
+
+    auto registerOverlayHotkey = []() {
+        UnregisterHotKey(nullptr, kGameOverlayHotkeyId);
+        const UINT modifiers = g_overlayHotkeyModifiers.load();
+        const UINT vk = g_overlayHotkeyVk.load();
+        if (vk != 0 &&
+            !RegisterHotKey(nullptr, kGameOverlayHotkeyId, modifiers | MOD_NOREPEAT, vk)) {
+            Wh_Log(L"Failed to register game overlay hotkey (already taken by another app?).");
+        }
+    };
+    registerOverlayHotkey();
+
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
+        if (msg.message == WM_HOTKEY && msg.wParam == kGameOverlayHotkeyId) {
+            // Toggle between the normal pill and the game overlay, same as
+            // the context menu item.
+            Wh_SetIntValue(L"GameOverlayPinned",
+                           Wh_GetIntValue(L"GameOverlayPinned", 0) ? 0 : 1);
+            g_layoutDirty = true;
+            TriggerNudge();
+            continue;
+        }
+        if (msg.message == WM_APP_HOTKEY_CHANGED) {
+            registerOverlayHotkey();
+            continue;
+        }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+
+    UnregisterHotKey(nullptr, kGameOverlayHotkeyId);
     if (g_keyboardHook) {
         UnhookWindowsHookEx(g_keyboardHook);
         g_keyboardHook = nullptr;
@@ -6444,7 +6584,10 @@ DWORD WINAPI RenderThreadProc(void*) {
                 primary.height = 0.0f;
             }
         }
-        if (primary.kind == IslandKind::Idle &&
+        // The game overlay is the pill's collapsed presentation while it is
+        // toggled on — hover/click expansion still opens the regular
+        // dashboard pages, so don't force the overlay size when expanded.
+        if (primary.kind == IslandKind::Idle && !pinned && !isHoverExpanded &&
             (g_settings.gameOverlay || Wh_GetIntValue(L"GameOverlayPinned", 0) != 0)) {
             primary.width = 372.0f * g_settings.sizeScale;
             primary.height = 64.0f * g_settings.sizeScale;
