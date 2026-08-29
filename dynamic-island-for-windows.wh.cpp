@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.6.1
+// @version         1.6.2
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -42,11 +42,12 @@ media, downloads, clipboard, battery, and more.
   overlay is on it acts as the pill's collapsed look — hovering or clicking
   still expands into the regular dashboard pages.
 
-GPU temperature comes from the graphics vendor's own library, since Windows
-publishes no equivalent of the ACPI thermal zones for GPUs: NVML for NVIDIA
-cards, ADL for AMD, and failing those the sensors LibreHardwareMonitor or
-OpenHardwareMonitor publish over WMI when either is running. Intel graphics
-expose nothing comparable, so those machines show "N/A".
+GPU temperature is read from the display driver's WDDM performance data —
+the same source Task Manager shows — which covers every vendor, including
+both halves of a hybrid laptop. Where a driver does not publish it, the
+vendor libraries are tried instead: NVML for NVIDIA, ADL for AMD, and
+finally the sensors LibreHardwareMonitor or OpenHardwareMonitor publish over
+WMI when either is running.
 
 On NVIDIA cards NVML also supplies the dedicated VRAM figures directly,
 which is more dependable than pairing a performance counter with a display
@@ -2474,6 +2475,7 @@ static double ReadPdhCounterValue(PDH_HCOUNTER counter) {
 // GPU counter instance names embed it ("luid_0x........_0x........").
 struct GpuAdapterInfo {
     std::wstring luid;
+    LUID luidRaw = {};
     float dedicatedGB = 0.0f;
     float sharedGB = 0.0f;
 };
@@ -2508,6 +2510,7 @@ static const std::vector<GpuAdapterInfo>& GetGpuAdapters() {
 
                 GpuAdapterInfo info;
                 info.luid = luid;
+                info.luidRaw = desc.AdapterLuid;
                 info.dedicatedGB = static_cast<float>(desc.DedicatedVideoMemory / kBytesPerGB);
                 info.sharedGB = static_cast<float>(desc.SharedSystemMemory / kBytesPerGB);
                 s_adapters.push_back(info);
@@ -2768,6 +2771,123 @@ static bool QueryCpuTemperature(float* celsius) {
 // so each vendor's own library is asked in turn. Everything is resolved with
 // LoadLibrary/GetProcAddress so the mod still builds and runs on machines
 // where none of them exist.
+
+// The display driver's own performance data, reached through the WDDM
+// kernel interface in gdi32. This is where Task Manager's GPU temperature
+// comes from, so it works for every vendor — including the Intel and NVIDIA
+// halves of a hybrid laptop — without a vendor SDK.
+using D3DKMT_HANDLE = UINT32;
+
+struct D3DKMT_OPENADAPTERFROMLUID {
+    LUID AdapterLuid;
+    D3DKMT_HANDLE hAdapter;
+};
+
+struct D3DKMT_CLOSEADAPTER {
+    D3DKMT_HANDLE hAdapter;
+};
+
+struct D3DKMT_QUERYADAPTERINFO {
+    D3DKMT_HANDLE hAdapter;
+    int Type;
+    void* pPrivateDriverData;
+    UINT32 PrivateDriverDataSize;
+};
+
+struct D3DKMT_ADAPTER_PERFDATA {
+    UINT32 PhysicalAdapterIndex;
+    ULONGLONG MemoryFrequency;
+    ULONGLONG MaxMemoryFrequency;
+    ULONGLONG MaxMemoryFrequencyOC;
+    ULONGLONG MemoryBandwidth;
+    ULONGLONG PCIEBandwidth;
+    ULONG FanRPM;
+    ULONG Power;
+    ULONG Temperature;
+    UCHAR PowerDrawPercent;
+};
+
+// KMTQAITYPE_ADAPTERPERFDATA
+constexpr int kAdapterPerfDataQuery = 62;
+
+static bool QueryGpuTemperatureD3DKMT(float* celsius) {
+    using D3DKMTOpenAdapterFromLuid_t = LONG(__stdcall*)(D3DKMT_OPENADAPTERFROMLUID*);
+    using D3DKMTQueryAdapterInfo_t = LONG(__stdcall*)(D3DKMT_QUERYADAPTERINFO*);
+    using D3DKMTCloseAdapter_t = LONG(__stdcall*)(D3DKMT_CLOSEADAPTER*);
+
+    static bool tried = false;
+    static D3DKMTOpenAdapterFromLuid_t openAdapter = nullptr;
+    static D3DKMTQueryAdapterInfo_t queryInfo = nullptr;
+    static D3DKMTCloseAdapter_t closeAdapter = nullptr;
+
+    if (!tried) {
+        tried = true;
+        if (HMODULE gdi = GetModuleHandleW(L"gdi32.dll")) {
+            openAdapter = reinterpret_cast<D3DKMTOpenAdapterFromLuid_t>(
+                GetProcAddress(gdi, "D3DKMTOpenAdapterFromLuid"));
+            queryInfo = reinterpret_cast<D3DKMTQueryAdapterInfo_t>(
+                GetProcAddress(gdi, "D3DKMTQueryAdapterInfo"));
+            closeAdapter = reinterpret_cast<D3DKMTCloseAdapter_t>(
+                GetProcAddress(gdi, "D3DKMTCloseAdapter"));
+        }
+        Wh_Log(L"WDDM adapter perf data %s.",
+               (openAdapter && queryInfo) ? L"available" : L"unavailable");
+    }
+
+    if (!openAdapter || !queryInfo) {
+        return false;
+    }
+
+    // Prefer the adapter with the most dedicated memory — the discrete GPU on
+    // a hybrid laptop — but accept any adapter that answers.
+    const std::vector<GpuAdapterInfo>& adapters = GetGpuAdapters();
+    std::vector<const GpuAdapterInfo*> ordered;
+    ordered.reserve(adapters.size());
+    for (const GpuAdapterInfo& adapter : adapters) {
+        ordered.push_back(&adapter);
+    }
+    std::sort(ordered.begin(), ordered.end(),
+              [](const GpuAdapterInfo* a, const GpuAdapterInfo* b) {
+                  return a->dedicatedGB > b->dedicatedGB;
+              });
+
+    for (const GpuAdapterInfo* adapter : ordered) {
+        D3DKMT_OPENADAPTERFROMLUID open = {};
+        open.AdapterLuid = adapter->luidRaw;
+        if (openAdapter(&open) != 0 || open.hAdapter == 0) {
+            continue;
+        }
+
+        D3DKMT_ADAPTER_PERFDATA perfData = {};
+        D3DKMT_QUERYADAPTERINFO query = {};
+        query.hAdapter = open.hAdapter;
+        query.Type = kAdapterPerfDataQuery;
+        query.pPrivateDriverData = &perfData;
+        query.PrivateDriverDataSize = sizeof(perfData);
+        const bool ok = queryInfo(&query) == 0;
+
+        if (closeAdapter) {
+            D3DKMT_CLOSEADAPTER close = {};
+            close.hAdapter = open.hAdapter;
+            closeAdapter(&close);
+        }
+
+        if (!ok || perfData.Temperature == 0) {
+            continue;
+        }
+
+        // Drivers report deci-degrees; a few report whole degrees.
+        float value = static_cast<float>(perfData.Temperature);
+        if (value > 200.0f) {
+            value /= 10.0f;
+        }
+        if (value > 0.0f && value < 150.0f) {
+            *celsius = value;
+            return true;
+        }
+    }
+    return false;
+}
 
 // NVIDIA, through NVML (ships with the driver as nvml.dll). NVML reports the
 // card's own sensors and memory directly, so it is both the temperature
@@ -3058,8 +3178,8 @@ static bool QueryGpuTemperature(float* celsius) {
     if (!celsius) {
         return false;
     }
-    return QueryGpuTemperatureNvml(celsius) || QueryGpuTemperatureAdl(celsius) ||
-           QueryGpuTemperatureHardwareMonitor(celsius);
+    return QueryGpuTemperatureD3DKMT(celsius) || QueryGpuTemperatureNvml(celsius) ||
+           QueryGpuTemperatureAdl(celsius) || QueryGpuTemperatureHardwareMonitor(celsius);
 }
 
 void UpdateSystemSnapshot() {
