@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.3.1
+// @version         1.3.2
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -2313,6 +2313,27 @@ static void InitPdhQuery() {
     }
 }
 
+// Case-insensitive substring search. PDH GPU instance names embed the
+// adapter LUID as hex whose letter case differs between Windows builds, so
+// every comparison against them has to ignore case.
+static const wchar_t* StrStrNoCase(const wchar_t* haystack, const wchar_t* needle) {
+    if (!haystack || !needle || !*needle) {
+        return haystack;
+    }
+    for (const wchar_t* h = haystack; *h; ++h) {
+        const wchar_t* a = h;
+        const wchar_t* b = needle;
+        while (*a && *b && towlower(*a) == towlower(*b)) {
+            ++a;
+            ++b;
+        }
+        if (!*b) {
+            return h;
+        }
+    }
+    return nullptr;
+}
+
 // Sums the instances of a wildcard counter. The optional nameFilter and
 // nameFilter2 keep only instances whose name contains both substrings (e.g.
 // the "engtype_3D" engines belonging to one adapter LUID). matchedOut
@@ -2346,10 +2367,10 @@ static double SumPdhCounterArray(PDH_HCOUNTER counter, const wchar_t* nameFilter
         if (!items[i].szName) {
             continue;
         }
-        if (nameFilter && !wcsstr(items[i].szName, nameFilter)) {
+        if (nameFilter && !StrStrNoCase(items[i].szName, nameFilter)) {
             continue;
         }
-        if (nameFilter2 && !wcsstr(items[i].szName, nameFilter2)) {
+        if (nameFilter2 && !StrStrNoCase(items[i].szName, nameFilter2)) {
             continue;
         }
         total += items[i].FmtValue.doubleValue;
@@ -2377,18 +2398,18 @@ static double ReadPdhCounterValue(PDH_HCOUNTER counter) {
     return value.doubleValue;
 }
 
-// Queries DXGI once for the primary hardware adapter (largest dedicated
-// VRAM): its dedicated VRAM size, shared system memory pool size, and its
-// LUID formatted the way PDH GPU counter instance names embed it
-// ("luid_0xHHHHHHHH_0xLLLLLLLL"). The LUID lets the live usage counters be
-// filtered to the same adapter the totals describe, so used never comes from
-// one GPU while total comes from another on multi-GPU/iGPU systems.
-static void GetPrimaryGpuInfo(float* dedicatedTotalGB, float* sharedTotalGB,
-                              const wchar_t** luidFilter) {
+// One hardware GPU as DXGI reports it, with its LUID rendered the way PDH
+// GPU counter instance names embed it ("luid_0x........_0x........").
+struct GpuAdapterInfo {
+    std::wstring luid;
+    float dedicatedGB = 0.0f;
+    float sharedGB = 0.0f;
+};
+
+// Enumerated once; software adapters are skipped.
+static const std::vector<GpuAdapterInfo>& GetGpuAdapters() {
+    static std::vector<GpuAdapterInfo> s_adapters;
     static bool s_queried = false;
-    static float s_dedicatedGB = 0.0f;
-    static float s_sharedGB = 0.0f;
-    static wchar_t s_luid[40] = {};
 
     if (!s_queried) {
         s_queried = true;
@@ -2406,28 +2427,75 @@ static void GetPrimaryGpuInfo(float* dedicatedTotalGB, float* sharedTotalGB,
                 if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
                     continue;
                 }
+
                 constexpr double kBytesPerGB = 1024.0 * 1024.0 * 1024.0;
-                const float dedicated = static_cast<float>(desc.DedicatedVideoMemory / kBytesPerGB);
-                if (dedicated >= s_dedicatedGB) {
-                    s_dedicatedGB = dedicated;
-                    s_sharedGB = static_cast<float>(desc.SharedSystemMemory / kBytesPerGB);
-                    swprintf_s(s_luid, L"luid_0x%08X_0x%08X",
-                               static_cast<unsigned int>(desc.AdapterLuid.HighPart),
-                               static_cast<unsigned int>(desc.AdapterLuid.LowPart));
-                }
+                wchar_t luid[48] = {};
+                swprintf_s(luid, L"luid_0x%08x_0x%08x",
+                           static_cast<unsigned int>(desc.AdapterLuid.HighPart),
+                           static_cast<unsigned int>(desc.AdapterLuid.LowPart));
+
+                GpuAdapterInfo info;
+                info.luid = luid;
+                info.dedicatedGB = static_cast<float>(desc.DedicatedVideoMemory / kBytesPerGB);
+                info.sharedGB = static_cast<float>(desc.SharedSystemMemory / kBytesPerGB);
+                s_adapters.push_back(info);
+
+                Wh_Log(L"GPU adapter %s (%s): %.2f GB dedicated, %.2f GB shared",
+                       desc.Description, luid, info.dedicatedGB, info.sharedGB);
             }
+        }
+        if (s_adapters.empty()) {
+            Wh_Log(L"No DXGI hardware adapters found; VRAM totals unavailable.");
         }
     }
 
-    if (dedicatedTotalGB) {
-        *dedicatedTotalGB = s_dedicatedGB;
+    return s_adapters;
+}
+
+// Extracts the "luid_0x..._0x..." token from a PDH GPU instance name such as
+// "pid_1234_luid_0x00000000_0x0000a1b2_phys_0_eng_0_engtype_3D".
+static std::wstring LuidFromInstanceName(const wchar_t* name) {
+    const wchar_t* begin = StrStrNoCase(name, L"luid_");
+    if (!begin) {
+        return std::wstring();
     }
-    if (sharedTotalGB) {
-        *sharedTotalGB = s_sharedGB;
+    const wchar_t* end = StrStrNoCase(begin, L"_phys");
+    return end ? std::wstring(begin, end - begin) : std::wstring(begin);
+}
+
+// Totals a wildcard GPU memory counter per adapter LUID. Returns false when
+// the counter produced no data at all.
+static bool SumGpuMemoryByAdapter(PDH_HCOUNTER counter,
+                                  std::unordered_map<std::wstring, double>* out) {
+    if (!counter || !out) {
+        return false;
     }
-    if (luidFilter) {
-        *luidFilter = s_luid[0] ? s_luid : nullptr;
+
+    DWORD bufferSize = 0;
+    DWORD itemCount = 0;
+    PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &bufferSize, &itemCount, NULL);
+    if (bufferSize == 0) {
+        return false;
     }
+
+    std::vector<BYTE> buffer(bufferSize);
+    auto* items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buffer.data());
+    if (PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &bufferSize, &itemCount,
+                                     items) != ERROR_SUCCESS) {
+        return false;
+    }
+
+    for (DWORD i = 0; i < itemCount; ++i) {
+        if (!items[i].szName) {
+            continue;
+        }
+        std::wstring luid = LuidFromInstanceName(items[i].szName);
+        if (luid.empty()) {
+            continue;
+        }
+        (*out)[ToLowerCopy(std::move(luid))] += items[i].FmtValue.doubleValue;
+    }
+    return true;
 }
 
 // System-wide network transfer rates from the interface MIB octet counters.
@@ -2651,45 +2719,93 @@ void UpdateSystemSnapshot() {
             next.diskWriteBps = diskWrite;
         }
 
-        float dedicatedTotalGB = 0.0f;
-        float sharedTotalGB = 0.0f;
-        const wchar_t* gpuLuid = nullptr;
-        GetPrimaryGpuInfo(&dedicatedTotalGB, &sharedTotalGB, &gpuLuid);
-        next.vramTotalGB = dedicatedTotalGB;
-        next.sharedVramTotalGB = sharedTotalGB;
-
-        // Filter the usage counters to the adapter the DXGI totals describe;
-        // if the instance naming doesn't carry that LUID (older builds), fall
-        // back to summing every adapter as before.
-        int matched = 0;
-        double gpu = SumPdhCounterArray(g_gpuCounter, L"engtype_3D", gpuLuid, &matched);
-        if (gpuLuid && matched == 0) {
-            gpu = SumPdhCounterArray(g_gpuCounter, L"engtype_3D");
-        }
+        // GPU usage: every adapter's 3D engines. Deliberately not filtered
+        // to one adapter — on hybrid-graphics machines the work moves
+        // between the iGPU and the discrete GPU, and pinning to one of them
+        // reports 0% while the other is busy.
+        const double gpu = SumPdhCounterArray(g_gpuCounter, L"engtype_3D");
         if (gpu >= 0.0) {
             next.gpuPercent = ClampInt(static_cast<int>(gpu), 0, 100);
         }
 
-        double dedicatedUsed = SumPdhCounterArray(g_gpuDedicatedCounter, gpuLuid, nullptr, &matched);
-        if (gpuLuid && matched == 0) {
-            dedicatedUsed = SumPdhCounterArray(g_gpuDedicatedCounter, nullptr);
-        }
-        if (dedicatedUsed >= 0.0) {
-            next.vramUsedGB = static_cast<float>(dedicatedUsed / kBytesPerGB);
-            next.vramPercent = dedicatedTotalGB > 0.0f
-                ? ClampInt(static_cast<int>(dedicatedUsed / (dedicatedTotalGB * kBytesPerGB) * 100.0 + 0.5), 0, 100)
-                : -1;
+        // VRAM: total per adapter from the counters, then report the adapter
+        // actually holding memory, so used and total always describe the same
+        // GPU. Falls back to the largest adapter when nothing is allocated.
+        std::unordered_map<std::wstring, double> dedicatedByLuid;
+        std::unordered_map<std::wstring, double> sharedByLuid;
+        const bool haveDedicated = SumGpuMemoryByAdapter(g_gpuDedicatedCounter, &dedicatedByLuid);
+        const bool haveShared = SumGpuMemoryByAdapter(g_gpuSharedCounter, &sharedByLuid);
+
+        std::wstring activeLuid;
+        double activeDedicated = -1.0;
+        for (const auto& entry : dedicatedByLuid) {
+            if (entry.second > activeDedicated) {
+                activeDedicated = entry.second;
+                activeLuid = entry.first;
+            }
         }
 
-        double sharedUsed = SumPdhCounterArray(g_gpuSharedCounter, gpuLuid, nullptr, &matched);
-        if (gpuLuid && matched == 0) {
-            sharedUsed = SumPdhCounterArray(g_gpuSharedCounter, nullptr);
+        const std::vector<GpuAdapterInfo>& adapters = GetGpuAdapters();
+        const GpuAdapterInfo* chosen = nullptr;
+        for (const GpuAdapterInfo& adapter : adapters) {
+            if (!activeLuid.empty() && _wcsicmp(adapter.luid.c_str(), activeLuid.c_str()) == 0) {
+                chosen = &adapter;
+                break;
+            }
         }
-        if (sharedUsed >= 0.0) {
-            next.sharedVramUsedGB = static_cast<float>(sharedUsed / kBytesPerGB);
-            next.sharedVramPercent = sharedTotalGB > 0.0f
-                ? ClampInt(static_cast<int>(sharedUsed / (sharedTotalGB * kBytesPerGB) * 100.0 + 0.5), 0, 100)
-                : -1;
+        if (!chosen) {
+            // No counter/DXGI match (or nothing allocated yet): describe the
+            // adapter with the most video memory.
+            for (const GpuAdapterInfo& adapter : adapters) {
+                if (!chosen || adapter.dedicatedGB > chosen->dedicatedGB) {
+                    chosen = &adapter;
+                }
+            }
+        }
+
+        if (chosen) {
+            next.vramTotalGB = chosen->dedicatedGB;
+            next.sharedVramTotalGB = chosen->sharedGB;
+
+            double dedicatedUsed = 0.0;
+            auto dedicatedIt = dedicatedByLuid.find(ToLowerCopy(chosen->luid));
+            if (dedicatedIt != dedicatedByLuid.end()) {
+                dedicatedUsed = dedicatedIt->second;
+            }
+            double sharedUsed = 0.0;
+            auto sharedIt = sharedByLuid.find(ToLowerCopy(chosen->luid));
+            if (sharedIt != sharedByLuid.end()) {
+                sharedUsed = sharedIt->second;
+            }
+
+            if (haveDedicated) {
+                next.vramUsedGB = static_cast<float>(dedicatedUsed / kBytesPerGB);
+                next.vramPercent =
+                    chosen->dedicatedGB > 0.0f
+                        ? ClampInt(static_cast<int>(
+                              dedicatedUsed / (chosen->dedicatedGB * kBytesPerGB) * 100.0 + 0.5),
+                              0, 100)
+                        : -1;
+            }
+            if (haveShared) {
+                next.sharedVramUsedGB = static_cast<float>(sharedUsed / kBytesPerGB);
+                next.sharedVramPercent =
+                    chosen->sharedGB > 0.0f
+                        ? ClampInt(static_cast<int>(
+                              sharedUsed / (chosen->sharedGB * kBytesPerGB) * 100.0 + 0.5),
+                              0, 100)
+                        : -1;
+            }
+        }
+
+        static bool s_loggedGpuOnce = false;
+        if (!s_loggedGpuOnce) {
+            s_loggedGpuOnce = true;
+            Wh_Log(L"GPU counters: engine=%.1f%%, adapters with memory=%u, "
+                   L"chosen=%s, dedicated=%.2f/%.2f GB",
+                   gpu, static_cast<unsigned int>(dedicatedByLuid.size()),
+                   chosen ? chosen->luid.c_str() : L"(none)",
+                   next.vramUsedGB, next.vramTotalGB);
         }
     }
 
@@ -6090,14 +6206,15 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             }
         }
 
-        // Fallback path for the game overlay hotkey: when RegisterHotKey was
-        // refused (another app holds the combo) no WM_HOTKEY ever arrives, so
-        // recognize the chord here instead. Auto-repeat is suppressed until
-        // the key is released.
+        // Second path for the game overlay hotkey. RegisterHotKey is refused
+        // outright when another app already owns the combo, and even when it
+        // succeeds some full-screen games swallow the key, so the chord is
+        // also recognized here. Whichever path fires first wins; the toggle
+        // debounces so the two never act twice on one press. Auto-repeat is
+        // suppressed until the key is released.
         static bool s_overlayChordHeld = false;
         const UINT overlayVk = g_overlayHotkeyVk.load();
-        if (overlayVk != 0 && !g_overlayHotkeyRegistered.load() &&
-            kbd->vkCode == overlayVk) {
+        if (overlayVk != 0 && kbd->vkCode == overlayVk) {
             if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
                 const UINT mods = g_overlayHotkeyModifiers.load();
                 auto down = [](int vk) {
@@ -6110,7 +6227,10 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
                     (!(mods & MOD_WIN) || down(VK_LWIN) || down(VK_RWIN));
                 if (modsHeld && !s_overlayChordHeld) {
                     s_overlayChordHeld = true;
-                    PostThreadMessageW(g_keyboardThreadId, WM_APP_TOGGLE_OVERLAY, 0, 0);
+                    // The hook runs on the thread that installed it, so this
+                    // always reaches the loop below even if the cached thread
+                    // id has not been published yet.
+                    PostThreadMessageW(GetCurrentThreadId(), WM_APP_TOGGLE_OVERLAY, 0, 0);
                 }
             } else if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
                 s_overlayChordHeld = false;
@@ -6133,6 +6253,8 @@ DWORD WINAPI KeyboardThreadProc(void*) {
         }
         if (RegisterHotKey(nullptr, kGameOverlayHotkeyId, modifiers | MOD_NOREPEAT, vk)) {
             g_overlayHotkeyRegistered = true;
+            Wh_Log(L"Game overlay hotkey registered (modifiers 0x%X, key 0x%X).",
+                   modifiers, vk);
         } else {
             Wh_Log(L"Game overlay hotkey is held by another app; using the "
                    L"keyboard hook to detect it instead.");
@@ -6143,10 +6265,20 @@ DWORD WINAPI KeyboardThreadProc(void*) {
     // Toggle between the normal pill and the game overlay, same as the
     // context menu item.
     auto toggleGameOverlay = []() {
-        Wh_SetIntValue(L"GameOverlayPinned",
-                       Wh_GetIntValue(L"GameOverlayPinned", 0) ? 0 : 1);
+        // WM_HOTKEY and the keyboard hook can both report the same press.
+        static ULONGLONG s_lastToggleTick = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (now - s_lastToggleTick < 300) {
+            return;
+        }
+        s_lastToggleTick = now;
+
+        const int enabled = Wh_GetIntValue(L"GameOverlayPinned", 0) ? 0 : 1;
+        Wh_SetIntValue(L"GameOverlayPinned", enabled);
         g_layoutDirty = true;
         TriggerNudge();
+        Wh_Log(L"Game overlay hotkey pressed; overlay is now %s",
+               enabled ? L"on" : L"off");
     };
 
     MSG msg;
