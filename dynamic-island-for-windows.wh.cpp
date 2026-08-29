@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.3.3
+// @version         1.4.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -33,6 +33,9 @@ media, downloads, clipboard, battery, and more.
     percent plus used GB / total pool size in GB).
   - **Network & Disk** — system-wide upload, download and combined transfer
     rates, and disk read, write and combined speeds.
+
+  Flip between pages with the up/down buttons on the right edge of the
+  expanded pill, or by scrolling the wheel over it.
 - Optional game overlay with FPS/CPU/RAM/GPU/disk cards, toggled from the
   context menu or with a configurable hotkey (default Ctrl+Alt+G). While the
   overlay is on it acts as the pill's collapsed look — hovering or clicking
@@ -221,6 +224,20 @@ constexpr int kIdleTabCount = 5;
 // The expanded media view adds its own page in front of the idle pages.
 constexpr int kMediaTabCount = kIdleTabCount + 1;
 
+// Page up/down buttons drawn on the right edge of the expanded pill. The
+// renderer and the click hit-test share these so they always agree.
+constexpr float kPageNavRightInset = 16.0f;
+constexpr float kPageNavButtonRadius = 11.0f;
+constexpr float kPageNavMaxOffset = 54.0f;
+constexpr float kPageNavEdgeMargin = 18.0f;
+// The pill only shows the buttons once it has expanded past this height.
+constexpr float kExpandedPillHeight = 100.0f;
+
+// Vertical distance from the pill's centre to each button.
+float PageNavButtonOffset(float halfHeight) {
+    return std::min(halfHeight - kPageNavEdgeMargin, kPageNavMaxOffset);
+}
+
 enum class IslandKind {
     Idle,
     Media,
@@ -401,6 +418,15 @@ struct SystemSnapshot {
     bool hasCpuTemp = false;
     float cpuTempC = 0.0f;
 };
+
+// The privacy dots sit at the same right edge, so page controls shift left
+// to make room for them.
+float PrivacyShiftX(bool micActive, bool cameraActive) {
+    if (micActive && cameraActive) {
+        return 30.0f;
+    }
+    return (micActive || cameraActive) ? 16.0f : 0.0f;
+}
 
 struct Activity {
     IslandKind kind = IslandKind::Idle;
@@ -2284,6 +2310,8 @@ static PDH_HQUERY g_pdhQuery = NULL;
 static PDH_HCOUNTER g_gpuCounter = NULL;
 static PDH_HCOUNTER g_gpuDedicatedCounter = NULL;
 static PDH_HCOUNTER g_gpuSharedCounter = NULL;
+static PDH_HCOUNTER g_gpuProcDedicatedCounter = NULL;
+static PDH_HCOUNTER g_gpuProcSharedCounter = NULL;
 static PDH_HCOUNTER g_diskReadCounter = NULL;
 static PDH_HCOUNTER g_diskWriteCounter = NULL;
 static PDH_HCOUNTER g_thermalHiPrecCounter = NULL;
@@ -2300,6 +2328,10 @@ static void InitPdhQuery() {
             PdhAddEnglishCounterW(g_pdhQuery, L"\\Processor Information(_Total)\\% Processor Utility", 0, &g_cpuUtilityCounter);
             PdhAddEnglishCounterW(g_pdhQuery, L"\\GPU Adapter Memory(*)\\Dedicated Usage", 0, &g_gpuDedicatedCounter);
             PdhAddEnglishCounterW(g_pdhQuery, L"\\GPU Adapter Memory(*)\\Shared Usage", 0, &g_gpuSharedCounter);
+            // Per-process equivalents, summed per adapter when the adapter-wide
+            // set reports nothing on this machine.
+            PdhAddEnglishCounterW(g_pdhQuery, L"\\GPU Process Memory(*)\\Dedicated Usage", 0, &g_gpuProcDedicatedCounter);
+            PdhAddEnglishCounterW(g_pdhQuery, L"\\GPU Process Memory(*)\\Shared Usage", 0, &g_gpuProcSharedCounter);
             PdhAddEnglishCounterW(g_pdhQuery, L"\\PhysicalDisk(_Total)\\Disk Read Bytes/sec", 0, &g_diskReadCounter);
             PdhAddEnglishCounterW(g_pdhQuery, L"\\PhysicalDisk(_Total)\\Disk Write Bytes/sec", 0, &g_diskWriteCounter);
             // ACPI thermal zones via performance counters: readable without
@@ -2485,6 +2517,7 @@ static bool SumGpuMemoryByAdapter(PDH_HCOUNTER counter,
         return false;
     }
 
+    bool named = false;
     for (DWORD i = 0; i < itemCount; ++i) {
         if (!items[i].szName) {
             continue;
@@ -2493,9 +2526,13 @@ static bool SumGpuMemoryByAdapter(PDH_HCOUNTER counter,
         if (luid.empty()) {
             continue;
         }
+        if (!named) {
+            named = true;
+            Wh_Log(L"GPU memory counter instance sample: %s", items[i].szName);
+        }
         (*out)[ToLowerCopy(std::move(luid))] += items[i].FmtValue.doubleValue;
     }
-    return true;
+    return !out->empty();
 }
 
 // System-wide network transfer rates from the interface MIB octet counters.
@@ -2728,34 +2765,49 @@ void UpdateSystemSnapshot() {
             next.gpuPercent = ClampInt(static_cast<int>(gpu), 0, 100);
         }
 
-        // VRAM: total per adapter from the counters, then report the adapter
-        // actually holding memory, so used and total always describe the same
-        // GPU. Falls back to the largest adapter when nothing is allocated.
+        // VRAM. The counters are totalled per adapter LUID; whichever adapter
+        // holds the most memory is the one reported, and its own measured
+        // usage is used directly. Pairing it with a DXGI total is best effort:
+        // the LUID spellings line up on most systems, but when they don't the
+        // largest adapter's capacity is used rather than dropping the reading
+        // to zero.
         std::unordered_map<std::wstring, double> dedicatedByLuid;
         std::unordered_map<std::wstring, double> sharedByLuid;
-        const bool haveDedicated = SumGpuMemoryByAdapter(g_gpuDedicatedCounter, &dedicatedByLuid);
-        const bool haveShared = SumGpuMemoryByAdapter(g_gpuSharedCounter, &sharedByLuid);
+        bool haveDedicated = SumGpuMemoryByAdapter(g_gpuDedicatedCounter, &dedicatedByLuid);
+        bool haveShared = SumGpuMemoryByAdapter(g_gpuSharedCounter, &sharedByLuid);
+        if (!haveDedicated) {
+            haveDedicated = SumGpuMemoryByAdapter(g_gpuProcDedicatedCounter, &dedicatedByLuid);
+        }
+        if (!haveShared) {
+            haveShared = SumGpuMemoryByAdapter(g_gpuProcSharedCounter, &sharedByLuid);
+        }
 
         std::wstring activeLuid;
-        double activeDedicated = -1.0;
+        double dedicatedUsed = 0.0;
         for (const auto& entry : dedicatedByLuid) {
-            if (entry.second > activeDedicated) {
-                activeDedicated = entry.second;
+            if (entry.second > dedicatedUsed || activeLuid.empty()) {
+                dedicatedUsed = entry.second;
                 activeLuid = entry.first;
+            }
+        }
+        double sharedUsed = 0.0;
+        if (!activeLuid.empty()) {
+            auto sharedIt = sharedByLuid.find(activeLuid);
+            if (sharedIt != sharedByLuid.end()) {
+                sharedUsed = sharedIt->second;
             }
         }
 
         const std::vector<GpuAdapterInfo>& adapters = GetGpuAdapters();
         const GpuAdapterInfo* chosen = nullptr;
         for (const GpuAdapterInfo& adapter : adapters) {
-            if (!activeLuid.empty() && _wcsicmp(adapter.luid.c_str(), activeLuid.c_str()) == 0) {
+            if (!activeLuid.empty() &&
+                _wcsicmp(adapter.luid.c_str(), activeLuid.c_str()) == 0) {
                 chosen = &adapter;
                 break;
             }
         }
         if (!chosen) {
-            // No counter/DXGI match (or nothing allocated yet): describe the
-            // adapter with the most video memory.
             for (const GpuAdapterInfo& adapter : adapters) {
                 if (!chosen || adapter.dedicatedGB > chosen->dedicatedGB) {
                     chosen = &adapter;
@@ -2766,46 +2818,38 @@ void UpdateSystemSnapshot() {
         if (chosen) {
             next.vramTotalGB = chosen->dedicatedGB;
             next.sharedVramTotalGB = chosen->sharedGB;
+        }
 
-            double dedicatedUsed = 0.0;
-            auto dedicatedIt = dedicatedByLuid.find(ToLowerCopy(chosen->luid));
-            if (dedicatedIt != dedicatedByLuid.end()) {
-                dedicatedUsed = dedicatedIt->second;
-            }
-            double sharedUsed = 0.0;
-            auto sharedIt = sharedByLuid.find(ToLowerCopy(chosen->luid));
-            if (sharedIt != sharedByLuid.end()) {
-                sharedUsed = sharedIt->second;
-            }
-
-            if (haveDedicated) {
-                next.vramUsedGB = static_cast<float>(dedicatedUsed / kBytesPerGB);
-                next.vramPercent =
-                    chosen->dedicatedGB > 0.0f
-                        ? ClampInt(static_cast<int>(
-                              dedicatedUsed / (chosen->dedicatedGB * kBytesPerGB) * 100.0 + 0.5),
-                              0, 100)
-                        : -1;
-            }
-            if (haveShared) {
-                next.sharedVramUsedGB = static_cast<float>(sharedUsed / kBytesPerGB);
-                next.sharedVramPercent =
-                    chosen->sharedGB > 0.0f
-                        ? ClampInt(static_cast<int>(
-                              sharedUsed / (chosen->sharedGB * kBytesPerGB) * 100.0 + 0.5),
-                              0, 100)
-                        : -1;
-            }
+        if (haveDedicated) {
+            next.vramUsedGB = static_cast<float>(dedicatedUsed / kBytesPerGB);
+            next.vramPercent =
+                next.vramTotalGB > 0.0f
+                    ? ClampInt(static_cast<int>(
+                          dedicatedUsed / (next.vramTotalGB * kBytesPerGB) * 100.0 + 0.5),
+                          0, 100)
+                    : -1;
+        }
+        if (haveShared) {
+            next.sharedVramUsedGB = static_cast<float>(sharedUsed / kBytesPerGB);
+            next.sharedVramPercent =
+                next.sharedVramTotalGB > 0.0f
+                    ? ClampInt(static_cast<int>(
+                          sharedUsed / (next.sharedVramTotalGB * kBytesPerGB) * 100.0 + 0.5),
+                          0, 100)
+                    : -1;
         }
 
         static bool s_loggedGpuOnce = false;
         if (!s_loggedGpuOnce) {
             s_loggedGpuOnce = true;
             Wh_Log(L"GPU counters: engine=%.1f%%, adapters with memory=%u, "
-                   L"chosen=%s, dedicated=%.2f/%.2f GB",
+                   L"active=%s, matched DXGI=%s, dedicated=%.2f/%.2f GB, "
+                   L"shared=%.2f/%.2f GB",
                    gpu, static_cast<unsigned int>(dedicatedByLuid.size()),
+                   activeLuid.empty() ? L"(none)" : activeLuid.c_str(),
                    chosen ? chosen->luid.c_str() : L"(none)",
-                   next.vramUsedGB, next.vramTotalGB);
+                   next.vramUsedGB, next.vramTotalGB,
+                   next.sharedVramUsedGB, next.sharedVramTotalGB);
         }
     }
 
@@ -4483,6 +4527,62 @@ class Renderer {
                     FormatBytesPerSec(diskCombined), -1.0f, D2D1::ColorF(0, 0, 0, 0));
     }
 
+    // A chevron button; dimmed when there is no page in that direction.
+    void DrawPageNavButton(D2D1_POINT_2F center, bool up, bool enabled) {
+        ComPtr<ID2D1SolidColorBrush> bg;
+        target_->CreateSolidColorBrush(
+            D2D1::ColorF(1, 1, 1, (enabled ? 0.10f : 0.04f) * settingsOpacity_), &bg);
+        if (bg) {
+            target_->FillEllipse(
+                D2D1::Ellipse(center, kPageNavButtonRadius, kPageNavButtonRadius), bg.Get());
+        }
+
+        ComPtr<ID2D1SolidColorBrush> rim;
+        target_->CreateSolidColorBrush(
+            D2D1::ColorF(1, 1, 1, (enabled ? 0.16f : 0.06f) * settingsOpacity_), &rim);
+        if (rim) {
+            target_->DrawEllipse(
+                D2D1::Ellipse(center, kPageNavButtonRadius, kPageNavButtonRadius), rim.Get(), 1.0f);
+        }
+
+        const float w = 3.8f;
+        const float h = 2.4f;
+        const float tipY = center.y + (up ? -h : h);
+        const float baseY = center.y + (up ? h : -h);
+        textBrush_->SetOpacity(enabled ? 0.92f : 0.28f);
+        target_->DrawLine(D2D1::Point2F(center.x - w, baseY), D2D1::Point2F(center.x, tipY),
+                          textBrush_.Get(), 1.7f);
+        target_->DrawLine(D2D1::Point2F(center.x, tipY), D2D1::Point2F(center.x + w, baseY),
+                          textBrush_.Get(), 1.7f);
+        textBrush_->SetOpacity(0.90f);
+    }
+
+    // Up/down page buttons with the position dots between them.
+    void DrawPageNav(const SharedState& state, D2D1_RECT_F rect, int tab, int count) {
+        const float shiftX = PrivacyShiftX(state.system.micActive, state.system.cameraActive);
+        const float x = rect.right - kPageNavRightInset - shiftX;
+        const float cy = (rect.top + rect.bottom) * 0.5f;
+        const float offset = PageNavButtonOffset((rect.bottom - rect.top) * 0.5f);
+
+        DrawPageNavButton(D2D1::Point2F(x, cy - offset), true, tab > 0);
+        DrawPageNavButton(D2D1::Point2F(x, cy + offset), false, tab < count - 1);
+
+        ComPtr<ID2D1SolidColorBrush> activeDot, inactiveDot;
+        target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.85f * settingsOpacity_), &activeDot);
+        target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.25f * settingsOpacity_), &inactiveDot);
+        if (!activeDot || !inactiveDot) {
+            return;
+        }
+
+        const float spacing = 7.0f;
+        const float span = (count - 1) * spacing;
+        for (int i = 0; i < count; ++i) {
+            target_->FillEllipse(
+                D2D1::Ellipse(D2D1::Point2F(x, cy - span * 0.5f + i * spacing), 2.2f, 2.2f),
+                i == tab ? activeDot.Get() : inactiveDot.Get());
+        }
+    }
+
     void DrawIdleDashboard(const SharedState& state, D2D1_RECT_F rect, const Settings& settings,
                            double now) {
         // While the game overlay is toggled on it replaces only the pill's
@@ -4566,28 +4666,7 @@ class Renderer {
                 break;
         }
 
-        // Pagination dots (Vertical on the right edge)
-        float shiftX = 0.0f;
-        if (state.system.micActive && state.system.cameraActive) {
-            shiftX = 30.0f * scale;
-        } else if (state.system.micActive || state.system.cameraActive) {
-            shiftX = 16.0f * scale;
-        }
-        const float dotX = rect.right - 10.0f * scale - shiftX;
-        const float dotY = (rect.top + rect.bottom) * 0.5f;
-        const float spacing = 8.0f * scale;
-        const float r = 2.5f * scale;
-
-        ComPtr<ID2D1SolidColorBrush> activeDot, inactiveDot;
-        target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.85f * settingsOpacity_), &activeDot);
-        target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.25f * settingsOpacity_), &inactiveDot);
-
-        const float dotSpan = (kIdleTabCount - 1) * spacing;
-        for (int i = 0; i < kIdleTabCount; ++i) {
-            target_->FillEllipse(
-                D2D1::Ellipse(D2D1::Point2F(dotX, dotY - dotSpan * 0.5f + i * spacing), r, r),
-                i == tab ? activeDot.Get() : inactiveDot.Get());
-        }
+        DrawPageNav(state, rect, tab, kIdleTabCount);
 
         target_->PopAxisAlignedClip();
     }
@@ -5216,29 +5295,7 @@ class Renderer {
                 DrawNetDiskDashboard(state, rect);
             }
 
-            // Pagination dots (Vertical on the right edge)
-            const float scale = 1.0f;
-            float shiftX = 0.0f;
-            if (state.system.micActive && state.system.cameraActive) {
-                shiftX = 30.0f * scale;
-            } else if (state.system.micActive || state.system.cameraActive) {
-                shiftX = 16.0f * scale;
-            }
-            const float dotX = rect.right - 10.0f * scale - shiftX;
-            const float dotY = (rect.top + rect.bottom) * 0.5f;
-            const float spacing = 8.0f * scale;
-            const float r = 2.5f * scale;
-
-            ComPtr<ID2D1SolidColorBrush> activeDot, inactiveDot;
-            target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.85f * settingsOpacity_), &activeDot);
-            target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.25f * settingsOpacity_), &inactiveDot);
-
-            const float dotSpan = (kMediaTabCount - 1) * spacing;
-            for (int i = 0; i < kMediaTabCount; ++i) {
-                target_->FillEllipse(
-                    D2D1::Ellipse(D2D1::Point2F(dotX, dotY - dotSpan * 0.5f + i * spacing), r, r),
-                    i == tab ? activeDot.Get() : inactiveDot.Get());
-            }
+            DrawPageNav(state, rect, tab, kMediaTabCount);
 
             target_->PopLayer();
         }
@@ -6441,11 +6498,9 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 }
 
                 bool mediaActive = false;
-                std::vector<IslandKind> kinds;
                 {
                     std::lock_guard lock(g_stateMutex);
                     mediaActive = g_settings.media && g_state.media.available;
-                    kinds = ChooseActivities(g_state, g_settings, NowSeconds());
                 }
 
                 RECT clientRect;
@@ -6503,22 +6558,55 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     }
                 }
 
+                // Page up/down buttons on the right edge of the expanded
+                // pill. Coordinates are converted into the same unscaled
+                // space the renderer draws in, relative to the pill's centre.
+                const float sizeScale = std::max(g_settings.sizeScale, 0.01f);
+                const float pillHeight = (height - kRenderPadY * 2.0f) / sizeScale;
+                const float pillHalfWidth = (width - kRenderPadX * 2.0f) / sizeScale * 0.5f;
+                if (pillHeight > kExpandedPillHeight) {
+                    bool micActive = false;
+                    bool cameraActive = false;
+                    {
+                        std::lock_guard lock(g_stateMutex);
+                        micActive = g_state.system.micActive;
+                        cameraActive = g_state.system.cameraActive;
+                    }
+
+                    const float unX = (xPos - width * 0.5f) / sizeScale;
+                    const float unY = (yPos - height * 0.5f) / sizeScale;
+                    const float buttonX = pillHalfWidth - kPageNavRightInset -
+                                          PrivacyShiftX(micActive, cameraActive);
+                    const float offset = PageNavButtonOffset(pillHeight * 0.5f);
+                    const float hitRadius = kPageNavButtonRadius + 3.0f;
+
+                    auto hitButton = [&](float buttonY) {
+                        const float dx = unX - buttonX;
+                        const float dy = unY - buttonY;
+                        return dx * dx + dy * dy <= hitRadius * hitRadius;
+                    };
+
+                    const int tabCount = mediaActive ? kMediaTabCount : kIdleTabCount;
+                    if (hitButton(-offset)) {
+                        if (g_idleTab > 0) {
+                            g_idleTab--;
+                            g_layoutDirty = true;
+                        }
+                        return 0;
+                    }
+                    if (hitButton(offset)) {
+                        if (g_idleTab < tabCount - 1) {
+                            g_idleTab++;
+                            g_layoutDirty = true;
+                        }
+                        return 0;
+                    }
+                }
+
                 if (mediaActive) {
-                    if (height > 45.0f && xPos > width - 30.0f) {
-                        // Clicked on the right edge scroll area in Media
-                        g_idleTab = (g_idleTab + 1) % kMediaTabCount;
-                        g_layoutDirty = true;
-                    } else {
-                        OpenRelevantApp();
-                    }
+                    OpenRelevantApp();
                 } else {
-                    if (!kinds.empty() && kinds[0] == IslandKind::Idle && height > 45.0f) {
-                        if (xPos < width / 2.0f) g_idleTab = (g_idleTab - 1 + kIdleTabCount) % kIdleTabCount;
-                        else g_idleTab = (g_idleTab + 1) % kIdleTabCount;
-                        g_layoutDirty = true;
-                    } else {
-                        HandleStatusClickAtPoint(hwnd, lParam);
-                    }
+                    HandleStatusClickAtPoint(hwnd, lParam);
                 }
             }
             return 0;
@@ -6532,44 +6620,33 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
 
         case WM_MOUSEWHEEL: {
-            // One page per scroll gesture: precision touchpads and free-
-            // spinning wheels deliver a stream of events for one flick, which
-            // used to skip several pages. Accumulate deltas until a full
-            // wheel notch, turn a single page, then swallow the rest of the
-            // gesture until the events pause for a moment.
-            static ULONGLONG s_lastWheelEventTime = 0;
-            static int s_wheelAccumulator = 0;
-            static bool s_gestureConsumed = false;
-
+            // One page per wheel notch, with a short debounce so a fast flick
+            // does not race through every page.
+            static ULONGLONG s_lastScrollTime = 0;
             const ULONGLONG now = GetTickCount64();
-            if (now - s_lastWheelEventTime > 300) {
-                // Quiet gap: this event starts a new gesture.
-                s_wheelAccumulator = 0;
-                s_gestureConsumed = false;
-            }
-            s_lastWheelEventTime = now;
-
-            if (s_gestureConsumed) {
+            if (now - s_lastScrollTime < 120) {
                 return 0;
             }
+            s_lastScrollTime = now;
 
-            s_wheelAccumulator += GET_WHEEL_DELTA_WPARAM(wParam);
-            if (s_wheelAccumulator >= WHEEL_DELTA || s_wheelAccumulator <= -WHEEL_DELTA) {
-                bool mediaActive = false;
-                {
-                    std::lock_guard lock(g_stateMutex);
-                    mediaActive = g_settings.media && g_state.media.available;
-                }
-                int tabCount = mediaActive ? kMediaTabCount : kIdleTabCount;
-                if (s_wheelAccumulator > 0) {
-                    if (g_idleTab > 0) g_idleTab--;
-                } else {
-                    if (g_idleTab < tabCount - 1) g_idleTab++;
-                }
-                s_gestureConsumed = true;
-                s_wheelAccumulator = 0;
-                g_layoutDirty = true;
+            bool mediaActive = false;
+            {
+                std::lock_guard lock(g_stateMutex);
+                mediaActive = g_settings.media && g_state.media.available;
             }
+            const int tabCount = mediaActive ? kMediaTabCount : kIdleTabCount;
+            const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+            if (delta > 0) {
+                if (g_idleTab > 0) {
+                    g_idleTab--;
+                }
+            } else if (delta < 0) {
+                if (g_idleTab < tabCount - 1) {
+                    g_idleTab++;
+                }
+            }
+
+            g_layoutDirty = true;
             return 0;
         }
 
