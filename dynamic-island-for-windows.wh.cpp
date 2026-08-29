@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.5.0
+// @version         1.5.1
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -2825,63 +2825,74 @@ void UpdateSystemSnapshot() {
                                                g_gpuProcSharedCounter, g_gpuProcNonLocalCounter},
                                               &sharedByLuid);
 
-        std::wstring activeLuid;
-        double dedicatedUsed = 0.0;
-        for (const auto& entry : dedicatedByLuid) {
-            if (entry.second > dedicatedUsed || activeLuid.empty()) {
-                dedicatedUsed = entry.second;
-                activeLuid = entry.first;
-            }
-        }
-        double sharedUsed = 0.0;
-        if (!sharedByLuid.empty()) {
-            // Prefer the adapter chosen above; otherwise the busiest one.
-            auto sharedIt = activeLuid.empty() ? sharedByLuid.end() : sharedByLuid.find(activeLuid);
-            if (sharedIt != sharedByLuid.end()) {
-                sharedUsed = sharedIt->second;
-            } else {
-                for (const auto& entry : sharedByLuid) {
-                    sharedUsed = std::max(sharedUsed, entry.second);
+        // The busiest adapter in each pool. Dedicated and shared are resolved
+        // independently: a machine can report them against different GPUs,
+        // and forcing both onto one adapter leaves the other paired with a
+        // capacity that cannot hold its reading.
+        auto busiestAdapter = [](const std::unordered_map<std::wstring, double>& byLuid,
+                                 std::wstring* luidOut) {
+            double most = 0.0;
+            luidOut->clear();
+            for (const auto& entry : byLuid) {
+                if (entry.second > most || luidOut->empty()) {
+                    most = entry.second;
+                    *luidOut = entry.first;
                 }
             }
-        }
+            return most;
+        };
+
+        std::wstring dedicatedLuid;
+        std::wstring sharedLuid;
+        const double dedicatedUsed = busiestAdapter(dedicatedByLuid, &dedicatedLuid);
+        const double sharedUsed = busiestAdapter(sharedByLuid, &sharedLuid);
 
         const std::vector<GpuAdapterInfo>& adapters = GetGpuAdapters();
-        const GpuAdapterInfo* chosen = nullptr;
-        for (const GpuAdapterInfo& adapter : adapters) {
-            if (!activeLuid.empty() &&
-                _wcsicmp(adapter.luid.c_str(), activeLuid.c_str()) == 0) {
-                chosen = &adapter;
-                break;
-            }
-        }
-        if (!chosen) {
+
+        // Pairs a reading with a capacity: the adapter the counters name when
+        // it is large enough, else the roomiest one for that pool, so a
+        // reading is never shown against a capacity it exceeds.
+        auto pickAdapter = [&](const std::wstring& luid, double usedBytes,
+                               bool dedicatedPool) -> const GpuAdapterInfo* {
+            auto capacityOf = [&](const GpuAdapterInfo& adapter) {
+                return dedicatedPool ? adapter.dedicatedGB : adapter.sharedGB;
+            };
+
+            const GpuAdapterInfo* named = nullptr;
             for (const GpuAdapterInfo& adapter : adapters) {
-                if (!chosen || adapter.dedicatedGB > chosen->dedicatedGB) {
-                    chosen = &adapter;
+                if (!luid.empty() && _wcsicmp(adapter.luid.c_str(), luid.c_str()) == 0) {
+                    named = &adapter;
+                    break;
                 }
             }
+
+            const float usedGB = static_cast<float>(usedBytes / kBytesPerGB);
+            if (named && capacityOf(*named) >= usedGB) {
+                return named;
+            }
+
+            const GpuAdapterInfo* roomiest = nullptr;
+            for (const GpuAdapterInfo& adapter : adapters) {
+                if (!roomiest || capacityOf(adapter) > capacityOf(*roomiest)) {
+                    roomiest = &adapter;
+                }
+            }
+            if (roomiest && capacityOf(*roomiest) >= usedGB) {
+                return roomiest;
+            }
+            return named ? named : roomiest;
+        };
+
+        const GpuAdapterInfo* dedicatedAdapter = pickAdapter(dedicatedLuid, dedicatedUsed, true);
+        const GpuAdapterInfo* sharedAdapter = pickAdapter(sharedLuid, sharedUsed, false);
+        if (dedicatedAdapter) {
+            next.vramTotalGB = dedicatedAdapter->dedicatedGB;
+        }
+        if (sharedAdapter) {
+            next.sharedVramTotalGB = sharedAdapter->sharedGB;
         }
 
-        // A capacity smaller than the measured usage means the counters and
-        // the DXGI description are talking about different GPUs (common on
-        // hybrid graphics, where the matched adapter is the integrated one).
-        // Prefer an adapter that can actually hold the reading.
         const float dedicatedUsedGB = static_cast<float>(dedicatedUsed / kBytesPerGB);
-        if (chosen && dedicatedUsedGB > chosen->dedicatedGB) {
-            const GpuAdapterInfo* roomier = chosen;
-            for (const GpuAdapterInfo& adapter : adapters) {
-                if (adapter.dedicatedGB > roomier->dedicatedGB) {
-                    roomier = &adapter;
-                }
-            }
-            chosen = roomier;
-        }
-
-        if (chosen) {
-            next.vramTotalGB = chosen->dedicatedGB;
-            next.sharedVramTotalGB = chosen->sharedGB;
-        }
 
         // Percentages are only shown when the capacity can hold the reading;
         // otherwise the row falls back to a plain "x.x GB used".
@@ -2909,8 +2920,8 @@ void UpdateSystemSnapshot() {
                    gpu, haveDedicated ? 1 : 0,
                    static_cast<unsigned int>(dedicatedByLuid.size()),
                    haveShared ? 1 : 0,
-                   activeLuid.empty() ? L"(none)" : activeLuid.c_str(),
-                   chosen ? chosen->luid.c_str() : L"(none)",
+                   dedicatedLuid.empty() ? L"(none)" : dedicatedLuid.c_str(),
+                   dedicatedAdapter ? dedicatedAdapter->luid.c_str() : L"(none)",
                    next.vramUsedGB, next.vramTotalGB,
                    next.sharedVramUsedGB, next.sharedVramTotalGB);
         }
