@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.4.0
+// @version         1.4.1
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -224,18 +224,18 @@ constexpr int kIdleTabCount = 5;
 // The expanded media view adds its own page in front of the idle pages.
 constexpr int kMediaTabCount = kIdleTabCount + 1;
 
-// Page up/down buttons drawn on the right edge of the expanded pill. The
-// renderer and the click hit-test share these so they always agree.
-constexpr float kPageNavRightInset = 16.0f;
-constexpr float kPageNavButtonRadius = 11.0f;
-constexpr float kPageNavMaxOffset = 54.0f;
-constexpr float kPageNavEdgeMargin = 18.0f;
+// Page up/down buttons, centred horizontally at the top and bottom edges of
+// the expanded pill. The renderer and the click hit-test share these so they
+// always agree. The position dots stay on the right edge.
+constexpr float kPageNavButtonRadius = 10.0f;
+constexpr float kPageNavEdgeInset = 13.0f;
+constexpr float kPageDotsRightInset = 10.0f;
 // The pill only shows the buttons once it has expanded past this height.
 constexpr float kExpandedPillHeight = 100.0f;
 
 // Vertical distance from the pill's centre to each button.
 float PageNavButtonOffset(float halfHeight) {
-    return std::min(halfHeight - kPageNavEdgeMargin, kPageNavMaxOffset);
+    return std::max(halfHeight - kPageNavEdgeInset, 0.0f);
 }
 
 enum class IslandKind {
@@ -2765,22 +2765,36 @@ void UpdateSystemSnapshot() {
             next.gpuPercent = ClampInt(static_cast<int>(gpu), 0, 100);
         }
 
-        // VRAM. The counters are totalled per adapter LUID; whichever adapter
-        // holds the most memory is the one reported, and its own measured
-        // usage is used directly. Pairing it with a DXGI total is best effort:
-        // the LUID spellings line up on most systems, but when they don't the
-        // largest adapter's capacity is used rather than dropping the reading
-        // to zero.
+        // VRAM. Counters are totalled per adapter LUID; whichever adapter
+        // holds the most memory is reported, using its own measured usage.
+        // The adapter-wide counter set exists on some machines but reports
+        // nothing but zeros, so a set that yields no bytes at all is treated
+        // as no data and the per-process counters are summed instead. When
+        // neither source has bytes the row shows N/A rather than a
+        // misleading 0%.
+        auto totalBytes = [](const std::unordered_map<std::wstring, double>& byLuid) {
+            double total = 0.0;
+            for (const auto& entry : byLuid) {
+                total += entry.second;
+            }
+            return total;
+        };
+        auto readGpuMemory = [&](PDH_HCOUNTER adapterCounter, PDH_HCOUNTER processCounter,
+                                 std::unordered_map<std::wstring, double>* byLuid) {
+            byLuid->clear();
+            if (SumGpuMemoryByAdapter(adapterCounter, byLuid) && totalBytes(*byLuid) > 0.0) {
+                return true;
+            }
+            byLuid->clear();
+            return SumGpuMemoryByAdapter(processCounter, byLuid) && totalBytes(*byLuid) > 0.0;
+        };
+
         std::unordered_map<std::wstring, double> dedicatedByLuid;
         std::unordered_map<std::wstring, double> sharedByLuid;
-        bool haveDedicated = SumGpuMemoryByAdapter(g_gpuDedicatedCounter, &dedicatedByLuid);
-        bool haveShared = SumGpuMemoryByAdapter(g_gpuSharedCounter, &sharedByLuid);
-        if (!haveDedicated) {
-            haveDedicated = SumGpuMemoryByAdapter(g_gpuProcDedicatedCounter, &dedicatedByLuid);
-        }
-        if (!haveShared) {
-            haveShared = SumGpuMemoryByAdapter(g_gpuProcSharedCounter, &sharedByLuid);
-        }
+        const bool haveDedicated =
+            readGpuMemory(g_gpuDedicatedCounter, g_gpuProcDedicatedCounter, &dedicatedByLuid);
+        const bool haveShared =
+            readGpuMemory(g_gpuSharedCounter, g_gpuProcSharedCounter, &sharedByLuid);
 
         std::wstring activeLuid;
         double dedicatedUsed = 0.0;
@@ -2791,10 +2805,15 @@ void UpdateSystemSnapshot() {
             }
         }
         double sharedUsed = 0.0;
-        if (!activeLuid.empty()) {
-            auto sharedIt = sharedByLuid.find(activeLuid);
+        if (!sharedByLuid.empty()) {
+            // Prefer the adapter chosen above; otherwise the busiest one.
+            auto sharedIt = activeLuid.empty() ? sharedByLuid.end() : sharedByLuid.find(activeLuid);
             if (sharedIt != sharedByLuid.end()) {
                 sharedUsed = sharedIt->second;
+            } else {
+                for (const auto& entry : sharedByLuid) {
+                    sharedUsed = std::max(sharedUsed, entry.second);
+                }
             }
         }
 
@@ -2820,32 +2839,29 @@ void UpdateSystemSnapshot() {
             next.sharedVramTotalGB = chosen->sharedGB;
         }
 
-        if (haveDedicated) {
-            next.vramUsedGB = static_cast<float>(dedicatedUsed / kBytesPerGB);
-            next.vramPercent =
-                next.vramTotalGB > 0.0f
-                    ? ClampInt(static_cast<int>(
-                          dedicatedUsed / (next.vramTotalGB * kBytesPerGB) * 100.0 + 0.5),
-                          0, 100)
-                    : -1;
-        }
-        if (haveShared) {
-            next.sharedVramUsedGB = static_cast<float>(sharedUsed / kBytesPerGB);
-            next.sharedVramPercent =
-                next.sharedVramTotalGB > 0.0f
-                    ? ClampInt(static_cast<int>(
-                          sharedUsed / (next.sharedVramTotalGB * kBytesPerGB) * 100.0 + 0.5),
-                          0, 100)
-                    : -1;
-        }
+        next.vramUsedGB = static_cast<float>(dedicatedUsed / kBytesPerGB);
+        next.vramPercent =
+            (haveDedicated && next.vramTotalGB > 0.0f)
+                ? ClampInt(static_cast<int>(
+                      dedicatedUsed / (next.vramTotalGB * kBytesPerGB) * 100.0 + 0.5), 0, 100)
+                : -1;
 
-        static bool s_loggedGpuOnce = false;
-        if (!s_loggedGpuOnce) {
-            s_loggedGpuOnce = true;
-            Wh_Log(L"GPU counters: engine=%.1f%%, adapters with memory=%u, "
-                   L"active=%s, matched DXGI=%s, dedicated=%.2f/%.2f GB, "
-                   L"shared=%.2f/%.2f GB",
-                   gpu, static_cast<unsigned int>(dedicatedByLuid.size()),
+        next.sharedVramUsedGB = static_cast<float>(sharedUsed / kBytesPerGB);
+        next.sharedVramPercent =
+            (haveShared && next.sharedVramTotalGB > 0.0f)
+                ? ClampInt(static_cast<int>(
+                      sharedUsed / (next.sharedVramTotalGB * kBytesPerGB) * 100.0 + 0.5), 0, 100)
+                : -1;
+
+        static double s_nextGpuLog = 0.0;
+        if (NowSeconds() >= s_nextGpuLog) {
+            s_nextGpuLog = NowSeconds() + 30.0;
+            Wh_Log(L"GPU counters: engine=%.1f%%, dedicated data=%d (adapters=%u), "
+                   L"shared data=%d, active=%s, matched DXGI=%s, "
+                   L"dedicated=%.2f/%.2f GB, shared=%.2f/%.2f GB",
+                   gpu, haveDedicated ? 1 : 0,
+                   static_cast<unsigned int>(dedicatedByLuid.size()),
+                   haveShared ? 1 : 0,
                    activeLuid.empty() ? L"(none)" : activeLuid.c_str(),
                    chosen ? chosen->luid.c_str() : L"(none)",
                    next.vramUsedGB, next.vramTotalGB,
@@ -4404,7 +4420,7 @@ class Renderer {
         wchar_t buf[96] = {};
 
         swprintf_s(buf, L"%d%%", state.system.cpuPercent);
-        DrawStatRow(left, right, rect.top + 36.0f, L"CPU Usage", buf,
+        DrawStatRow(left, right, rect.top + 34.0f, L"CPU Usage", buf,
                     state.system.cpuPercent / 100.0f, D2D1::ColorF(0.0f, 0.82f, 1.0f, 1.0f));
 
         std::wstring temp;
@@ -4416,17 +4432,17 @@ class Renderer {
         } else {
             temp = L"N/A";
         }
-        DrawStatRow(left, right, rect.top + 72.0f, L"CPU Temp", temp, -1.0f,
+        DrawStatRow(left, right, rect.top + 68.0f, L"CPU Temp", temp, -1.0f,
                     D2D1::ColorF(0, 0, 0, 0));
 
         swprintf_s(buf, L"%d%%  \u00b7  %.1f / %.1f GB", state.system.memoryPercent,
                    state.system.ramUsedGB, state.system.ramTotalGB);
-        DrawStatRow(left, right, rect.top + 108.0f, L"RAM", buf,
+        DrawStatRow(left, right, rect.top + 102.0f, L"RAM", buf,
                     state.system.memoryPercent / 100.0f, D2D1::ColorF(0.83f, 0.0f, 1.0f, 1.0f));
 
         swprintf_s(buf, L"%d%%  \u00b7  %.1f / %.1f GB", state.system.commitPercent,
                    state.system.commitUsedGB, state.system.commitTotalGB);
-        DrawStatRow(left, right, rect.top + 144.0f, L"Committed", buf,
+        DrawStatRow(left, right, rect.top + 136.0f, L"Committed", buf,
                     state.system.commitPercent / 100.0f, D2D1::ColorF(1.0f, 0.48f, 0.0f, 1.0f));
     }
 
@@ -4557,15 +4573,15 @@ class Renderer {
         textBrush_->SetOpacity(0.90f);
     }
 
-    // Up/down page buttons with the position dots between them.
+    // Page buttons at the top and bottom centre, with the position dots kept
+    // on the right edge (shifted clear of the privacy dots).
     void DrawPageNav(const SharedState& state, D2D1_RECT_F rect, int tab, int count) {
-        const float shiftX = PrivacyShiftX(state.system.micActive, state.system.cameraActive);
-        const float x = rect.right - kPageNavRightInset - shiftX;
+        const float cx = (rect.left + rect.right) * 0.5f;
         const float cy = (rect.top + rect.bottom) * 0.5f;
         const float offset = PageNavButtonOffset((rect.bottom - rect.top) * 0.5f);
 
-        DrawPageNavButton(D2D1::Point2F(x, cy - offset), true, tab > 0);
-        DrawPageNavButton(D2D1::Point2F(x, cy + offset), false, tab < count - 1);
+        DrawPageNavButton(D2D1::Point2F(cx, cy - offset), true, tab > 0);
+        DrawPageNavButton(D2D1::Point2F(cx, cy + offset), false, tab < count - 1);
 
         ComPtr<ID2D1SolidColorBrush> activeDot, inactiveDot;
         target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.85f * settingsOpacity_), &activeDot);
@@ -4574,11 +4590,13 @@ class Renderer {
             return;
         }
 
-        const float spacing = 7.0f;
+        const float shiftX = PrivacyShiftX(state.system.micActive, state.system.cameraActive);
+        const float dotX = rect.right - kPageDotsRightInset - shiftX;
+        const float spacing = 8.0f;
         const float span = (count - 1) * spacing;
         for (int i = 0; i < count; ++i) {
             target_->FillEllipse(
-                D2D1::Ellipse(D2D1::Point2F(x, cy - span * 0.5f + i * spacing), 2.2f, 2.2f),
+                D2D1::Ellipse(D2D1::Point2F(dotX, cy - span * 0.5f + i * spacing), 2.5f, 2.5f),
                 i == tab ? activeDot.Get() : inactiveDot.Get());
         }
     }
@@ -6558,32 +6576,21 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     }
                 }
 
-                // Page up/down buttons on the right edge of the expanded
-                // pill. Coordinates are converted into the same unscaled
-                // space the renderer draws in, relative to the pill's centre.
+                // Page up/down buttons at the top and bottom centre of the
+                // expanded pill. Coordinates are converted into the same
+                // unscaled space the renderer draws in, relative to the
+                // pill's centre.
                 const float sizeScale = std::max(g_settings.sizeScale, 0.01f);
                 const float pillHeight = (height - kRenderPadY * 2.0f) / sizeScale;
-                const float pillHalfWidth = (width - kRenderPadX * 2.0f) / sizeScale * 0.5f;
                 if (pillHeight > kExpandedPillHeight) {
-                    bool micActive = false;
-                    bool cameraActive = false;
-                    {
-                        std::lock_guard lock(g_stateMutex);
-                        micActive = g_state.system.micActive;
-                        cameraActive = g_state.system.cameraActive;
-                    }
-
                     const float unX = (xPos - width * 0.5f) / sizeScale;
                     const float unY = (yPos - height * 0.5f) / sizeScale;
-                    const float buttonX = pillHalfWidth - kPageNavRightInset -
-                                          PrivacyShiftX(micActive, cameraActive);
                     const float offset = PageNavButtonOffset(pillHeight * 0.5f);
-                    const float hitRadius = kPageNavButtonRadius + 3.0f;
+                    const float hitRadius = kPageNavButtonRadius + 4.0f;
 
                     auto hitButton = [&](float buttonY) {
-                        const float dx = unX - buttonX;
                         const float dy = unY - buttonY;
-                        return dx * dx + dy * dy <= hitRadius * hitRadius;
+                        return unX * unX + dy * dy <= hitRadius * hitRadius;
                     };
 
                     const int tabCount = mediaActive ? kMediaTabCount : kIdleTabCount;
