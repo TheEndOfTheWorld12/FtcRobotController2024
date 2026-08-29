@@ -801,10 +801,14 @@ void LoadSettings() {
     }
 
     // Publish the parsed game-overlay hotkey and tell the keyboard thread to
-    // re-register it when it changed.
+    // re-register it when it changed. A missing value (settings saved by an
+    // older version of the mod) falls back to the documented default; only an
+    // explicit "none" disables the hotkey.
     UINT hotkeyModifiers = 0;
     UINT hotkeyVk = 0;
-    ParseHotkeySetting(next.gameOverlayHotkey, &hotkeyModifiers, &hotkeyVk);
+    ParseHotkeySetting(next.gameOverlayHotkey.empty() ? std::wstring(L"Ctrl+Alt+G")
+                                                      : next.gameOverlayHotkey,
+                       &hotkeyModifiers, &hotkeyVk);
     const bool hotkeyChanged = hotkeyModifiers != g_overlayHotkeyModifiers.load() ||
                                hotkeyVk != g_overlayHotkeyVk.load();
     g_overlayHotkeyModifiers = hotkeyModifiers;
