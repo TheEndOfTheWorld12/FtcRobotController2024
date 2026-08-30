@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.7.1
+// @version         1.7.2
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -28,7 +28,8 @@ media, downloads, clipboard, battery, and more.
     °C and °F), physical RAM usage (percent plus used/total GB) and commit
     charge (percent of memory committed by apps — backed by RAM or the page
     file — plus used/total GB).
-  - **GPU & VRAM** — usage, temperature (°C and °F), dedicated VRAM usage
+  - **GPU & VRAM** — usage, temperature (°C and °F, omitted entirely on a
+    GPU whose driver publishes no temperature), dedicated VRAM usage
     (percent plus used/total GB) and shared GPU memory usage (system RAM
     used as extra GPU memory: percent plus used GB / total pool size in GB).
     On a machine with more than one graphics adapter the page follows
@@ -57,6 +58,12 @@ On NVIDIA cards NVML also supplies the dedicated VRAM figures directly,
 which is more dependable than pairing a performance counter with a display
 adapter; the counters remain the source everywhere else and for shared
 memory.
+
+A usage bar is drawn under a memory figure only where its capacity is
+known. An integrated GPU has no dedicated pool of its own — Windows reports
+a dedicated size of zero and the memory it uses comes out of system RAM —
+so its dedicated VRAM row shows the amount in use with no bar, while shared
+VRAM, whose pool size is known, keeps its bar.
 
 CPU temperature is read from the ACPI thermal zones exposed by the firmware,
 averaged across all zones. The mod first tries the "Thermal Zone Information"
@@ -4971,9 +4978,42 @@ class Renderer {
                     state.system.commitPercent / 100.0f, D2D1::ColorF(1.0f, 0.48f, 0.0f, 1.0f));
     }
 
-    // Page: one adapter's usage, temperature and memory.
-    // One page for the busiest adapter, named in the heading so it is clear
-    // which GPU the numbers below belong to.
+    // A row of the GPU page, gathered before drawing so rows that have nothing
+    // to report can be left out and the rest spread over the whole panel.
+    struct StatRow {
+        const wchar_t* label;
+        std::wstring value;
+        float fill;
+        D2D1_COLOR_F color;
+    };
+
+    // Lays rows out down the panel's stat band, keeping the four-row spacing as
+    // the tightest case and spreading further apart when there are fewer.
+    void DrawStatRows(float left, float right, float bandTop, float bandBottom,
+                      const std::vector<StatRow>& rows) {
+        if (rows.empty()) {
+            return;
+        }
+        constexpr float kRowHeight = 21.0f;   // label plus its bar
+        constexpr float kMinSpacing = 30.0f;
+        constexpr float kMaxSpacing = 40.0f;
+
+        const int count = static_cast<int>(rows.size());
+        float spacing = kMinSpacing;
+        if (count > 1) {
+            spacing = Clamp((bandBottom - bandTop - kRowHeight) / (count - 1),
+                            kMinSpacing, kMaxSpacing);
+        }
+        const float blockHeight = (count - 1) * spacing + kRowHeight;
+        float y = bandTop + ((bandBottom - bandTop) - blockHeight) * 0.5f;
+        for (const StatRow& row : rows) {
+            DrawStatRow(left, right, y, row.label, row.value, row.fill, row.color);
+            y += spacing;
+        }
+    }
+
+    // Page: the busiest adapter's usage, temperature and memory, named in the
+    // heading so it is clear which GPU the numbers below belong to.
     void DrawGpuDashboard(const SharedState& state, D2D1_RECT_F rect) {
         const float left = rect.left + 24.0f;
         const float right = rect.right - 34.0f;
@@ -4997,6 +5037,8 @@ class Renderer {
                            mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
         wchar_t buf[96] = {};
+        std::vector<StatRow> rows;
+        rows.reserve(4);
 
         std::wstring gpuValue;
         float gpuFill = -1.0f;
@@ -5007,20 +5049,19 @@ class Renderer {
         } else {
             gpuValue = L"--";
         }
-        DrawStatRow(left, right, rect.top + 56.0f, L"GPU Usage", gpuValue, gpuFill,
-                    D2D1::ColorF(0.0f, 1.0f, 0.60f, 1.0f));
+        rows.push_back({L"GPU Usage", gpuValue, gpuFill,
+                        D2D1::ColorF(0.0f, 1.0f, 0.60f, 1.0f)});
 
-        std::wstring gpuTemp;
+        // Plenty of drivers publish no temperature at all, so the row is left
+        // out entirely rather than showing a permanent "N/A".
         if (gpu.hasTemp) {
             swprintf_s(buf, L"%.1f\u00B0C  /  %.1f\u00B0F", gpu.tempC,
                        gpu.tempC * 9.0f / 5.0f + 32.0f);
-            gpuTemp = buf;
-        } else {
-            gpuTemp = L"N/A";
+            rows.push_back({L"GPU Temp", buf, -1.0f, D2D1::ColorF(0, 0, 0, 0)});
         }
-        DrawStatRow(left, right, rect.top + 86.0f, L"GPU Temp", gpuTemp, -1.0f,
-                    D2D1::ColorF(0, 0, 0, 0));
 
+        // A bar needs a capacity to fill: an adapter with no dedicated pool of
+        // its own (any integrated GPU) reports the figure without one.
         std::wstring vramValue;
         float vramFill = -1.0f;
         if (gpu.dedicatedTotalGB > 0.0f && gpu.dedicatedPercent >= 0) {
@@ -5034,8 +5075,8 @@ class Renderer {
         } else {
             vramValue = L"N/A";
         }
-        DrawStatRow(left, right, rect.top + 116.0f, L"Dedicated VRAM", vramValue, vramFill,
-                    D2D1::ColorF(0.0f, 0.82f, 1.0f, 1.0f));
+        rows.push_back({L"Dedicated VRAM", vramValue, vramFill,
+                        D2D1::ColorF(0.0f, 0.82f, 1.0f, 1.0f)});
 
         std::wstring sharedValue;
         float sharedFill = -1.0f;
@@ -5050,8 +5091,10 @@ class Renderer {
         } else {
             sharedValue = L"N/A";
         }
-        DrawStatRow(left, right, rect.top + 146.0f, L"Shared VRAM", sharedValue, sharedFill,
-                    D2D1::ColorF(0.83f, 0.0f, 1.0f, 1.0f));
+        rows.push_back({L"Shared VRAM", sharedValue, sharedFill,
+                        D2D1::ColorF(0.83f, 0.0f, 1.0f, 1.0f)});
+
+        DrawStatRows(left, right, rect.top + 56.0f, rect.top + 167.0f, rows);
     }
 
     // Page: network transfer rates (left column) and disk speeds (right column).
