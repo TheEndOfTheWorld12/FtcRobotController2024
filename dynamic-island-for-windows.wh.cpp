@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.7.0
+// @version         1.7.1
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -28,12 +28,14 @@ media, downloads, clipboard, battery, and more.
     °C and °F), physical RAM usage (percent plus used/total GB) and commit
     charge (percent of memory committed by apps — backed by RAM or the page
     file — plus used/total GB).
-  - **GPU & VRAM** — one page per graphics adapter, each headed with that
-    GPU's name, showing its usage, temperature (°C and °F), dedicated VRAM
-    usage (percent plus used/total GB) and shared GPU memory usage (system
-    RAM used as extra GPU memory: percent plus used GB / total pool size in
-    GB). A hybrid laptop therefore gets a page for its integrated GPU and
-    another for its discrete one, each reading only its own adapter.
+  - **GPU & VRAM** — usage, temperature (°C and °F), dedicated VRAM usage
+    (percent plus used/total GB) and shared GPU memory usage (system RAM
+    used as extra GPU memory: percent plus used GB / total pool size in GB).
+    On a machine with more than one graphics adapter the page follows
+    whichever GPU is working hardest and names it in the heading, so a hybrid
+    laptop shows its integrated GPU while idle and switches to the discrete
+    one once that picks up the work. Every figure comes from that one
+    adapter, never a blend of both.
   - **Network & Disk** — system-wide upload, download and combined transfer
     rates, and disk read, write and combined speeds.
 
@@ -236,8 +238,10 @@ constexpr UINT WM_APP_NEW_EVENT = WM_APP + 0x443;
 constexpr float kRenderPadX = 28.0f;
 constexpr float kRenderPadY = 22.0f;
 
-// Dashboard page counts are decided at runtime, because one page is shown per
-// graphics adapter: see IdleTabCount() and MediaTabCount() below.
+// Dashboard pages: calendar, weather, CPU & memory, GPU & VRAM, network &
+// disk, plus the media page in front of them when something is playing.
+constexpr int kIdleTabCount = 5;
+constexpr int kMediaTabCount = kIdleTabCount + 1;
 
 // Page up/down buttons, centred horizontally at the top and bottom edges of
 // the expanded pill. The renderer and the click hit-test share these so they
@@ -436,6 +440,9 @@ struct SystemSnapshot {
     int diskFreePercent = 0;
     int renderFps = 0;
     int gpuPercent = -1;
+    // Index into gpus of the adapter the GPU page shows: whichever one is
+    // working hardest right now.
+    int activeGpu = 0;
     bool charging = false;
     bool micActive = false;      // orange dot: microphone in use
     bool cameraActive = false;   // green dot: camera in use
@@ -2540,23 +2547,14 @@ static const std::vector<GpuAdapterInfo>& GetGpuAdapters() {
     return s_adapters;
 }
 
-// Pages: calendar, weather, CPU & memory, one per GPU, then network & disk.
-// At least one GPU page is always shown, even when nothing is enumerated, so
-// the layout stays predictable.
-constexpr size_t kMaxGpuPages = 4;
+// Every adapter is measured separately, but only one is shown at a time, so
+// there is no need to poll more than a handful.
+constexpr size_t kMaxGpuAdapters = 4;
 
-int GpuPageCount() {
-    const size_t count = GetGpuAdapters().size();
-    return count == 0 ? 1 : static_cast<int>(std::min(count, kMaxGpuPages));
-}
-
-int IdleTabCount() {
-    return 3 + GpuPageCount() + 1;
-}
-
-int MediaTabCount() {
-    return IdleTabCount() + 1;
-}
+// How far another adapter has to pull ahead, in percentage points, before the
+// GPU page switches to it. Without this the page would flicker between two
+// adapters running neck and neck.
+constexpr int kGpuSwitchMargin = 5;
 
 // Extracts the "luid_0x..._0x..." token from a PDH GPU instance name such as
 // "pid_1234_luid_0x00000000_0x0000a1b2_phys_0_eng_0_engtype_3D".
@@ -3286,7 +3284,7 @@ void UpdateSystemSnapshot() {
 
         next.gpus.clear();
         for (const GpuAdapterInfo& adapter : adapters) {
-            if (next.gpus.size() >= kMaxGpuPages) {
+            if (next.gpus.size() >= kMaxGpuAdapters) {
                 break;
             }
 
@@ -3356,13 +3354,38 @@ void UpdateSystemSnapshot() {
             next.gpus.push_back(std::move(stats));
         }
 
+        // The GPU page shows one adapter: whichever is working hardest. The
+        // incumbent keeps the page until another pulls clearly ahead, so a
+        // hybrid machine settles on its integrated GPU while idle and moves to
+        // the discrete one once that starts doing the work.
+        static int s_activeGpu = 0;
+        if (s_activeGpu < 0 || s_activeGpu >= static_cast<int>(next.gpus.size())) {
+            s_activeGpu = 0;
+        }
+        auto usageOf = [&next](int index) {
+            return std::max(0, next.gpus[index].usagePercent);
+        };
+        int hottest = 0;
+        for (int i = 1; i < static_cast<int>(next.gpus.size()); ++i) {
+            if (usageOf(i) > usageOf(hottest)) {
+                hottest = i;
+            }
+        }
+        if (usageOf(hottest) >= usageOf(s_activeGpu) + kGpuSwitchMargin) {
+            s_activeGpu = hottest;
+        }
+        next.activeGpu = s_activeGpu;
+
         static double s_nextGpuLog = 0.0;
         if (NowSeconds() >= s_nextGpuLog) {
             s_nextGpuLog = NowSeconds() + 30.0;
-            for (const GpuStats& stats : next.gpus) {
-                Wh_Log(L"GPU \"%s\": usage=%d%%, temp=%s, dedicated=%.2f/%.2f GB, "
+            for (size_t i = 0; i < next.gpus.size(); ++i) {
+                const GpuStats& stats = next.gpus[i];
+                Wh_Log(L"GPU \"%s\"%s: usage=%d%%, temp=%s, dedicated=%.2f/%.2f GB, "
                        L"shared=%.2f/%.2f GB",
-                       stats.name.c_str(), stats.usagePercent,
+                       stats.name.c_str(),
+                       static_cast<int>(i) == next.activeGpu ? L" [shown]" : L"",
+                       stats.usagePercent,
                        stats.hasTemp ? L"yes" : L"no",
                        stats.dedicatedUsedGB, stats.dedicatedTotalGB,
                        stats.sharedUsedGB, stats.sharedTotalGB);
@@ -4949,23 +4972,19 @@ class Renderer {
     }
 
     // Page: one adapter's usage, temperature and memory.
-    void DrawGpuDashboard(const SharedState& state, D2D1_RECT_F rect, int gpuIndex) {
+    // One page for the busiest adapter, named in the heading so it is clear
+    // which GPU the numbers below belong to.
+    void DrawGpuDashboard(const SharedState& state, D2D1_RECT_F rect) {
         const float left = rect.left + 24.0f;
         const float right = rect.right - 34.0f;
 
         static const GpuStats kNoGpu;
+        const int gpuIndex = state.system.activeGpu;
         const bool valid = gpuIndex >= 0 &&
                            gpuIndex < static_cast<int>(state.system.gpus.size());
         const GpuStats& gpu = valid ? state.system.gpus[gpuIndex] : kNoGpu;
 
-        // Heading names the adapter, numbered when there is more than one.
-        std::wstring heading;
-        if (state.system.gpus.size() > 1) {
-            wchar_t prefix[16] = {};
-            swprintf_s(prefix, L"GPU %d  \u00b7  ", gpuIndex + 1);
-            heading = prefix;
-        }
-        heading += gpu.name.empty() ? std::wstring(L"GPU") : gpu.name;
+        std::wstring heading = gpu.name.empty() ? std::wstring(L"GPU") : gpu.name;
         if (heading.size() > 38) {
             heading.resize(38);
             heading += L"...";
@@ -5137,20 +5156,19 @@ class Renderer {
     }
 
     // Shared page dispatch for the idle pill and the expanded media view:
-    // calendar, weather, CPU & memory, one page per GPU, then network & disk.
+    // calendar, weather, CPU & memory, GPU & VRAM, network & disk.
     void DrawDashboardPage(const SharedState& state, D2D1_RECT_F rect,
                            const Settings& settings, double now, float scale,
                            SYSTEMTIME& local, bool hasWeather, const std::wstring& wIcon,
                            const std::wstring& wText, int tab) {
-        const int gpuPages = GpuPageCount();
         if (tab == 0) {
             DrawCalendarDashboard(state, rect, settings, now, scale, local);
         } else if (tab == 1) {
             DrawWeatherDashboard(state, rect, settings, now, scale, hasWeather, wIcon, wText);
         } else if (tab == 2) {
             DrawCpuRamDashboard(state, rect);
-        } else if (tab < 3 + gpuPages) {
-            DrawGpuDashboard(state, rect, tab - 3);
+        } else if (tab == 3) {
+            DrawGpuDashboard(state, rect);
         } else {
             DrawNetDiskDashboard(state, rect);
         }
@@ -5217,7 +5235,7 @@ class Renderer {
         }
 
         // Expanded Mode
-        const int tabCount = IdleTabCount();
+        const int tabCount = kIdleTabCount;
         int tab = g_idleTab % tabCount;
         if (tab < 0) tab += tabCount;
 
@@ -5735,7 +5753,7 @@ class Renderer {
         if (expandedAlpha > 0.01f && mask && layer) {
             target_->PushLayer(D2D1::LayerParameters(rect, mask.Get(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1::IdentityMatrix(), expandedAlpha, nullptr, D2D1_LAYER_OPTIONS_NONE), layer.Get());
 
-            const int tabCount = MediaTabCount();
+            const int tabCount = kMediaTabCount;
             int tab = g_idleTab % tabCount;
             if (tab < 0) tab += tabCount;
 
@@ -7010,7 +7028,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 const float height = static_cast<float>(clientRect.bottom - clientRect.top);
                 const float width = static_cast<float>(clientRect.right - clientRect.left);
 
-                if (mediaActive && height > 60.0f && (g_idleTab % MediaTabCount()) == 0) {
+                if (mediaActive && height > 60.0f && (g_idleTab % kMediaTabCount) == 0) {
                     float totalScale = (GetDpiForWindow(hwnd) / 96.0f) * g_settings.sizeScale;
                     float cx = width / 2.0f;
                     float cy = height / 2.0f;
@@ -7064,7 +7082,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 const float height = static_cast<float>(clientRect.bottom - clientRect.top);
                 const float width = static_cast<float>(clientRect.right - clientRect.left);
 
-                if (mediaActive && height > 60.0f && (g_idleTab % MediaTabCount()) == 0) {
+                if (mediaActive && height > 60.0f && (g_idleTab % kMediaTabCount) == 0) {
                     float totalScale = (GetDpiForWindow(hwnd) / 96.0f) * g_settings.sizeScale;
                     float cx = width / 2.0f;
                     float cy = height / 2.0f;
@@ -7133,7 +7151,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                                std::fabs(unY - stripY) <= halfStrip;
                     };
 
-                    const int tabCount = mediaActive ? MediaTabCount() : IdleTabCount();
+                    const int tabCount = mediaActive ? kMediaTabCount : kIdleTabCount;
                     if (hitButton(-offset)) {
                         if (g_idleTab > 0) {
                             g_idleTab--;
@@ -7181,7 +7199,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 std::lock_guard lock(g_stateMutex);
                 mediaActive = g_settings.media && g_state.media.available;
             }
-            const int tabCount = mediaActive ? MediaTabCount() : IdleTabCount();
+            const int tabCount = mediaActive ? kMediaTabCount : kIdleTabCount;
             const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
             if (delta > 0) {
                 if (g_idleTab > 0) {
@@ -7561,7 +7579,8 @@ DWORD WINAPI RenderThreadProc(void*) {
         // The GPU pages are built from a variable-length list of adapters, so
         // fold every value they display into a single number and redraw when it
         // moves.
-        double gpuDigest = static_cast<double>(snapshot.system.gpus.size());
+        double gpuDigest = static_cast<double>(snapshot.system.gpus.size()) * 7.0 +
+                           snapshot.system.activeGpu;
         for (const GpuStats& gpu : snapshot.system.gpus) {
             gpuDigest = gpuDigest * 31.0 + gpu.usagePercent;
             gpuDigest = gpuDigest * 31.0 + (gpu.hasTemp ? gpu.tempC : -1000.0f);
