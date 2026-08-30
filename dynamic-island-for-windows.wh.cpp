@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.7.2
+// @version         1.7.3
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -2377,6 +2377,7 @@ static PDH_HCOUNTER g_diskWriteCounter = NULL;
 static PDH_HCOUNTER g_thermalHiPrecCounter = NULL;
 static PDH_HCOUNTER g_thermalTempCounter = NULL;
 static PDH_HCOUNTER g_cpuUtilityCounter = NULL;
+static PDH_HCOUNTER g_cpuTimeCounter = NULL;
 
 static void InitPdhQuery() {
     if (g_pdhQuery == NULL) {
@@ -2386,6 +2387,9 @@ static void InitPdhQuery() {
             // normalized utilization, noticeably higher than raw "% Processor
             // Time" on CPUs that boost. Falls back to GetSystemTimes below.
             PdhAddEnglishCounterW(g_pdhQuery, L"\\Processor Information(_Total)\\% Processor Utility", 0, &g_cpuUtilityCounter);
+            // Kept purely so the log can show both figures side by side when
+            // the displayed number is being compared against Task Manager.
+            PdhAddEnglishCounterW(g_pdhQuery, L"\\Processor Information(_Total)\\% Processor Time", 0, &g_cpuTimeCounter);
             PdhAddEnglishCounterW(g_pdhQuery, L"\\GPU Adapter Memory(*)\\Dedicated Usage", 0, &g_gpuDedicatedCounter);
             PdhAddEnglishCounterW(g_pdhQuery, L"\\GPU Adapter Memory(*)\\Shared Usage", 0, &g_gpuSharedCounter);
             // Drivers vary in which of these they populate, so every source is
@@ -3241,6 +3245,16 @@ void UpdateSystemSnapshot() {
         if (cpuUtility >= 0.0) {
             next.cpuPercent = ClampInt(static_cast<int>(cpuUtility + 0.5), 0, 100);
             cpuFromPdh = true;
+        }
+
+        // Both CPU figures, logged every few seconds so the one on screen can
+        // be checked against Task Manager without guessing which counter
+        // disagrees.
+        static double s_nextCpuLog = 0.0;
+        if (NowSeconds() >= s_nextCpuLog) {
+            s_nextCpuLog = NowSeconds() + 5.0;
+            Wh_Log(L"CPU: utility=%.1f%% (shown), time=%.1f%%", cpuUtility,
+                   ReadPdhCounterValue(g_cpuTimeCounter));
         }
 
         const double diskRead = ReadPdhCounterValue(g_diskReadCounter);
