@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.6.0
+// @version         1.6.1
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -24,7 +24,7 @@ media, downloads, clipboard, battery, and more.
 - Resting pill shows the weather at a glance — icon and temperature, then
   place and condition, feels-like, humidity and wind. No clock: the date and
   time live on the calendar page one hover away.
-- Idle dashboard with calendar and live weather (wttr.in).
+- Idle dashboard with calendar and live weather.
 - **System stats pages** (scroll on the pill, or click its left/right half,
   to flip between pages):
   - **CPU & Memory** — CPU usage, average ACPI CPU temperature (shown in both
@@ -52,6 +52,13 @@ The CPU figure comes from the "% Processor Time" performance counter, which
 tracks what Task Manager shows. The similarly named "% Processor Utility" is
 scaled by current-over-base clock speed and reads far higher on a CPU that
 boosts well above its base frequency.
+
+Weather comes from two services: wttr.in resolves the location (from your IP,
+or from the city in the settings) and names it, and Open-Meteo supplies the
+readings for those coordinates. wttr.in's own current_condition block is a
+nearest-station observation that can sit a few degrees and a lot of humidity
+away from the national forecast models; Open-Meteo serves those models. If
+Open-Meteo cannot be reached, wttr.in's readings are shown instead.
 
 CPU temperature is read from the ACPI thermal zones exposed by the firmware,
 averaged across all zones. The mod first tries the "Thermal Zone Information"
@@ -195,6 +202,7 @@ shown; that is a platform limitation, not a mod bug.
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cwchar>
 #include <cstring>
 #include <initializer_list>
@@ -2007,6 +2015,188 @@ std::string HttpGet(const wchar_t* host, const wchar_t* path, bool https = true)
     return response;
 }
 
+// ── Weather readings: Open-Meteo ─────────────────────────────────────────────
+// wttr.in resolves the location well (by IP, or from the city setting) but its
+// current_condition block is a nearest-station observation that can be a few
+// degrees and a lot of humidity away from what the national forecast models
+// say. Open-Meteo serves those models, so the location still comes from
+// wttr.in and the readings come from here.
+
+// Pulls a bare JSON number out of an object, e.g. "temperature_2m":69.4.
+static bool ParseJsonNumber(const char* object, const char* key, double* out) {
+    if (!object || !key || !out) {
+        return false;
+    }
+    const char* found = strstr(object, key);
+    if (!found) {
+        return false;
+    }
+    found += strlen(key);
+    while (*found == ' ' || *found == ':' || *found == '"') {
+        ++found;
+    }
+    char* end = nullptr;
+    const double value = strtod(found, &end);
+    if (end == found) {
+        return false;
+    }
+    *out = value;
+    return true;
+}
+
+// wttr.in's nearest_area block carries the coordinates it resolved to.
+static bool ParseWttrCoordinates(const char* response, double* latitude, double* longitude) {
+    const char* area = strstr(response, "\"nearest_area\":");
+    if (!area) {
+        return false;
+    }
+    return ParseJsonNumber(area, "\"latitude\"", latitude) &&
+           ParseJsonNumber(area, "\"longitude\"", longitude);
+}
+
+// Open-Meteo reports WMO weather codes. The icon table is keyed by the World
+// Weather Online codes wttr.in uses, so translate to those rather than keep two
+// tables in step.
+static bool WmoToWwoCode(int wmo, int* wwo, std::wstring* text) {
+    struct Mapping {
+        int wmo;
+        int wwo;
+        const wchar_t* text;
+    };
+    static const Mapping kMappings[] = {
+        {0, 113, L"Clear"},
+        {1, 113, L"Mainly clear"},
+        {2, 116, L"Partly cloudy"},
+        {3, 122, L"Overcast"},
+        {45, 143, L"Fog"},
+        {48, 143, L"Freezing fog"},
+        {51, 266, L"Light drizzle"},
+        {53, 293, L"Drizzle"},
+        {55, 296, L"Heavy drizzle"},
+        {56, 281, L"Freezing drizzle"},
+        {57, 284, L"Heavy freezing drizzle"},
+        {61, 296, L"Light rain"},
+        {63, 302, L"Rain"},
+        {65, 308, L"Heavy rain"},
+        {66, 311, L"Freezing rain"},
+        {67, 314, L"Heavy freezing rain"},
+        {71, 326, L"Light snow"},
+        {73, 332, L"Snow"},
+        {75, 338, L"Heavy snow"},
+        {77, 350, L"Snow grains"},
+        {80, 353, L"Light showers"},
+        {81, 356, L"Showers"},
+        {82, 359, L"Heavy showers"},
+        {85, 368, L"Light snow showers"},
+        {86, 371, L"Snow showers"},
+        {95, 200, L"Thunderstorm"},
+        {96, 386, L"Thunderstorm with hail"},
+        {99, 389, L"Thunderstorm with heavy hail"},
+    };
+
+    for (const Mapping& mapping : kMappings) {
+        if (mapping.wmo == wmo) {
+            if (wwo) {
+                *wwo = mapping.wwo;
+            }
+            if (text) {
+                *text = mapping.text;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+// Open-Meteo gives a bearing in degrees; the pill shows a 16-point compass
+// name, as wttr.in did.
+static std::wstring CompassFromDegrees(double degrees) {
+    static const wchar_t* kPoints[] = {L"N",  L"NNE", L"NE", L"ENE", L"E",  L"ESE", L"SE", L"SSE",
+                                       L"S",  L"SSW", L"SW", L"WSW", L"W",  L"WNW", L"NW", L"NNW"};
+    while (degrees < 0.0) {
+        degrees += 360.0;
+    }
+    const int index = static_cast<int>(degrees / 22.5 + 0.5) % 16;
+    return kPoints[index];
+}
+
+// Readings for one point, in the units the pill is set to show. Leaves the
+// caller's values untouched and returns false when anything is missing.
+struct OpenMeteoReading {
+    float temperature = 0.0f;
+    int weatherCode = 0;
+    std::wstring desc;
+    std::wstring feelsLike;
+    std::wstring humidity;
+    std::wstring windSpeed;
+    std::wstring windDir;
+};
+
+static bool FetchOpenMeteo(double latitude, double longitude, bool isFahrenheit,
+                           OpenMeteoReading* out) {
+    if (!out) {
+        return false;
+    }
+
+    wchar_t url[512] = {};
+    swprintf_s(url,
+               L"/v1/forecast?latitude=%.4f&longitude=%.4f&current=temperature_2m,"
+               L"relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,"
+               L"wind_direction_10m%s",
+               latitude, longitude,
+               isFahrenheit ? L"&temperature_unit=fahrenheit&wind_speed_unit=mph" : L"");
+
+    const std::string response = HttpGet(L"api.open-meteo.com", url, true);
+    if (response.empty()) {
+        Wh_Log(L"Weather: Open-Meteo request failed; keeping wttr.in readings.");
+        return false;
+    }
+
+    // "current_units" precedes "current" in the response, and the trailing
+    // colon is what keeps this from matching it.
+    const char* current = strstr(response.c_str(), "\"current\":");
+    if (!current) {
+        Wh_Log(L"Weather: Open-Meteo response had no \"current\" block.");
+        return false;
+    }
+
+    double temperature = 0.0;
+    double code = 0.0;
+    if (!ParseJsonNumber(current, "\"temperature_2m\"", &temperature) ||
+        !ParseJsonNumber(current, "\"weather_code\"", &code)) {
+        Wh_Log(L"Weather: Open-Meteo response was missing temperature or code.");
+        return false;
+    }
+
+    out->temperature = static_cast<float>(temperature);
+
+    int wwo = 0;
+    std::wstring text;
+    if (WmoToWwoCode(static_cast<int>(code), &wwo, &text)) {
+        out->weatherCode = wwo;
+        out->desc = text;
+    }
+
+    wchar_t buf[32] = {};
+    double value = 0.0;
+    if (ParseJsonNumber(current, "\"apparent_temperature\"", &value)) {
+        swprintf_s(buf, L"%.0f", value);
+        out->feelsLike = buf;
+    }
+    if (ParseJsonNumber(current, "\"relative_humidity_2m\"", &value)) {
+        swprintf_s(buf, L"%.0f", value);
+        out->humidity = buf;
+    }
+    if (ParseJsonNumber(current, "\"wind_speed_10m\"", &value)) {
+        swprintf_s(buf, L"%.0f", value);
+        out->windSpeed = buf;
+    }
+    if (ParseJsonNumber(current, "\"wind_direction_10m\"", &value)) {
+        out->windDir = CompassFromDegrees(value);
+    }
+    return true;
+}
+
 DWORD WINAPI WeatherThreadProc(void*) {
     // Initial delay to avoid slowing down startup
     WaitForSingleObject(g_stopEvent, 3000);
@@ -2131,6 +2321,31 @@ DWORD WINAPI WeatherThreadProc(void*) {
                        finalCity.c_str(), temp, feelsLike.c_str(), humidity.c_str(), desc.c_str());
             } else {
                 Wh_Log(L"Weather: Failed to find \"current_condition\" in response.");
+            }
+
+            // wttr.in named the place; Open-Meteo supplies the readings.
+            double latitude = 0.0;
+            double longitude = 0.0;
+            if (ParseWttrCoordinates(wRes.c_str(), &latitude, &longitude)) {
+                OpenMeteoReading reading;
+                if (FetchOpenMeteo(latitude, longitude, isFahrenheit, &reading)) {
+                    temp = reading.temperature;
+                    if (reading.weatherCode != 0) {
+                        code = reading.weatherCode;
+                    }
+                    if (!reading.desc.empty()) desc = reading.desc;
+                    if (!reading.feelsLike.empty()) feelsLike = reading.feelsLike;
+                    if (!reading.humidity.empty()) humidity = reading.humidity;
+                    if (!reading.windSpeed.empty()) windSpeed = reading.windSpeed;
+                    if (!reading.windDir.empty()) windDir = reading.windDir;
+                    Wh_Log(L"Weather: Open-Meteo at %.4f,%.4f: temp=%.1f, feelsLike=%s, "
+                           L"humidity=%s%%, wind=%s %s, desc=%s",
+                           latitude, longitude, temp, feelsLike.c_str(), humidity.c_str(),
+                           windSpeed.c_str(), windDir.c_str(), desc.c_str());
+                }
+            } else {
+                Wh_Log(L"Weather: no coordinates in the wttr.in response; "
+                       L"showing its own readings.");
             }
 
             {
