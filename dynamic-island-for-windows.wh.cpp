@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.5.5
+// @version         1.6.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -21,6 +21,9 @@ media, downloads, clipboard, battery, and more.
 - Live media pill with album art, waveform, scrubber and playback controls.
 - Clipboard, notification, volume, Caps/Num lock, device connect/disconnect and
   battery alerts.
+- Resting pill shows the weather at a glance — icon and temperature, then
+  place and condition, feels-like, humidity and wind. No clock: the date and
+  time live on the calendar page one hover away.
 - Idle dashboard with calendar and live weather (wttr.in).
 - **System stats pages** (scroll on the pill, or click its left/right half,
   to flip between pages):
@@ -4695,7 +4698,7 @@ class Renderer {
                            double now) {
         // While the game overlay is toggled on it replaces only the pill's
         // collapsed look (the overlay is 64 units tall; the expanded panel is
-        // 184) — an expanded pill still shows the regular dashboard pages.
+        // 200) — an expanded pill still shows the regular dashboard pages.
         const bool overlayMode =
             settings.gameOverlay || Wh_GetIntValue(L"GameOverlayPinned", 0) != 0;
         if (overlayMode && (rect.bottom - rect.top) < 100.0f) {
@@ -4709,11 +4712,8 @@ class Renderer {
 
         SYSTEMTIME local = {};
         GetLocalTime(&local);
-        wchar_t timeBuf[32] = {};
-        GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, &local, nullptr, timeBuf, ARRAYSIZE(timeBuf));
 
         const float scale = 1.0f;
-        const float width = rect.right - rect.left;
 
         bool hasWeather = state.weather.hasData && (now - state.weather.lastUpdated < 3600.0);
         std::wstring wIcon = L"🌡️";
@@ -4723,29 +4723,76 @@ class Renderer {
             GetWeatherIconAndText(state.weather.weatherCode, wIcon, wText);
         }
 
-        if (width / scale < 220.0f) {
-            // Collapsed Mode
-            D2D1_RECT_F timeRect = D2D1::RectF(rect.left + 20.0f * scale, rect.top + 7.0f * scale,
-                                               rect.left + 80.0f * scale, rect.bottom - 7.0f * scale);
+        // Collapsed: weather only, no clock. Height tells the two states apart
+        // (36 units collapsed against 200 expanded); width cannot, because the
+        // collapsed pill is now wide enough to carry the detail lines.
+        if ((rect.bottom - rect.top) / scale < 100.0f) {
+            // The privacy dots occupy the right edge, so give way to them.
+            const float right =
+                rect.right - PrivacyShiftX(state.system.micActive, state.system.cameraActive);
+
+            wchar_t nowLabel[32] = {};
+            if (hasWeather) {
+                swprintf_s(nowLabel, L"%s %.0f\x00B0", wIcon.c_str(), state.weather.temperature);
+            } else {
+                wcscpy_s(nowLabel, ARRAYSIZE(nowLabel), L"🌡️ --\x00B0");
+            }
+
             textBrush_->SetOpacity(0.96f);
-            target_->DrawTextW(timeBuf, static_cast<UINT32>(wcslen(timeBuf)), smallTextFormat_.Get(),
-                               timeRect, textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+            target_->DrawTextW(nowLabel, static_cast<UINT32>(wcslen(nowLabel)), textFormat_.Get(),
+                               D2D1::RectF(rect.left + 16.0f * scale, rect.top + 7.0f * scale,
+                                           rect.left + 84.0f * scale, rect.bottom - 6.0f * scale),
+                               textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
 
             ComPtr<ID2D1SolidColorBrush> divider;
             target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.12f * settingsOpacity_), &divider);
             target_->FillRoundedRectangle(
-                D2D1::RoundedRect(D2D1::RectF(rect.left + 82.0f * scale, rect.top + 10.0f * scale,
-                                               rect.left + 83.5f * scale, rect.bottom - 10.0f * scale),
+                D2D1::RoundedRect(D2D1::RectF(rect.left + 88.0f * scale, rect.top + 9.0f * scale,
+                                              rect.left + 89.5f * scale, rect.bottom - 9.0f * scale),
                                   0.5f * scale, 0.5f * scale), divider.Get());
 
-            wchar_t weatherLabel[32] = {};
-            if (hasWeather) swprintf_s(weatherLabel, L"%s %.0f\x00B0", wIcon.c_str(), state.weather.temperature);
-            else wcscpy_s(weatherLabel, ARRAYSIZE(weatherLabel), L"🌡️ --\x00B0");
+            // The same readings the weather page carries, folded onto two
+            // lines: place and condition above, feels-like, humidity and wind
+            // below.
+            std::wstring line1;
+            std::wstring line2;
+            if (hasWeather) {
+                line1 = state.weather.city.empty() ? wText : state.weather.city + L"  \u00b7  " + wText;
+                line2 = L"Feels " + state.weather.feelsLike + L"\x00B0";
+                if (!state.weather.humidity.empty()) {
+                    line2 += L"  \u00b7  " + state.weather.humidity + L"%";
+                }
+                if (!state.weather.windSpeed.empty()) {
+                    line2 += L"  \u00b7  " + state.weather.windSpeed +
+                             (settings.weatherFahrenheit ? L" mph" : L" km/h");
+                    if (!state.weather.windDir.empty()) {
+                        line2 += L" " + state.weather.windDir;
+                    }
+                }
+            } else {
+                line1 = L"Locating...";
+                line2 = wText;
+            }
 
-            D2D1_RECT_F wRect = D2D1::RectF(rect.left + 94.0f * scale, rect.top + 7.0f * scale,
-                                            rect.right, rect.bottom - 7.0f * scale);
-            target_->DrawTextW(weatherLabel, static_cast<UINT32>(wcslen(weatherLabel)), smallTextFormat_.Get(),
-                               wRect, textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+            // Without this a long city or condition wraps and the second line
+            // is clipped away mid-word.
+            smallTextFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+            const float textLeft = rect.left + 100.0f * scale;
+            target_->DrawTextW(line1.c_str(), static_cast<UINT32>(line1.size()),
+                               smallTextFormat_.Get(),
+                               D2D1::RectF(textLeft, rect.top + 4.0f * scale, right,
+                                           rect.top + 18.0f * scale),
+                               textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+
+            mutedBrush_->SetOpacity(0.70f);
+            target_->DrawTextW(line2.c_str(), static_cast<UINT32>(line2.size()),
+                               smallTextFormat_.Get(),
+                               D2D1::RectF(textLeft, rect.top + 18.0f * scale, right,
+                                           rect.top + 32.0f * scale),
+                               mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            smallTextFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+
+            mutedBrush_->SetOpacity(0.58f);
             textBrush_->SetOpacity(1.0f);
             target_->PopAxisAlignedClip();
             return;
@@ -6311,7 +6358,9 @@ Activity ActivityForKind(IslandKind kind, const Settings& settings, const Shared
                 activity.width = 0.0f;
                 activity.height = 0.0f;
             } else {
-                activity.width = 170.0f;
+                // Wide enough for the collapsed weather readout: icon and
+                // temperature, then two lines of detail.
+                activity.width = 300.0f;
                 activity.height = 36.0f;
             }
             break;
