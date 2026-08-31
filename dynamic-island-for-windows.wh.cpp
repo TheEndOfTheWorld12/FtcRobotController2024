@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.5.3
+// @version         1.5.4
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -40,19 +40,15 @@ media, downloads, clipboard, battery, and more.
 
   Flip between pages with the bars along the top and bottom edges of the
   expanded pill, or by scrolling the wheel over it.
-- Optional game overlay with FPS/CPU/RAM/GPU/disk cards (the disk card is
-  activity, matching Task Manager's "Active time" — not how full the drive
-  is), toggled from the
+- Optional game overlay with FPS/CPU/RAM/GPU/disk cards, toggled from the
   context menu or with a configurable hotkey (default Ctrl+Alt+G). While the
   overlay is on it acts as the pill's collapsed look — hovering or clicking
   still expands into the regular dashboard pages.
 
-CPU, RAM, GPU and disk figures are chosen to agree with Task Manager: CPU
-from "% Processor Time" rather than "% Processor Utility" (which is scaled
-by current/base clock and reads far higher on a boosting CPU), RAM as
-(total - available) / total, disk activity as the complement of the disk's
-idle time, and GPU as the busiest engine type on the reported adapter
-rather than its 3D engines alone.
+The CPU figure comes from the "% Processor Time" performance counter, which
+tracks what Task Manager shows. The similarly named "% Processor Utility" is
+scaled by current-over-base clock speed and reads far higher on a CPU that
+boosts well above its base frequency.
 
 CPU temperature is read from the ACPI thermal zones exposed by the firmware,
 averaged across all zones. The mod first tries the "Thermal Zone Information"
@@ -417,10 +413,6 @@ struct SystemSnapshot {
     int cpuPercent = 0;
     int memoryPercent = 0;
     int diskFreePercent = 0;
-    // Share of the interval the disk was busy, the same metric as Task
-    // Manager's "Active time". Distinct from diskFreePercent, which is how
-    // much space is left on C:.
-    int diskActivePercent = 0;
     int renderFps = 0;
     int gpuPercent = -1;
     bool charging = false;
@@ -2353,7 +2345,6 @@ static PDH_HCOUNTER g_gpuNonLocalCounter = NULL;
 static PDH_HCOUNTER g_gpuProcLocalCounter = NULL;
 static PDH_HCOUNTER g_gpuProcNonLocalCounter = NULL;
 static PDH_HCOUNTER g_diskReadCounter = NULL;
-static PDH_HCOUNTER g_diskIdleCounter = NULL;
 static PDH_HCOUNTER g_diskWriteCounter = NULL;
 static PDH_HCOUNTER g_thermalHiPrecCounter = NULL;
 static PDH_HCOUNTER g_thermalTempCounter = NULL;
@@ -2363,17 +2354,12 @@ static void InitPdhQuery() {
     if (g_pdhQuery == NULL) {
         if (PdhOpenQueryW(NULL, 0, &g_pdhQuery) == ERROR_SUCCESS) {
             PdhAddEnglishCounterW(g_pdhQuery, L"\\GPU Engine(*)\\Utilization Percentage", 0, &g_gpuCounter);
-            // The metric Task Manager shows on Windows 10/11: frequency-
-            // normalized utilization, noticeably higher than raw "% Processor
-            // Time" on CPUs that boost. Falls back to GetSystemTimes below.
-            // Task Manager's "Utilization" figure. Not "% Processor Utility":
-            // that one is scaled by current/base clock, so on a CPU boosting
-            // to 3.84 GHz over a 1.40 GHz base it reads nearly three times
-            // higher than the number Task Manager shows.
+            // The figure Task Manager shows. Deliberately not "% Processor
+            // Utility": that one is scaled by current/base clock, so a CPU
+            // boosting to 3.84 GHz over a 1.40 GHz base reads nearly three
+            // times higher than Task Manager's number. Falls back to
+            // GetSystemTimes below.
             PdhAddEnglishCounterW(g_pdhQuery, L"\\Processor Information(_Total)\\% Processor Time", 0, &g_cpuTimeCounter);
-            // Disk activity, the same metric as Task Manager's "Active time":
-            // the share of the interval the disk was not idle.
-            PdhAddEnglishCounterW(g_pdhQuery, L"\\PhysicalDisk(_Total)\\% Idle Time", 0, &g_diskIdleCounter);
             PdhAddEnglishCounterW(g_pdhQuery, L"\\GPU Adapter Memory(*)\\Dedicated Usage", 0, &g_gpuDedicatedCounter);
             PdhAddEnglishCounterW(g_pdhQuery, L"\\GPU Adapter Memory(*)\\Shared Usage", 0, &g_gpuSharedCounter);
             // Drivers vary in which of these they populate, so every source is
@@ -2420,13 +2406,13 @@ static const wchar_t* StrStrNoCase(const wchar_t* haystack, const wchar_t* needl
     return nullptr;
 }
 
-// GPU utilization for one adapter, the way Task Manager measures it: the
-// engine instances are grouped by engine type ("engtype_3D", "engtype_Compute",
-// "engtype_VideoEncode", ...), summed within each type, and the busiest type
-// wins. Summing only the 3D engines reports a card as idle while it is flat out
-// encoding or running compute. Returns -1.0 when the adapter has no instances.
-static double MaxGpuEngineUsage(PDH_HCOUNTER counter, const wchar_t* luidFilter,
-                                int* matchedOut) {
+// Sums the instances of a wildcard counter. The optional nameFilter and
+// nameFilter2 keep only instances whose name contains both substrings (e.g.
+// the "engtype_3D" engines belonging to one adapter LUID). matchedOut
+// receives how many instances passed the filters. Returns -1.0 on failure.
+static double SumPdhCounterArray(PDH_HCOUNTER counter, const wchar_t* nameFilter,
+                                 const wchar_t* nameFilter2 = nullptr,
+                                 int* matchedOut = nullptr) {
     if (matchedOut) {
         *matchedOut = 0;
     }
@@ -2442,42 +2428,30 @@ static double MaxGpuEngineUsage(PDH_HCOUNTER counter, const wchar_t* luidFilter,
     }
 
     std::vector<BYTE> buffer(bufferSize);
-    PDH_FMT_COUNTERVALUE_ITEM_W* items =
-        reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buffer.data());
-    if (PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &bufferSize, &itemCount, items) !=
-        ERROR_SUCCESS) {
+    PDH_FMT_COUNTERVALUE_ITEM_W* items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buffer.data());
+    if (PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &bufferSize, &itemCount, items) != ERROR_SUCCESS) {
         return -1.0;
     }
 
-    std::unordered_map<std::wstring, double> byEngineType;
+    double total = 0.0;
     int matched = 0;
     for (DWORD i = 0; i < itemCount; i++) {
         if (!items[i].szName) {
             continue;
         }
-        if (luidFilter && !StrStrNoCase(items[i].szName, luidFilter)) {
+        if (nameFilter && !StrStrNoCase(items[i].szName, nameFilter)) {
             continue;
         }
-        const wchar_t* engine = StrStrNoCase(items[i].szName, L"engtype_");
-        // An instance with no engine type still counts towards the adapter;
-        // group those together under an empty key.
-        std::wstring type = engine ? engine + wcslen(L"engtype_") : L"";
-        byEngineType[type] += items[i].FmtValue.doubleValue;
+        if (nameFilter2 && !StrStrNoCase(items[i].szName, nameFilter2)) {
+            continue;
+        }
+        total += items[i].FmtValue.doubleValue;
         ++matched;
     }
-
     if (matchedOut) {
         *matchedOut = matched;
     }
-    if (byEngineType.empty()) {
-        return -1.0;
-    }
-
-    double busiest = 0.0;
-    for (const auto& entry : byEngineType) {
-        busiest = std::max(busiest, entry.second);
-    }
-    return busiest;
+    return total;
 }
 
 // Reads a single-instance counter as a double. Returns -1.0 on failure.
@@ -2806,20 +2780,10 @@ void UpdateSystemSnapshot() {
 
     InitPdhQuery();
     if (g_pdhQuery && PdhCollectQueryData(g_pdhQuery) == ERROR_SUCCESS) {
-        // "% Processor Utility" is what Task Manager displays: it is
-        // normalized by base frequency, so on a boosting CPU it reads much
-        // higher than the raw time-based number. Task Manager caps it at 100.
         const double cpuTime = ReadPdhCounterValue(g_cpuTimeCounter);
         if (cpuTime >= 0.0) {
             next.cpuPercent = ClampInt(static_cast<int>(cpuTime + 0.5), 0, 100);
             cpuFromPdh = true;
-        }
-
-        // "% Idle Time" is the share of the interval the disk did nothing, so
-        // activity is its complement.
-        const double diskIdle = ReadPdhCounterValue(g_diskIdleCounter);
-        if (diskIdle >= 0.0) {
-            next.diskActivePercent = ClampInt(static_cast<int>(100.0 - diskIdle + 0.5), 0, 100);
         }
 
         const double diskRead = ReadPdhCounterValue(g_diskReadCounter);
@@ -2884,9 +2848,10 @@ void UpdateSystemSnapshot() {
             reading.adapter = &adapter;
 
             int matched = 0;
-            const double usage = MaxGpuEngineUsage(g_gpuCounter, adapter.luid.c_str(), &matched);
+            const double usage =
+                SumPdhCounterArray(g_gpuCounter, L"engtype_3D", adapter.luid.c_str(), &matched);
             if (usage >= 0.0 && matched > 0) {
-                reading.usagePercent = ClampInt(static_cast<int>(usage + 0.5), 0, 100);
+                reading.usagePercent = ClampInt(static_cast<int>(usage), 0, 100);
             }
 
             auto dedicatedIt = dedicatedByLuid.find(adapter.luid);
@@ -2906,9 +2871,9 @@ void UpdateSystemSnapshot() {
         if (readings.empty()) {
             // No adapter enumerated: fall back to the unfiltered engine total
             // so the usage row still shows something.
-            const double gpuTotal = MaxGpuEngineUsage(g_gpuCounter, nullptr, nullptr);
+            const double gpuTotal = SumPdhCounterArray(g_gpuCounter, L"engtype_3D");
             if (gpuTotal >= 0.0) {
-                next.gpuPercent = ClampInt(static_cast<int>(gpuTotal + 0.5), 0, 100);
+                next.gpuPercent = ClampInt(static_cast<int>(gpuTotal), 0, 100);
             }
         } else {
             // The busiest adapter holds the page. It keeps it until another
@@ -2939,9 +2904,9 @@ void UpdateSystemSnapshot() {
             if (next.gpuPercent < 0) {
                 // No engine instance carried this adapter's LUID. Rather than
                 // show nothing, fall back to the unfiltered engine total.
-                const double gpuTotal = MaxGpuEngineUsage(g_gpuCounter, nullptr, nullptr);
+                const double gpuTotal = SumPdhCounterArray(g_gpuCounter, L"engtype_3D");
                 if (gpuTotal >= 0.0) {
-                    next.gpuPercent = ClampInt(static_cast<int>(gpuTotal + 0.5), 0, 100);
+                    next.gpuPercent = ClampInt(static_cast<int>(gpuTotal), 0, 100);
                 }
             }
 
@@ -2987,14 +2952,7 @@ void UpdateSystemSnapshot() {
     MEMORYSTATUSEX memory = {};
     memory.dwLength = sizeof(memory);
     if (GlobalMemoryStatusEx(&memory)) {
-        // Task Manager shows (total - available) / total. dwMemoryLoad is a
-        // slightly different figure and lands a couple of points off it.
-        next.memoryPercent =
-            memory.ullTotalPhys > 0
-                ? ClampInt(static_cast<int>((memory.ullTotalPhys - memory.ullAvailPhys) * 100 /
-                                            memory.ullTotalPhys),
-                           0, 100)
-                : static_cast<int>(memory.dwMemoryLoad);
+        next.memoryPercent = static_cast<int>(memory.dwMemoryLoad);
         next.ramTotalGB = static_cast<float>(memory.ullTotalPhys / kBytesPerGB);
         next.ramUsedGB = static_cast<float>((memory.ullTotalPhys - memory.ullAvailPhys) / kBytesPerGB);
         // Commit charge: ullTotalPageFile is the current commit limit
@@ -4866,7 +4824,7 @@ class Renderer {
                            L"GPU", state.system.gpuPercent, 3, scale);
         DrawGameMetricCard(D2D1::RectF(start + cardW * 3.0f + gap * 3.0f, cardTop,
                                        start + cardW * 4.0f + gap * 3.0f, rect.bottom - 10.0f * scale),
-                           L"DSK", state.system.diskActivePercent, 4, scale);
+                           L"DSK", 100 - state.system.diskFreePercent, 4, scale);
 
         textBrush_->SetOpacity(0.90f);
         mutedBrush_->SetOpacity(0.58f);
@@ -7139,7 +7097,6 @@ DWORD WINAPI RenderThreadProc(void*) {
         static int prevCpu = -1;
         static int prevRam = -1;
         static int prevDisk = -1;
-        static int prevDiskActive = -1;
         static int prevVol = -1;
         static bool prevMuted = false;
         static int prevBat = -1;
@@ -7164,7 +7121,6 @@ DWORD WINAPI RenderThreadProc(void*) {
             snapshot.system.cpuPercent != prevCpu ||
             snapshot.system.memoryPercent != prevRam ||
             snapshot.system.diskFreePercent != prevDisk ||
-            snapshot.system.diskActivePercent != prevDiskActive ||
             snapshot.system.volumePercent != prevVol ||
             snapshot.system.volumeMuted != prevMuted ||
             snapshot.battery.percent != prevBat ||
@@ -7188,7 +7144,6 @@ DWORD WINAPI RenderThreadProc(void*) {
             prevCpu = snapshot.system.cpuPercent;
             prevRam = snapshot.system.memoryPercent;
             prevDisk = snapshot.system.diskFreePercent;
-            prevDiskActive = snapshot.system.diskActivePercent;
             prevVol = snapshot.system.volumePercent;
             prevMuted = snapshot.system.volumeMuted;
             prevBat = snapshot.battery.percent;
