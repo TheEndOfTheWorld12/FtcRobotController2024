@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.5.4
+// @version         1.5.5
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -28,13 +28,13 @@ media, downloads, clipboard, battery, and more.
     °C and °F), physical RAM usage (percent plus used/total GB) and commit
     charge (percent of memory committed by apps — backed by RAM or the page
     file — plus used/total GB).
-  - **GPU & VRAM** — GPU usage, dedicated VRAM usage (percent plus used/total
-    GB) and shared GPU memory usage (system RAM used as extra GPU memory:
-    percent plus used GB / total pool size in GB). On a machine with more
-    than one graphics adapter the page follows whichever GPU is working
-    hardest and names it in the heading; every figure on the page is measured
-    from that one adapter, so a reading is never paired with another card's
-    capacity.
+  - **GPU & Memory** — GPU usage, dedicated GPU memory (the card's own
+    VRAM: percent plus used/total GB) and shared GPU memory (the slice of
+    system RAM the GPU may borrow: percent plus used GB / pool size in GB).
+    The labels match Task Manager's. On a machine with more than one
+    graphics adapter the page follows whichever GPU is working hardest and
+    names it in the heading; every figure on the page is measured from that
+    one adapter, so a reading is never paired with another card's capacity.
   - **Network & Disk** — system-wide upload, download and combined transfer
     rates, and disk read, write and combined speeds.
 
@@ -229,7 +229,7 @@ constexpr UINT WM_APP_NEW_EVENT = WM_APP + 0x443;
 constexpr float kRenderPadX = 28.0f;
 constexpr float kRenderPadY = 22.0f;
 
-// Idle dashboard pages: calendar, weather, CPU+RAM, GPU+VRAM, network & disk.
+// Idle dashboard pages: calendar, weather, CPU+RAM, GPU+memory, network & disk.
 constexpr int kIdleTabCount = 5;
 // The expanded media view adds its own page in front of the idle pages.
 constexpr int kMediaTabCount = kIdleTabCount + 1;
@@ -2519,7 +2519,7 @@ static const std::vector<GpuAdapterInfo>& GetGpuAdapters() {
             }
         }
         if (s_adapters.empty()) {
-            Wh_Log(L"No DXGI hardware adapters found; VRAM totals unavailable.");
+            Wh_Log(L"No DXGI hardware adapters found; GPU memory totals unavailable.");
         }
     }
 
@@ -4524,14 +4524,14 @@ class Renderer {
                     state.system.commitPercent / 100.0f, D2D1::ColorF(1.0f, 0.48f, 0.0f, 1.0f));
     }
 
-    // Page: GPU usage, dedicated VRAM and shared GPU memory.
+    // Page: GPU usage, dedicated GPU memory and shared GPU memory.
     void DrawGpuDashboard(const SharedState& state, D2D1_RECT_F rect) {
         const float left = rect.left + 24.0f;
         const float right = rect.right - 34.0f;
 
         // Naming the adapter matters now that the page follows whichever GPU
         // is busiest: without it there is no telling which card is on screen.
-        std::wstring heading = state.system.gpuName.empty() ? std::wstring(L"GPU  &  VRAM")
+        std::wstring heading = state.system.gpuName.empty() ? std::wstring(L"GPU  &  MEMORY")
                                                             : state.system.gpuName;
         if (heading.size() > 38) {
             heading.resize(38);
@@ -4570,7 +4570,7 @@ class Renderer {
         } else {
             vramValue = L"N/A";
         }
-        DrawStatRow(left, right, rect.top + 102.0f, L"Dedicated VRAM", vramValue, vramFill,
+        DrawStatRow(left, right, rect.top + 102.0f, L"Dedicated GPU Memory", vramValue, vramFill,
                     D2D1::ColorF(0.0f, 0.82f, 1.0f, 1.0f));
 
         std::wstring sharedValue;
@@ -4586,7 +4586,7 @@ class Renderer {
         } else {
             sharedValue = L"N/A";
         }
-        DrawStatRow(left, right, rect.top + 142.0f, L"Shared VRAM", sharedValue, sharedFill,
+        DrawStatRow(left, right, rect.top + 142.0f, L"Shared GPU Memory", sharedValue, sharedFill,
                     D2D1::ColorF(0.83f, 0.0f, 1.0f, 1.0f));
     }
 
