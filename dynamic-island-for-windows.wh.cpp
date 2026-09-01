@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.6.2
+// @version         1.7.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -18,7 +18,8 @@ A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to
 media, downloads, clipboard, battery, and more.
 
 ## Features
-- Live media pill with album art, waveform, scrubber and playback controls.
+- Live media pill with album art, waveform, playback controls, and a
+  scrubber you can click or drag to seek within the track.
 - Clipboard, notification, volume, Caps/Num lock, device connect/disconnect and
   battery alerts.
 - Resting pill shows the weather at a glance — icon and temperature, then
@@ -210,6 +211,7 @@ shown; that is a platform limitation, not a mod bug.
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -543,6 +545,14 @@ std::atomic<int> g_idleTab = 0;
 std::atomic<bool> g_layoutDirty = true;
 std::atomic<bool> g_clickExpanded = false;
 std::atomic<int> g_pressedMediaButton = -1;
+
+// Dragging the media timeline. g_scrubFraction is -1 whenever the bar simply
+// follows playback; while a drag is in progress, and briefly after it ends, it
+// holds the position the pointer chose, so the bar does not snap back to the
+// old position before the session reports the seek.
+std::atomic<bool> g_scrubDragging = false;
+std::atomic<float> g_scrubFraction = -1.0f;
+std::atomic<uint64_t> g_scrubHoldUntil = 0;
 FILETIME g_prevIdleTime = {};
 FILETIME g_prevKernelTime = {};
 FILETIME g_prevUserTime = {};
@@ -5604,6 +5614,14 @@ class Renderer {
                 }
                 currentPosition = std::max(0.0, std::min(currentPosition, duration));
 
+                // While the timeline is being dragged — and until the session
+                // reports the seek — the bar and both times show the position
+                // the pointer chose rather than the one still playing.
+                const float scrubPreview = g_scrubFraction.load();
+                if (scrubPreview >= 0.0f && duration > 0.0) {
+                    currentPosition = duration * scrubPreview;
+                }
+
                 auto FormatTime = [](double seconds) -> std::wstring {
                     if (seconds <= 0.0 || _isnan(seconds)) return L"0:00";
                     int m = static_cast<int>(seconds) / 60;
@@ -6739,6 +6757,85 @@ DWORD WINAPI KeyboardThreadProc(void*) {
     return 0;
 }
 
+// Where a click lands on the expanded media scrubber. Mirrors the layout in
+// DrawMedia: the bar runs from rect.left + 60 to rect.right - 62, at
+// rect.top + 118, in the unscaled coordinates the renderer draws in.
+struct ScrubberHit {
+    bool valid = false;   // the pill is wide enough to hold a bar
+    bool onBar = false;   // the pointer is on it
+    float fraction = 0.0f;
+};
+
+static ScrubberHit HitTestScrubber(HWND hwnd, int xPos, int yPos) {
+    ScrubberHit hit;
+
+    RECT clientRect = {};
+    GetClientRect(hwnd, &clientRect);
+    const float width = static_cast<float>(clientRect.right - clientRect.left);
+    const float height = static_cast<float>(clientRect.bottom - clientRect.top);
+
+    const float sizeScale = std::max(g_settings.sizeScale, 0.01f);
+    const float dpiScale = std::max(GetDpiForWindow(hwnd) / 96.0f, 0.01f);
+    const float totalScale = dpiScale * sizeScale;
+
+    // Offsets from the pill's centre, the same space the media button
+    // hit-test works in.
+    const float unX = (xPos - width * 0.5f) / totalScale;
+    const float unY = (yPos - height * 0.5f) / totalScale;
+    const float halfW = (width / dpiScale - kRenderPadX * 2.0f) / sizeScale * 0.5f;
+    const float halfH = (height / dpiScale - kRenderPadY * 2.0f) / sizeScale * 0.5f;
+
+    const float barLeft = -halfW + 60.0f;
+    const float barRight = halfW - 62.0f;
+    if (barRight <= barLeft) {
+        return hit;
+    }
+
+    hit.valid = true;
+    hit.fraction = Clamp((unX - barLeft) / (barRight - barLeft), 0.0f, 1.0f);
+    // The bar is only 5 units tall, so accept a band around it and a little
+    // past each end rather than making it fiddly to grab.
+    hit.onBar = std::fabs(unY - (118.0f - halfH)) <= 10.0f &&
+                unX >= barLeft - 8.0f && unX <= barRight + 8.0f;
+    return hit;
+}
+
+// Moves the session the pill is showing to a point in the track.
+static void SeekCurrentSession(int64_t positionTicks) {
+    std::wstring aumid;
+    {
+        std::lock_guard lock(g_stateMutex);
+        aumid = g_state.media.sourceAppUserModelId;
+    }
+
+    std::thread([positionTicks, aumid]() {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        try {
+            using Manager =
+                winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager;
+            auto manager = Manager::RequestAsync().get();
+            if (!manager) {
+                return;
+            }
+            winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSession session =
+                nullptr;
+            for (auto const& candidate : manager.GetSessions()) {
+                if (candidate.SourceAppUserModelId().c_str() == aumid) {
+                    session = candidate;
+                    break;
+                }
+            }
+            if (!session) {
+                session = manager.GetCurrentSession();
+            }
+            if (session) {
+                // Players that cannot seek simply report false.
+                session.TryChangePlaybackPositionAsync(positionTicks).get();
+            }
+        } catch (...) {}
+    }).detach();
+}
+
 LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE:
@@ -6850,7 +6947,30 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                             return 0;
                         }
                     }
+
+                    // Pressing anywhere along the timeline starts a scrub; the
+                    // bar follows the pointer until the button comes back up.
+                    const ScrubberHit hit = HitTestScrubber(hwnd, xPos, yPos);
+                    if (hit.valid && hit.onBar) {
+                        g_scrubDragging = true;
+                        g_scrubFraction = hit.fraction;
+                        SetCapture(hwnd);
+                        g_layoutDirty = true;
+                        return 0;
+                    }
                 }
+            }
+            break;
+
+        case WM_MOUSEMOVE:
+            if (g_scrubDragging.load()) {
+                const ScrubberHit hit =
+                    HitTestScrubber(hwnd, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+                if (hit.valid) {
+                    g_scrubFraction = hit.fraction;
+                    g_layoutDirty = true;
+                }
+                return 0;
             }
             break;
 
@@ -6864,6 +6984,31 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
                 int xPos = GET_X_LPARAM(lParam);
                 int yPos = GET_Y_LPARAM(lParam);
+
+                if (g_scrubDragging.exchange(false)) {
+                    ReleaseCapture();
+                    const ScrubberHit hit = HitTestScrubber(hwnd, xPos, yPos);
+                    const float fraction = hit.valid ? hit.fraction : g_scrubFraction.load();
+
+                    int64_t endTicks = 0;
+                    {
+                        std::lock_guard lock(g_stateMutex);
+                        endTicks = g_state.media.endTicks;
+                    }
+
+                    if (endTicks > 0 && fraction >= 0.0f) {
+                        g_scrubFraction = fraction;
+                        // Keep showing the chosen position until the session
+                        // has had time to report it, otherwise the bar snaps
+                        // back to where the track was before the seek.
+                        g_scrubHoldUntil = GetTickCount64() + 1500;
+                        SeekCurrentSession(static_cast<int64_t>(endTicks * fraction));
+                    } else {
+                        g_scrubFraction = -1.0f;
+                    }
+                    g_layoutDirty = true;
+                    return 0;
+                }
 
                 bool expanded = Wh_GetIntValue(L"PinnedExpanded", 0) != 0 || g_clickExpanded.load();
                 if (!g_settings.expandOnHover && !expanded) {
@@ -6974,6 +7119,13 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 } else {
                     HandleStatusClickAtPoint(hwnd, lParam);
                 }
+            }
+            return 0;
+
+        case WM_CAPTURECHANGED:
+            if (g_scrubDragging.exchange(false)) {
+                g_scrubFraction = -1.0f;
+                g_layoutDirty = true;
             }
             return 0;
 
@@ -7171,6 +7323,14 @@ DWORD WINAPI RenderThreadProc(void*) {
         const bool hover = PtInRect(&windowRect, cursor) != FALSE;
 
         bool needsRender = false;
+
+        // Let go of a finished scrub once the session has had time to report
+        // the new position, so the bar goes back to following playback.
+        if (!g_scrubDragging.load() && g_scrubFraction.load() >= 0.0f &&
+            GetTickCount64() > g_scrubHoldUntil.load()) {
+            g_scrubFraction = -1.0f;
+            needsRender = true;
+        }
 
         if (!hover && g_clickExpanded.load()) {
             g_clickExpanded = false;
