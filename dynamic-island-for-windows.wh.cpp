@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.7.2
+// @version         1.7.3
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -6838,15 +6838,17 @@ static PillPoint PillPointFromClient(HWND hwnd, int xPos, int yPos) {
         return point;
     }
 
+    // No DPI term: the renderer sizes its bitmap as (pill + 2 * kRenderPad)
+    // raw pixels and draws one unit per pixel at sizeScale 1, so client pixels
+    // convert with sizeScale alone. Folding in GetDpiForWindow divided twice
+    // over on a scaled display and pushed every hit-test off target.
     const float sizeScale = std::max(g_settings.sizeScale, 0.01f);
-    const float dpiScale = std::max(GetDpiForWindow(hwnd) / 96.0f, 0.01f);
-    const float totalScale = dpiScale * sizeScale;
 
     point.valid = true;
-    point.x = (xPos - width * 0.5f) / totalScale;
-    point.y = (yPos - height * 0.5f) / totalScale;
-    point.halfW = (width / dpiScale - kRenderPadX * 2.0f) / sizeScale * 0.5f;
-    point.halfH = (height / dpiScale - kRenderPadY * 2.0f) / sizeScale * 0.5f;
+    point.x = (xPos - width * 0.5f) / sizeScale;
+    point.y = (yPos - height * 0.5f) / sizeScale;
+    point.halfW = (width - kRenderPadX * 2.0f) / sizeScale * 0.5f;
+    point.halfH = (height - kRenderPadY * 2.0f) / sizeScale * 0.5f;
     return point;
 }
 
@@ -7008,17 +7010,13 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 RECT clientRect;
                 GetClientRect(hwnd, &clientRect);
                 const float height = static_cast<float>(clientRect.bottom - clientRect.top);
-                const float width = static_cast<float>(clientRect.right - clientRect.left);
 
                 if (mediaActive && height > 60.0f && (g_idleTab % kMediaTabCount) == 0) {
-                    float totalScale = (GetDpiForWindow(hwnd) / 96.0f) * g_settings.sizeScale;
-                    float cx = width / 2.0f;
-                    float cy = height / 2.0f;
+                    const PillPoint point = PillPointFromClient(hwnd, xPos, yPos);
+                    const float unX = point.x;
+                    const float unY = point.y;
 
-                    float unX = (xPos - cx) / totalScale;
-                    float unY = (yPos - cy) / totalScale;
-
-                    if (unY > 48.0f - 26.0f && unY < 48.0f + 26.0f) {
+                    if (point.valid && unY > 48.0f - 26.0f && unY < 48.0f + 26.0f) {
                         int cmd = -1;
                         if (unX > -84.0f && unX < -44.0f) cmd = 0; // Prev
                         else if (unX > -24.0f && unX < 24.0f) cmd = 1; // Play/Pause
@@ -7113,14 +7111,11 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 const float width = static_cast<float>(clientRect.right - clientRect.left);
 
                 if (mediaActive && height > 60.0f && (g_idleTab % kMediaTabCount) == 0) {
-                    float totalScale = (GetDpiForWindow(hwnd) / 96.0f) * g_settings.sizeScale;
-                    float cx = width / 2.0f;
-                    float cy = height / 2.0f;
+                    const PillPoint point = PillPointFromClient(hwnd, xPos, yPos);
+                    const float unX = point.x;
+                    const float unY = point.y;
 
-                    float unX = (xPos - cx) / totalScale;
-                    float unY = (yPos - cy) / totalScale;
-
-                    if (unY > 48.0f - 26.0f && unY < 48.0f + 26.0f) {
+                    if (point.valid && unY > 48.0f - 26.0f && unY < 48.0f + 26.0f) {
                         // Check button clicks in expanded media view
                         int cmd = -1;
                         if (unX > -84.0f && unX < -44.0f) cmd = 0; // Prev
