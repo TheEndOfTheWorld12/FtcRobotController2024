@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.8.1
+// @version         1.8.2
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -47,6 +47,8 @@ media, downloads, clipboard, battery, and more.
 
   Flip between pages with the bars along the top and bottom edges of the
   expanded pill, or by scrolling the wheel over it.
+- Recovers on its own when a monitor is connected, disconnected or rescaled:
+  the pill rebuilds and re-places itself instead of needing a restart.
 - Press and drag the pill: it follows the pointer, and once the drag passes
   40 pixels it re-anchors and glides to the bottom of the screen (or back to
   the top, dragging up). Let go before then and it glides back to where it
@@ -95,6 +97,7 @@ shown; that is a platform limitation, not a mod bug.
     $name: Horizontal offset (px)
   - OffsetY: 0
     $name: Vertical offset (px)
+    $description: Distance from the edge the pill is anchored to, so the top and bottom placements mirror each other
   - SizeScale: "1.0"
     $name: Size scale
   - AutoDpiScale: true
@@ -590,6 +593,11 @@ std::atomic<float> g_moveOffsetY = 0.0f;
 std::atomic<float> g_moveOffsetTargetX = 0.0f;
 std::atomic<float> g_moveOffsetTargetY = 0.0f;
 
+// Set when monitors are plugged in, unplugged, rearranged or rescaled. The
+// renderer rebuilds its bitmap and fonts and re-places the window on the next
+// frame, which is what a restart used to be needed for.
+std::atomic<bool> g_displayChanged = false;
+
 std::atomic<bool> g_mediaHitValid = false;
 std::atomic<float> g_scrubBarLeftPx = 0.0f;
 std::atomic<float> g_scrubBarRightPx = 0.0f;
@@ -1009,6 +1017,7 @@ void AnchorPointForPosition(Position position, int width, int height, int* outX,
     RECT work = GetAnchorWorkRect();
     int x = work.left + (work.right - work.left - width) / 2;
     int y = work.top + 8;
+    bool bottomAnchored = false;
 
     switch (position) {
         case Position::TopLeft:
@@ -1022,6 +1031,7 @@ void AnchorPointForPosition(Position position, int width, int height, int* outX,
         case Position::BottomCenter:
             x = work.left + (work.right - work.left - width) / 2;
             y = work.bottom - height - 40;
+            bottomAnchored = true;
             break;
         case Position::TopCenter:
         default:
@@ -1029,7 +1039,10 @@ void AnchorPointForPosition(Position position, int width, int height, int* outX,
     }
 
     if (outX) *outX = x + g_settings.offsetX;
-    if (outY) *outY = y + g_settings.offsetY;
+    // The offset moves the pill away from the edge it hangs off, so a 100px
+    // vertical offset sits 100px below the top edge up there and 100px above
+    // the bottom edge down here — mirrored, rather than pushed off-screen.
+    if (outY) *outY = bottomAnchored ? y - g_settings.offsetY : y + g_settings.offsetY;
 }
 
 void PositionOverlayWindow(HWND hwnd, int width, int height) {
@@ -4102,6 +4115,21 @@ class Renderer {
     bool Render(const SharedState& state, const Settings& settings, const Activity& primary,
                 const std::optional<Activity>& secondary, float width, float height,
                 float nudge, bool hover, bool pinned, double now) {
+        // A monitor came or went: throw away the cached bitmap and fonts so
+        // they are rebuilt against the display the pill now lives on, and
+        // re-place the window rather than leaving it where the old layout put
+        // it.
+        if (g_displayChanged.exchange(false)) {
+            lastFontScale_ = 0.0f;
+            bitmapWidth_ = 0;
+            bitmapHeight_ = 0;
+            g_moveOffsetX = 0.0f;
+            g_moveOffsetY = 0.0f;
+            g_moveOffsetTargetX = 0.0f;
+            g_moveOffsetTargetY = 0.0f;
+            g_layoutDirty = true;
+        }
+
         EnsureTextFormats(settings.sizeScale);
         const int pixelWidth = std::max(1, static_cast<int>(std::ceil(width + kRenderPadX * 2.0f)));
         const int pixelHeight = std::max(1, static_cast<int>(std::ceil(height + kRenderPadY * 2.0f)));
@@ -7044,6 +7072,24 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
             return 0;
         }
+
+        // Monitors connected, disconnected, rearranged, or their resolution,
+        // scaling or work area changed. Each of these can leave the pill sized
+        // or placed for a screen that is no longer there.
+        case WM_DISPLAYCHANGE:
+        case WM_DPICHANGED:
+            g_displayChanged = true;
+            g_layoutDirty = true;
+            return 0;
+
+        case WM_SETTINGCHANGE:
+            // Docking and undocking usually shows up here as a work-area
+            // change; scaling changes arrive as WM_DPICHANGED above.
+            if (wParam == SPI_SETWORKAREA) {
+                g_displayChanged = true;
+                g_layoutDirty = true;
+            }
+            return 0;
 
         case WM_CLIPBOARDUPDATE:
             if (g_settings.clipboard) {
