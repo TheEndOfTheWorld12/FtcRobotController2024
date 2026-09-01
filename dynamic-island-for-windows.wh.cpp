@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.7.0
+// @version         1.7.1
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -19,7 +19,8 @@ media, downloads, clipboard, battery, and more.
 
 ## Features
 - Live media pill with album art, waveform, playback controls, and a
-  scrubber you can click or drag to seek within the track.
+  video-player-style scrubber: hovering thickens the bar and grows a knob at
+  the playhead, and clicking or dragging seeks within the track.
 - Clipboard, notification, volume, Caps/Num lock, device connect/disconnect and
   battery alerts.
 - Resting pill shows the weather at a glance — icon and temperature, then
@@ -551,6 +552,9 @@ std::atomic<int> g_pressedMediaButton = -1;
 // holds the position the pointer chose, so the bar does not snap back to the
 // old position before the session reports the seek.
 std::atomic<bool> g_scrubDragging = false;
+// How far the timeline is into its hover look, 0 to 1: the bar thickens and a
+// knob grows at the playhead, the way a video player's scrubber does.
+std::atomic<float> g_scrubEmphasis = 0.0f;
 std::atomic<float> g_scrubFraction = -1.0f;
 std::atomic<uint64_t> g_scrubHoldUntil = 0;
 FILETIME g_prevIdleTime = {};
@@ -5648,17 +5652,40 @@ class Renderer {
                 const float barRight = scrubRight - 38.0f;
                 const float progress = duration > 0.0 ? static_cast<float>(currentPosition / duration) : 0.0f;
 
+                // Hovering thickens the bar from 5 units to 8 and brightens
+                // the unplayed part, the way a video player's does.
+                const float emphasis = Clamp(g_scrubEmphasis.load(), 0.0f, 1.0f);
+                const float barHalf = 2.5f + 1.5f * emphasis;
+
                 ComPtr<ID2D1SolidColorBrush> scrubBg;
-                target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.15f), &scrubBg);
-                target_->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(barLeft, scrubberY - 2.5f, barRight, scrubberY + 2.5f), 2.5f, 2.5f), scrubBg.Get());
+                target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.15f + 0.10f * emphasis), &scrubBg);
+                target_->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(barLeft, scrubberY - barHalf, barRight, scrubberY + barHalf), barHalf, barHalf), scrubBg.Get());
 
                 // Same brush as the transport buttons. Reading the sampled
                 // album colour directly ignored the accent setting, so the bar
                 // stayed album-tinted while the buttons followed the setting.
                 const float scrubW = (barRight - barLeft) * progress;
                 accentBrush_->SetOpacity(0.9f);
-                target_->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(barLeft, scrubberY - 2.5f, barLeft + scrubW, scrubberY + 2.5f), 2.5f, 2.5f), accentBrush_.Get());
+                target_->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(barLeft, scrubberY - barHalf, barLeft + scrubW, scrubberY + barHalf), barHalf, barHalf), accentBrush_.Get());
                 accentBrush_->SetOpacity(1.0f);
+
+                // The knob rides the playhead and is only there on hover, as
+                // in a video player. A dark rim keeps it legible where it sits
+                // over the filled part of the bar.
+                if (emphasis > 0.01f) {
+                    const float knobX = barLeft + scrubW;
+                    const float knobR = 5.5f * emphasis;
+                    ComPtr<ID2D1SolidColorBrush> knobRim;
+                    target_->CreateSolidColorBrush(
+                        D2D1::ColorF(0, 0, 0, 0.35f * emphasis * settingsOpacity_), &knobRim);
+                    if (knobRim) {
+                        target_->FillEllipse(
+                            D2D1::Ellipse(D2D1::Point2F(knobX, scrubberY), knobR + 1.2f, knobR + 1.2f),
+                            knobRim.Get());
+                    }
+                    target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(knobX, scrubberY), knobR, knobR),
+                                         accentBrush_.Get());
+                }
 
                 // Controls
                 const float cy = rect.top + 148.0f;
@@ -7455,6 +7482,32 @@ DWORD WINAPI RenderThreadProc(void*) {
         }
 
         SetClickThrough(hwnd, primary.kind == IslandKind::Idle && !hover && !pinned);
+
+        // The timeline's hover look. The pointer has to be over the bar itself,
+        // and the transition is eased so the knob grows in rather than popping.
+        {
+            bool overScrubber = false;
+            if (g_scrubDragging.load()) {
+                overScrubber = true;
+            } else if (hover && primary.kind == IslandKind::Media &&
+                       (g_idleTab % kMediaTabCount) == 0) {
+                POINT local = cursor;
+                if (ScreenToClient(hwnd, &local)) {
+                    const ScrubberHit hit = HitTestScrubber(hwnd, local.x, local.y);
+                    overScrubber = hit.valid && hit.onBar;
+                }
+            }
+
+            const float target = overScrubber ? 1.0f : 0.0f;
+            const float current = g_scrubEmphasis.load();
+            if (std::fabs(target - current) > 0.002f) {
+                g_scrubEmphasis = current + (target - current) * std::min(1.0f, dt * 16.0f);
+                needsRender = true;
+            } else if (current != target) {
+                g_scrubEmphasis = target;
+                needsRender = true;
+            }
+        }
 
         // Check if animating structurally
         if (std::abs(widthSpring.velocity) > 0.01f || std::abs(widthSpring.target - widthSpring.value) > 0.01f ||
