@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.7.1
+// @version         1.7.2
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -20,7 +20,9 @@ media, downloads, clipboard, battery, and more.
 ## Features
 - Live media pill with album art, waveform, playback controls, and a
   video-player-style scrubber: hovering thickens the bar and grows a knob at
-  the playhead, and clicking or dragging seeks within the track.
+  the playhead, and clicking or dragging seeks within the track. A
+  "Go to media" button beside the transport controls brings the player to
+  the front — clicking elsewhere on the pill no longer does.
 - Clipboard, notification, volume, Caps/Num lock, device connect/disconnect and
   battery alerts.
 - Resting pill shows the weather at a glance — icon and temperature, then
@@ -555,6 +557,8 @@ std::atomic<bool> g_scrubDragging = false;
 // How far the timeline is into its hover look, 0 to 1: the bar thickens and a
 // knob grows at the playhead, the way a video player's scrubber does.
 std::atomic<float> g_scrubEmphasis = 0.0f;
+// Whether the pointer is over the media page's "Go to media" button.
+std::atomic<bool> g_goToMediaHover = false;
 std::atomic<float> g_scrubFraction = -1.0f;
 std::atomic<uint64_t> g_scrubHoldUntil = 0;
 FILETIME g_prevIdleTime = {};
@@ -5694,6 +5698,26 @@ class Renderer {
                                   D2D1::Point2F(cx - 64.0f, cy),
                                   D2D1::Point2F(cx, cy),
                                   D2D1::Point2F(cx + 64.0f, cy));
+
+                // Bringing the player to the front is a deliberate press now,
+                // rather than something a click anywhere on the pill does.
+                const bool goHover = g_goToMediaHover.load();
+                const D2D1_RECT_F goRect =
+                    D2D1::RectF(cx + 86.0f, cy - 12.0f, cx + 164.0f, cy + 12.0f);
+                ComPtr<ID2D1SolidColorBrush> goBg;
+                target_->CreateSolidColorBrush(
+                    D2D1::ColorF(1, 1, 1, (goHover ? 0.14f : 0.070f) * settingsOpacity_), &goBg);
+                if (goBg) {
+                    target_->FillRoundedRectangle(D2D1::RoundedRect(goRect, 12.0f, 12.0f),
+                                                  goBg.Get());
+                }
+                accentBrush_->SetOpacity(goHover ? 1.0f : 0.82f);
+                smallTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                target_->DrawTextW(L"Go to media", 11, smallTextFormat_.Get(),
+                                   D2D1::RectF(goRect.left, cy - 7.5f, goRect.right, cy + 12.0f),
+                                   accentBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                smallTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                accentBrush_->SetOpacity(1.0f);
             } else if (tab == 1) {
                 SYSTEMTIME local = {}; GetLocalTime(&local);
                 DrawCalendarDashboard(state, rect, g_settings, now, 1.0f, local);
@@ -6793,38 +6817,71 @@ struct ScrubberHit {
     float fraction = 0.0f;
 };
 
-static ScrubberHit HitTestScrubber(HWND hwnd, int xPos, int yPos) {
-    ScrubberHit hit;
+// A point in the client area, expressed the way the renderer draws: unscaled
+// units measured from the pill's centre, alongside the pill's half extents.
+struct PillPoint {
+    bool valid = false;
+    float x = 0.0f;
+    float y = 0.0f;
+    float halfW = 0.0f;
+    float halfH = 0.0f;
+};
+
+static PillPoint PillPointFromClient(HWND hwnd, int xPos, int yPos) {
+    PillPoint point;
 
     RECT clientRect = {};
     GetClientRect(hwnd, &clientRect);
     const float width = static_cast<float>(clientRect.right - clientRect.left);
     const float height = static_cast<float>(clientRect.bottom - clientRect.top);
+    if (width <= 0.0f || height <= 0.0f) {
+        return point;
+    }
 
     const float sizeScale = std::max(g_settings.sizeScale, 0.01f);
     const float dpiScale = std::max(GetDpiForWindow(hwnd) / 96.0f, 0.01f);
     const float totalScale = dpiScale * sizeScale;
 
-    // Offsets from the pill's centre, the same space the media button
-    // hit-test works in.
-    const float unX = (xPos - width * 0.5f) / totalScale;
-    const float unY = (yPos - height * 0.5f) / totalScale;
-    const float halfW = (width / dpiScale - kRenderPadX * 2.0f) / sizeScale * 0.5f;
-    const float halfH = (height / dpiScale - kRenderPadY * 2.0f) / sizeScale * 0.5f;
+    point.valid = true;
+    point.x = (xPos - width * 0.5f) / totalScale;
+    point.y = (yPos - height * 0.5f) / totalScale;
+    point.halfW = (width / dpiScale - kRenderPadX * 2.0f) / sizeScale * 0.5f;
+    point.halfH = (height / dpiScale - kRenderPadY * 2.0f) / sizeScale * 0.5f;
+    return point;
+}
 
-    const float barLeft = -halfW + 60.0f;
-    const float barRight = halfW - 62.0f;
+static ScrubberHit HitTestScrubber(HWND hwnd, int xPos, int yPos) {
+    ScrubberHit hit;
+
+    const PillPoint point = PillPointFromClient(hwnd, xPos, yPos);
+    if (!point.valid) {
+        return hit;
+    }
+
+    const float barLeft = -point.halfW + 60.0f;
+    const float barRight = point.halfW - 62.0f;
     if (barRight <= barLeft) {
         return hit;
     }
 
     hit.valid = true;
-    hit.fraction = Clamp((unX - barLeft) / (barRight - barLeft), 0.0f, 1.0f);
+    hit.fraction = Clamp((point.x - barLeft) / (barRight - barLeft), 0.0f, 1.0f);
     // The bar is only 5 units tall, so accept a band around it and a little
     // past each end rather than making it fiddly to grab.
-    hit.onBar = std::fabs(unY - (118.0f - halfH)) <= 10.0f &&
-                unX >= barLeft - 8.0f && unX <= barRight + 8.0f;
+    hit.onBar = std::fabs(point.y - (118.0f - point.halfH)) <= 10.0f &&
+                point.x >= barLeft - 8.0f && point.x <= barRight + 8.0f;
     return hit;
+}
+
+// The "Go to media" button, drawn to the right of the transport controls:
+// cx + 86 to cx + 164, centred on the control row at rect.top + 148.
+static bool HitTestGoToMedia(HWND hwnd, int xPos, int yPos) {
+    const PillPoint point = PillPointFromClient(hwnd, xPos, yPos);
+    if (!point.valid || point.halfW < 120.0f) {
+        return false;
+    }
+    return point.x >= 86.0f && point.x <= 164.0f &&
+           std::fabs(point.y - (148.0f - point.halfH)) <= 12.0f;
 }
 
 // Moves the session the pill is showing to a point in the track.
@@ -7142,7 +7199,13 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 }
 
                 if (mediaActive) {
-                    OpenRelevantApp();
+                    // Only the button opens the player. Clicking anywhere on
+                    // the pill used to yank the app to the foreground, which
+                    // made the pill hazardous to click for any other reason.
+                    if ((g_idleTab % kMediaTabCount) == 0 && height > 60.0f &&
+                        HitTestGoToMedia(hwnd, xPos, yPos)) {
+                        OpenRelevantApp();
+                    }
                 } else {
                     HandleStatusClickAtPoint(hwnd, lParam);
                 }
@@ -7486,16 +7549,22 @@ DWORD WINAPI RenderThreadProc(void*) {
         // The timeline's hover look. The pointer has to be over the bar itself,
         // and the transition is eased so the knob grows in rather than popping.
         {
-            bool overScrubber = false;
-            if (g_scrubDragging.load()) {
-                overScrubber = true;
-            } else if (hover && primary.kind == IslandKind::Media &&
-                       (g_idleTab % kMediaTabCount) == 0) {
+            bool overScrubber = g_scrubDragging.load();
+            bool overGoToMedia = false;
+            if (hover && primary.kind == IslandKind::Media &&
+                (g_idleTab % kMediaTabCount) == 0) {
                 POINT local = cursor;
                 if (ScreenToClient(hwnd, &local)) {
-                    const ScrubberHit hit = HitTestScrubber(hwnd, local.x, local.y);
-                    overScrubber = hit.valid && hit.onBar;
+                    if (!overScrubber) {
+                        const ScrubberHit hit = HitTestScrubber(hwnd, local.x, local.y);
+                        overScrubber = hit.valid && hit.onBar;
+                    }
+                    overGoToMedia = HitTestGoToMedia(hwnd, local.x, local.y);
                 }
+            }
+
+            if (g_goToMediaHover.exchange(overGoToMedia) != overGoToMedia) {
+                needsRender = true;
             }
 
             const float target = overScrubber ? 1.0f : 0.0f;
