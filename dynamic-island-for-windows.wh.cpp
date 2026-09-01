@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.8.2
+// @version         1.8.3
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -47,8 +47,9 @@ media, downloads, clipboard, battery, and more.
 
   Flip between pages with the bars along the top and bottom edges of the
   expanded pill, or by scrolling the wheel over it.
-- Recovers on its own when a monitor is connected, disconnected or rescaled:
-  the pill rebuilds and re-places itself instead of needing a restart.
+- Restarts itself when a monitor is connected, disconnected, rearranged or
+  rescaled, so the pill comes back sized and placed for the display it is
+  actually on.
 - Press and drag the pill: it follows the pointer, and once the drag passes
   40 pixels it re-anchors and glides to the bottom of the screen (or back to
   the top, dragging up). Let go before then and it glides back to where it
@@ -594,9 +595,10 @@ std::atomic<float> g_moveOffsetTargetX = 0.0f;
 std::atomic<float> g_moveOffsetTargetY = 0.0f;
 
 // Set when monitors are plugged in, unplugged, rearranged or rescaled. The
-// renderer rebuilds its bitmap and fonts and re-places the window on the next
-// frame, which is what a restart used to be needed for.
-std::atomic<bool> g_displayChanged = false;
+// overlay window and renderer are torn down and built again from scratch,
+// rather than nursing every cached size, font and handle back into agreement
+// with a screen that has just appeared or vanished.
+std::atomic<bool> g_restartOverlay = false;
 
 std::atomic<bool> g_mediaHitValid = false;
 std::atomic<float> g_scrubBarLeftPx = 0.0f;
@@ -4115,21 +4117,6 @@ class Renderer {
     bool Render(const SharedState& state, const Settings& settings, const Activity& primary,
                 const std::optional<Activity>& secondary, float width, float height,
                 float nudge, bool hover, bool pinned, double now) {
-        // A monitor came or went: throw away the cached bitmap and fonts so
-        // they are rebuilt against the display the pill now lives on, and
-        // re-place the window rather than leaving it where the old layout put
-        // it.
-        if (g_displayChanged.exchange(false)) {
-            lastFontScale_ = 0.0f;
-            bitmapWidth_ = 0;
-            bitmapHeight_ = 0;
-            g_moveOffsetX = 0.0f;
-            g_moveOffsetY = 0.0f;
-            g_moveOffsetTargetX = 0.0f;
-            g_moveOffsetTargetY = 0.0f;
-            g_layoutDirty = true;
-        }
-
         EnsureTextFormats(settings.sizeScale);
         const int pixelWidth = std::max(1, static_cast<int>(std::ceil(width + kRenderPadX * 2.0f)));
         const int pixelHeight = std::max(1, static_cast<int>(std::ceil(height + kRenderPadY * 2.0f)));
@@ -6825,7 +6812,10 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 
         if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
             if (kbd->vkCode == VK_CAPITAL || kbd->vkCode == VK_NUMLOCK) {
-                PostMessageW(g_hwnd, WM_APP_CAPSLOCK, kbd->vkCode, 0);
+                // The window is briefly absent while the overlay restarts.
+                if (HWND target = g_hwnd) {
+                    PostMessageW(target, WM_APP_CAPSLOCK, kbd->vkCode, 0);
+                }
             }
         }
 
@@ -7078,16 +7068,14 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         // or placed for a screen that is no longer there.
         case WM_DISPLAYCHANGE:
         case WM_DPICHANGED:
-            g_displayChanged = true;
-            g_layoutDirty = true;
+            g_restartOverlay = true;
             return 0;
 
         case WM_SETTINGCHANGE:
             // Docking and undocking usually shows up here as a work-area
             // change; scaling changes arrive as WM_DPICHANGED above.
             if (wParam == SPI_SETWORKAREA) {
-                g_displayChanged = true;
-                g_layoutDirty = true;
+                g_restartOverlay = true;
             }
             return 0;
 
@@ -7457,473 +7445,493 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 DWORD WINAPI RenderThreadProc(void*) {
     HRESULT hrCo = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
-    WNDCLASSEXW wc = {};
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = OverlayWndProc;
-    wc.hInstance = GetModuleHandleW(nullptr);
-    wc.lpszClassName = kWindowClass;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    RegisterClassExW(&wc);
+    // The overlay is built, run, and torn down inside this loop so that a
+    // display change can simply restart it.
+    for (;;) {
+        g_restartOverlay = false;
 
-    HWND hwnd = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
-        kWindowClass, L"Dynamic Island for Windows", WS_POPUP, 0, 0, 520, 140,
-        nullptr, nullptr, wc.hInstance, nullptr);
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = OverlayWndProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = kWindowClass;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        RegisterClassExW(&wc);
 
-    if (!hwnd) {
-        Wh_Log(L"Failed to create Dynamic Island overlay window.");
-        if (SUCCEEDED(hrCo)) {
-            CoUninitialize();
+        HWND hwnd = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+            kWindowClass, L"Dynamic Island for Windows", WS_POPUP, 0, 0, 520, 140,
+            nullptr, nullptr, wc.hInstance, nullptr);
+
+        if (!hwnd) {
+            Wh_Log(L"Failed to create Dynamic Island overlay window.");
+            UnregisterClassW(kWindowClass, wc.hInstance);
+            break;
         }
-        return 0;
-    }
 
-    g_hwnd = hwnd;
-    g_shellHookMessage = RegisterWindowMessageW(L"SHELLHOOK");
-    EnableBlurBehind(hwnd);
-    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        g_hwnd = hwnd;
+        g_shellHookMessage = RegisterWindowMessageW(L"SHELLHOOK");
+        EnableBlurBehind(hwnd);
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
-    Renderer renderer;
-    if (!renderer.Initialize(hwnd)) {
-        DestroyWindow(hwnd);
-        g_hwnd = nullptr;
-        if (SUCCEEDED(hrCo)) {
-            CoUninitialize();
+        Renderer renderer;
+        if (!renderer.Initialize(hwnd)) {
+            DestroyWindow(hwnd);
+            g_hwnd = nullptr;
+            UnregisterClassW(kWindowClass, wc.hInstance);
+            break;
         }
-        return 0;
-    }
 
-    SpringValue widthSpring;
-    SpringValue heightSpring;
-    SpringValue nudgeSpring;
-    widthSpring.Reset((g_settings.autoHideIdleSeconds == -1 ? 0.0f : 120.0f) * g_settings.sizeScale);
-    heightSpring.Reset((g_settings.autoHideIdleSeconds == -1 ? 0.0f : 36.0f) * g_settings.sizeScale);
-    nudgeSpring.Reset(0.0f);
+        SpringValue widthSpring;
+        SpringValue heightSpring;
+        SpringValue nudgeSpring;
+        widthSpring.Reset((g_settings.autoHideIdleSeconds == -1 ? 0.0f : 120.0f) * g_settings.sizeScale);
+        heightSpring.Reset((g_settings.autoHideIdleSeconds == -1 ? 0.0f : 36.0f) * g_settings.sizeScale);
+        nudgeSpring.Reset(0.0f);
 
-    IslandKind previousPrimary = IslandKind::Idle;
-    auto previousFrame = std::chrono::steady_clock::now();
-    double nextBatteryPoll = 0.0;
-    double nextProgressPoll = 0.0;
-    double nextSystemPoll = 0.0;
-    double nextPrivacyPoll = 0.0;
+        IslandKind previousPrimary = IslandKind::Idle;
+        auto previousFrame = std::chrono::steady_clock::now();
+        double nextBatteryPoll = 0.0;
+        double nextProgressPoll = 0.0;
+        double nextSystemPoll = 0.0;
+        double nextPrivacyPoll = 0.0;
 
-    while (WaitForSingleObject(g_stopEvent, 0) == WAIT_TIMEOUT) {
-        MSG message = {};
-        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
-            if (message.message == WM_APP_NEW_EVENT) {
-                nudgeSpring.value = -6.0f;
-                nudgeSpring.velocity = 0.0f;
-                nudgeSpring.target = 0.0f;
-                continue;
+        while (WaitForSingleObject(g_stopEvent, 0) == WAIT_TIMEOUT) {
+            if (g_restartOverlay.load()) {
+                break;
             }
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
-        }
 
-        const double now = NowSeconds();
-        if (now >= nextBatteryPoll) {
-            UpdateBatterySnapshot();
-            nextBatteryPoll = now + 15.0;
-        }
-        if (now >= nextProgressPoll) {
-            UpdateProgressSnapshot();
-            nextProgressPoll = now + 0.25;
-        }
-        if (now >= nextSystemPoll) {
-            UpdateSystemSnapshot();
-            nextSystemPoll = now + 1.0;
-        }
-        if (now >= nextPrivacyPoll) {
-            UpdatePrivacyIndicators();
-            nextPrivacyPoll = now + 2.0;  // poll every 2 s
-        }
-
-        SharedState snapshot;
-        {
-            std::lock_guard lock(g_stateMutex);
-            snapshot = g_state;
-            if (g_state.clipboard.active && now >= g_state.clipboard.expiresAt) {
-                g_state.clipboard.active = false;
-                snapshot.clipboard.active = false;
+            MSG message = {};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                if (message.message == WM_APP_NEW_EVENT) {
+                    nudgeSpring.value = -6.0f;
+                    nudgeSpring.velocity = 0.0f;
+                    nudgeSpring.target = 0.0f;
+                    continue;
+                }
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
             }
-            if (g_state.notification.active && now >= g_state.notification.expiresAt) {
-                g_state.notification.active = false;
-                snapshot.notification.active = false;
+
+            const double now = NowSeconds();
+            if (now >= nextBatteryPoll) {
+                UpdateBatterySnapshot();
+                nextBatteryPoll = now + 15.0;
             }
-            if (g_state.volume.active && now >= g_state.volume.expiresAt) {
-                g_state.volume.active = false;
-                snapshot.volume.active = false;
+            if (now >= nextProgressPoll) {
+                UpdateProgressSnapshot();
+                nextProgressPoll = now + 0.25;
             }
-            if (g_state.capsLock.active && now >= g_state.capsLock.expiresAt) {
-                g_state.capsLock.active = false;
-                snapshot.capsLock.active = false;
+            if (now >= nextSystemPoll) {
+                UpdateSystemSnapshot();
+                nextSystemPoll = now + 1.0;
             }
-            if (g_state.battery.active && now >= g_state.battery.expiresAt) {
-                g_state.battery.active = false;
-                snapshot.battery.active = false;
+            if (now >= nextPrivacyPoll) {
+                UpdatePrivacyIndicators();
+                nextPrivacyPoll = now + 2.0;  // poll every 2 s
             }
-            if (g_state.device.active && now >= g_state.device.expiresAt) {
-                g_state.device.active = false;
-                snapshot.device.active = false;
-            }
-        }
 
-        const std::vector<IslandKind> kinds = ChooseActivities(snapshot, g_settings, now);
-        Activity primary = ActivityForKind(kinds[0], g_settings, snapshot);
-        std::optional<Activity> secondary;
-        if (kinds.size() >= 2) {
-            secondary = ActivityForKind(kinds[1], g_settings, snapshot);
-        }
-
-        const bool pinned = Wh_GetIntValue(L"PinnedExpanded", 0) != 0;
-
-        if (primary.kind != previousPrimary && primary.kind != IslandKind::Idle) {
-            nudgeSpring.value = -6.0f;
-            nudgeSpring.velocity = 0.0f;
-            nudgeSpring.target = 0.0f;
-        }
-        previousPrimary = primary.kind;
-
-        RECT windowRect = {};
-        GetWindowRect(hwnd, &windowRect);
-        POINT cursor = {};
-        GetCursorPos(&cursor);
-        const bool hover = PtInRect(&windowRect, cursor) != FALSE;
-
-        bool needsRender = false;
-
-        // Let go of a finished scrub once the session has had time to report
-        // the new position, so the bar goes back to following playback.
-        if (!g_scrubDragging.load() && g_scrubFraction.load() >= 0.0f &&
-            GetTickCount64() > g_scrubHoldUntil.load()) {
-            g_scrubFraction = -1.0f;
-            needsRender = true;
-        }
-
-        if (!hover && g_clickExpanded.load()) {
-            g_clickExpanded = false;
-            needsRender = true;
-        }
-        static double lastInteractionTime = NowSeconds();
-        bool currentlyHidden = false;
-        if (g_settings.autoHideIdleSeconds == -1) {
-            currentlyHidden = true;
-        } else if (g_settings.autoHideIdleSeconds > 0) {
-            currentlyHidden = (now - lastInteractionTime > g_settings.autoHideIdleSeconds);
-        }
-
-        bool isHoverExpanded = g_settings.expandOnHover ? hover : (hover && g_clickExpanded.load());
-
-        if (currentlyHidden && !g_settings.unhideOnHover && primary.kind == IslandKind::Idle) {
-            isHoverExpanded = false;
-        } else if (isHoverExpanded || pinned || primary.kind != IslandKind::Idle) {
-            lastInteractionTime = now;
-        }
-
-        bool isHidden = false;
-        if (g_settings.autoHideIdleSeconds == -1) {
-            isHidden = true;
-        } else if (g_settings.autoHideIdleSeconds > 0) {
-            isHidden = (now - lastInteractionTime > g_settings.autoHideIdleSeconds);
-        }
-
-        bool privacyActive = snapshot.system.micActive || snapshot.system.cameraActive;
-        if (primary.kind == IslandKind::Idle) {
-            if (pinned || isHoverExpanded) {
-                primary.width = 380.0f * g_settings.sizeScale;
-                primary.height = kExpandedPillContentHeight * g_settings.sizeScale;
-            } else if (isHidden && !privacyActive) {
-                primary.width = 0.0f;
-                primary.height = 0.0f;
-            }
-        }
-        // While the game overlay is toggled on it becomes the pill's collapsed
-        // presentation, taking over from the idle dashboard AND from the media
-        // pill — otherwise the overlay would stay hidden for as long as
-        // something is playing. Brief alerts (clipboard, notifications,
-        // volume, battery...) still interrupt and then hand the pill back.
-        // Hover/pin expansion is untouched, so the full dashboard pages remain
-        // one hover away.
-        const bool overlayMode =
-            g_settings.gameOverlay || Wh_GetIntValue(L"GameOverlayPinned", 0) != 0;
-        if (overlayMode && !pinned && !isHoverExpanded &&
-            (primary.kind == IslandKind::Idle || primary.kind == IslandKind::Media)) {
-            primary.kind = IslandKind::Idle;
-            primary.width = 372.0f * g_settings.sizeScale;
-            primary.height = 64.0f * g_settings.sizeScale;
-            secondary.reset();
-        }
-        if (primary.kind == IslandKind::Media) {
-            // Expansion is deliberate only: hovering or pinning. New tracks
-            // used to pop the pill open on their own, which interrupts
-            // whatever is underneath it.
-            if (isHoverExpanded || pinned) {
-                primary.width = 380.0f * g_settings.sizeScale;
-                primary.height = kExpandedPillContentHeight * g_settings.sizeScale;
-            }
-        }
-
-        float targetWidth = primary.width;
-        float targetHeight = primary.height;
-        if (secondary) {
-            targetWidth = primary.width + secondary->width + 12.0f * g_settings.sizeScale;
-            targetHeight = std::max(primary.height, secondary->height);
-        }
-        if (pinned) {
-            targetWidth = std::max(targetWidth, 380.0f * g_settings.sizeScale);
-            targetHeight = std::max(targetHeight, 64.0f * g_settings.sizeScale);
-        }
-
-        widthSpring.target = targetWidth;
-        heightSpring.target = targetHeight;
-
-        const auto currentFrame = std::chrono::steady_clock::now();
-        float dt = std::chrono::duration<float>(currentFrame - previousFrame).count();
-        previousFrame = currentFrame;
-        dt = Clamp(dt, 0.001f, 0.050f);
-
-        const float speed = g_settings.animationSpeed;
-        float widthStiffness = 280.0f;
-        float widthDamping = 24.0f;
-        if (targetWidth > widthSpring.value) {
-            widthStiffness = 380.0f;
-            widthDamping = 26.0f;
-        } else if (targetWidth < widthSpring.value) {
-            widthStiffness = 200.0f;
-            widthDamping = 28.0f;
-        }
-
-        float heightStiffness = 280.0f;
-        float heightDamping = 24.0f;
-        if (targetHeight > heightSpring.value) {
-            heightStiffness = 380.0f;
-            heightDamping = 26.0f;
-        } else if (targetHeight < heightSpring.value) {
-            heightStiffness = 200.0f;
-            heightDamping = 28.0f;
-        }
-
-        widthSpring.Step(dt * speed, widthStiffness, widthDamping);
-        if (widthSpring.value < 0.0f) {
-            widthSpring.value = 0.0f;
-            widthSpring.velocity = 0.0f;
-        }
-
-        heightSpring.Step(dt * speed, heightStiffness, heightDamping);
-        if (heightSpring.value < 0.0f) {
-            heightSpring.value = 0.0f;
-            heightSpring.velocity = 0.0f;
-        }
-
-        nudgeSpring.Step(dt * speed, 280.0f, 24.0f);
-
-        {
-            std::lock_guard lock(g_stateMutex);
-            g_state.system.renderFps = ClampInt(static_cast<int>(1.0f / std::max(dt, 0.001f) + 0.5f), 0, 240);
-        }
-
-        SetClickThrough(hwnd, primary.kind == IslandKind::Idle && !hover && !pinned);
-
-        // Glide the pill onto its anchor. While a drag is in progress the
-        // offset is written straight from the pointer and left alone here; the
-        // easing only runs once the drag has let go of it.
-        if (!g_moveGestureActive.load() || g_moveGestureFired.load()) {
-            const float targetX = g_moveOffsetTargetX.load();
-            const float targetY = g_moveOffsetTargetY.load();
-            float x = g_moveOffsetX.load();
-            float y = g_moveOffsetY.load();
-            if (std::fabs(targetX - x) > 0.5f || std::fabs(targetY - y) > 0.5f) {
-                const float k = std::min(1.0f, dt * 11.0f);
-                x += (targetX - x) * k;
-                y += (targetY - y) * k;
-                g_moveOffsetX = x;
-                g_moveOffsetY = y;
-                g_layoutDirty = true;
-                needsRender = true;
-            } else if (x != targetX || y != targetY) {
-                g_moveOffsetX = targetX;
-                g_moveOffsetY = targetY;
-                g_layoutDirty = true;
-                needsRender = true;
-            }
-        }
-
-        // The timeline's hover look. The pointer has to be over the bar itself,
-        // and the transition is eased so the knob grows in rather than popping.
-        {
-            bool overScrubber = g_scrubDragging.load();
-            bool overGoToMedia = false;
-            if (hover && primary.kind == IslandKind::Media &&
-                (g_idleTab % kMediaTabCount) == 0) {
-                POINT local = cursor;
-                if (ScreenToClient(hwnd, &local)) {
-                    if (!overScrubber) {
-                        const ScrubberHit hit = HitTestScrubber(hwnd, local.x, local.y);
-                        overScrubber = hit.valid && hit.onBar;
-                    }
-                    overGoToMedia = HitTestGoToMedia(hwnd, local.x, local.y);
+            SharedState snapshot;
+            {
+                std::lock_guard lock(g_stateMutex);
+                snapshot = g_state;
+                if (g_state.clipboard.active && now >= g_state.clipboard.expiresAt) {
+                    g_state.clipboard.active = false;
+                    snapshot.clipboard.active = false;
+                }
+                if (g_state.notification.active && now >= g_state.notification.expiresAt) {
+                    g_state.notification.active = false;
+                    snapshot.notification.active = false;
+                }
+                if (g_state.volume.active && now >= g_state.volume.expiresAt) {
+                    g_state.volume.active = false;
+                    snapshot.volume.active = false;
+                }
+                if (g_state.capsLock.active && now >= g_state.capsLock.expiresAt) {
+                    g_state.capsLock.active = false;
+                    snapshot.capsLock.active = false;
+                }
+                if (g_state.battery.active && now >= g_state.battery.expiresAt) {
+                    g_state.battery.active = false;
+                    snapshot.battery.active = false;
+                }
+                if (g_state.device.active && now >= g_state.device.expiresAt) {
+                    g_state.device.active = false;
+                    snapshot.device.active = false;
                 }
             }
 
-            if (g_goToMediaHover.exchange(overGoToMedia) != overGoToMedia) {
+            const std::vector<IslandKind> kinds = ChooseActivities(snapshot, g_settings, now);
+            Activity primary = ActivityForKind(kinds[0], g_settings, snapshot);
+            std::optional<Activity> secondary;
+            if (kinds.size() >= 2) {
+                secondary = ActivityForKind(kinds[1], g_settings, snapshot);
+            }
+
+            const bool pinned = Wh_GetIntValue(L"PinnedExpanded", 0) != 0;
+
+            if (primary.kind != previousPrimary && primary.kind != IslandKind::Idle) {
+                nudgeSpring.value = -6.0f;
+                nudgeSpring.velocity = 0.0f;
+                nudgeSpring.target = 0.0f;
+            }
+            previousPrimary = primary.kind;
+
+            RECT windowRect = {};
+            GetWindowRect(hwnd, &windowRect);
+            POINT cursor = {};
+            GetCursorPos(&cursor);
+            const bool hover = PtInRect(&windowRect, cursor) != FALSE;
+
+            bool needsRender = false;
+
+            // Let go of a finished scrub once the session has had time to report
+            // the new position, so the bar goes back to following playback.
+            if (!g_scrubDragging.load() && g_scrubFraction.load() >= 0.0f &&
+                GetTickCount64() > g_scrubHoldUntil.load()) {
+                g_scrubFraction = -1.0f;
                 needsRender = true;
             }
 
-            const float target = overScrubber ? 1.0f : 0.0f;
-            const float current = g_scrubEmphasis.load();
-            if (std::fabs(target - current) > 0.002f) {
-                g_scrubEmphasis = current + (target - current) * std::min(1.0f, dt * 16.0f);
-                needsRender = true;
-            } else if (current != target) {
-                g_scrubEmphasis = target;
+            if (!hover && g_clickExpanded.load()) {
+                g_clickExpanded = false;
                 needsRender = true;
             }
-        }
-
-        // Check if animating structurally
-        if (std::abs(widthSpring.velocity) > 0.01f || std::abs(widthSpring.target - widthSpring.value) > 0.01f ||
-            std::abs(heightSpring.velocity) > 0.01f || std::abs(heightSpring.target - heightSpring.value) > 0.01f ||
-            std::abs(nudgeSpring.velocity) > 0.01f || std::abs(nudgeSpring.target - nudgeSpring.value) > 0.01f) {
-            needsRender = true;
-        }
-
-        // Active Monitor Tracking (Follow Mouse)
-        if (g_settings.targetMonitor == -1) {
-            static HMONITOR s_lastMonitor = nullptr;
-            POINT pt;
-            GetCursorPos(&pt);
-            HMONITOR currentMonitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-            if (currentMonitor != s_lastMonitor) {
-                s_lastMonitor = currentMonitor;
-                g_layoutDirty = true;
+            static double lastInteractionTime = NowSeconds();
+            bool currentlyHidden = false;
+            if (g_settings.autoHideIdleSeconds == -1) {
+                currentlyHidden = true;
+            } else if (g_settings.autoHideIdleSeconds > 0) {
+                currentlyHidden = (now - lastInteractionTime > g_settings.autoHideIdleSeconds);
             }
-        }
 
-        // Check if layout was explicitly invalidated
-        if (g_layoutDirty.load()) {
-            needsRender = true;
-        }
+            bool isHoverExpanded = g_settings.expandOnHover ? hover : (hover && g_clickExpanded.load());
 
-        // Hover or pinned state changes visual elements slightly
-        static bool prevHover = false;
-        static bool prevPinned = false;
-        if (hover != prevHover || pinned != prevPinned) {
-            needsRender = true;
-            prevHover = hover;
-            prevPinned = pinned;
-        }
+            if (currentlyHidden && !g_settings.unhideOnHover && primary.kind == IslandKind::Idle) {
+                isHoverExpanded = false;
+            } else if (isHoverExpanded || pinned || primary.kind != IslandKind::Idle) {
+                lastInteractionTime = now;
+            }
 
-        // Animated activities that require continuous rendering
-        if (primary.kind == IslandKind::Media || primary.kind == IslandKind::BatteryLow ||
-            primary.kind == IslandKind::Clipboard || primary.kind == IslandKind::Notification) {
-            needsRender = true;
-        }
+            bool isHidden = false;
+            if (g_settings.autoHideIdleSeconds == -1) {
+                isHidden = true;
+            } else if (g_settings.autoHideIdleSeconds > 0) {
+                isHidden = (now - lastInteractionTime > g_settings.autoHideIdleSeconds);
+            }
 
-        // The game overlay shows a live FPS readout, so keep it refreshing.
-        if (overlayMode) {
-            needsRender = true;
-        }
+            bool privacyActive = snapshot.system.micActive || snapshot.system.cameraActive;
+            if (primary.kind == IslandKind::Idle) {
+                if (pinned || isHoverExpanded) {
+                    primary.width = 380.0f * g_settings.sizeScale;
+                    primary.height = kExpandedPillContentHeight * g_settings.sizeScale;
+                } else if (isHidden && !privacyActive) {
+                    primary.width = 0.0f;
+                    primary.height = 0.0f;
+                }
+            }
+            // While the game overlay is toggled on it becomes the pill's collapsed
+            // presentation, taking over from the idle dashboard AND from the media
+            // pill — otherwise the overlay would stay hidden for as long as
+            // something is playing. Brief alerts (clipboard, notifications,
+            // volume, battery...) still interrupt and then hand the pill back.
+            // Hover/pin expansion is untouched, so the full dashboard pages remain
+            // one hover away.
+            const bool overlayMode =
+                g_settings.gameOverlay || Wh_GetIntValue(L"GameOverlayPinned", 0) != 0;
+            if (overlayMode && !pinned && !isHoverExpanded &&
+                (primary.kind == IslandKind::Idle || primary.kind == IslandKind::Media)) {
+                primary.kind = IslandKind::Idle;
+                primary.width = 372.0f * g_settings.sizeScale;
+                primary.height = 64.0f * g_settings.sizeScale;
+                secondary.reset();
+            }
+            if (primary.kind == IslandKind::Media) {
+                // Expansion is deliberate only: hovering or pinning. New tracks
+                // used to pop the pill open on their own, which interrupts
+                // whatever is underneath it.
+                if (isHoverExpanded || pinned) {
+                    primary.width = 380.0f * g_settings.sizeScale;
+                    primary.height = kExpandedPillContentHeight * g_settings.sizeScale;
+                }
+            }
 
-        // Privacy dots
-        if (snapshot.system.micActive || snapshot.system.cameraActive) {
-            needsRender = true;
-        }
+            float targetWidth = primary.width;
+            float targetHeight = primary.height;
+            if (secondary) {
+                targetWidth = primary.width + secondary->width + 12.0f * g_settings.sizeScale;
+                targetHeight = std::max(primary.height, secondary->height);
+            }
+            if (pinned) {
+                targetWidth = std::max(targetWidth, 380.0f * g_settings.sizeScale);
+                targetHeight = std::max(targetHeight, 64.0f * g_settings.sizeScale);
+            }
 
-        // Idle dashboard clock changes once a minute
-        static SYSTEMTIME prevTime = {};
-        if (primary.kind == IslandKind::Idle && !isHidden) {
-            SYSTEMTIME local = {};
-            GetLocalTime(&local);
-            if (local.wMinute != prevTime.wMinute) {
+            widthSpring.target = targetWidth;
+            heightSpring.target = targetHeight;
+
+            const auto currentFrame = std::chrono::steady_clock::now();
+            float dt = std::chrono::duration<float>(currentFrame - previousFrame).count();
+            previousFrame = currentFrame;
+            dt = Clamp(dt, 0.001f, 0.050f);
+
+            const float speed = g_settings.animationSpeed;
+            float widthStiffness = 280.0f;
+            float widthDamping = 24.0f;
+            if (targetWidth > widthSpring.value) {
+                widthStiffness = 380.0f;
+                widthDamping = 26.0f;
+            } else if (targetWidth < widthSpring.value) {
+                widthStiffness = 200.0f;
+                widthDamping = 28.0f;
+            }
+
+            float heightStiffness = 280.0f;
+            float heightDamping = 24.0f;
+            if (targetHeight > heightSpring.value) {
+                heightStiffness = 380.0f;
+                heightDamping = 26.0f;
+            } else if (targetHeight < heightSpring.value) {
+                heightStiffness = 200.0f;
+                heightDamping = 28.0f;
+            }
+
+            widthSpring.Step(dt * speed, widthStiffness, widthDamping);
+            if (widthSpring.value < 0.0f) {
+                widthSpring.value = 0.0f;
+                widthSpring.velocity = 0.0f;
+            }
+
+            heightSpring.Step(dt * speed, heightStiffness, heightDamping);
+            if (heightSpring.value < 0.0f) {
+                heightSpring.value = 0.0f;
+                heightSpring.velocity = 0.0f;
+            }
+
+            nudgeSpring.Step(dt * speed, 280.0f, 24.0f);
+
+            {
+                std::lock_guard lock(g_stateMutex);
+                g_state.system.renderFps = ClampInt(static_cast<int>(1.0f / std::max(dt, 0.001f) + 0.5f), 0, 240);
+            }
+
+            SetClickThrough(hwnd, primary.kind == IslandKind::Idle && !hover && !pinned);
+
+            // Glide the pill onto its anchor. While a drag is in progress the
+            // offset is written straight from the pointer and left alone here; the
+            // easing only runs once the drag has let go of it.
+            if (!g_moveGestureActive.load() || g_moveGestureFired.load()) {
+                const float targetX = g_moveOffsetTargetX.load();
+                const float targetY = g_moveOffsetTargetY.load();
+                float x = g_moveOffsetX.load();
+                float y = g_moveOffsetY.load();
+                if (std::fabs(targetX - x) > 0.5f || std::fabs(targetY - y) > 0.5f) {
+                    const float k = std::min(1.0f, dt * 11.0f);
+                    x += (targetX - x) * k;
+                    y += (targetY - y) * k;
+                    g_moveOffsetX = x;
+                    g_moveOffsetY = y;
+                    g_layoutDirty = true;
+                    needsRender = true;
+                } else if (x != targetX || y != targetY) {
+                    g_moveOffsetX = targetX;
+                    g_moveOffsetY = targetY;
+                    g_layoutDirty = true;
+                    needsRender = true;
+                }
+            }
+
+            // The timeline's hover look. The pointer has to be over the bar itself,
+            // and the transition is eased so the knob grows in rather than popping.
+            {
+                bool overScrubber = g_scrubDragging.load();
+                bool overGoToMedia = false;
+                if (hover && primary.kind == IslandKind::Media &&
+                    (g_idleTab % kMediaTabCount) == 0) {
+                    POINT local = cursor;
+                    if (ScreenToClient(hwnd, &local)) {
+                        if (!overScrubber) {
+                            const ScrubberHit hit = HitTestScrubber(hwnd, local.x, local.y);
+                            overScrubber = hit.valid && hit.onBar;
+                        }
+                        overGoToMedia = HitTestGoToMedia(hwnd, local.x, local.y);
+                    }
+                }
+
+                if (g_goToMediaHover.exchange(overGoToMedia) != overGoToMedia) {
+                    needsRender = true;
+                }
+
+                const float target = overScrubber ? 1.0f : 0.0f;
+                const float current = g_scrubEmphasis.load();
+                if (std::fabs(target - current) > 0.002f) {
+                    g_scrubEmphasis = current + (target - current) * std::min(1.0f, dt * 16.0f);
+                    needsRender = true;
+                } else if (current != target) {
+                    g_scrubEmphasis = target;
+                    needsRender = true;
+                }
+            }
+
+            // Check if animating structurally
+            if (std::abs(widthSpring.velocity) > 0.01f || std::abs(widthSpring.target - widthSpring.value) > 0.01f ||
+                std::abs(heightSpring.velocity) > 0.01f || std::abs(heightSpring.target - heightSpring.value) > 0.01f ||
+                std::abs(nudgeSpring.velocity) > 0.01f || std::abs(nudgeSpring.target - nudgeSpring.value) > 0.01f) {
                 needsRender = true;
-                prevTime = local;
             }
+
+            // Active Monitor Tracking (Follow Mouse)
+            if (g_settings.targetMonitor == -1) {
+                static HMONITOR s_lastMonitor = nullptr;
+                POINT pt;
+                GetCursorPos(&pt);
+                HMONITOR currentMonitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+                if (currentMonitor != s_lastMonitor) {
+                    s_lastMonitor = currentMonitor;
+                    g_layoutDirty = true;
+                }
+            }
+
+            // Check if layout was explicitly invalidated
+            if (g_layoutDirty.load()) {
+                needsRender = true;
+            }
+
+            // Hover or pinned state changes visual elements slightly
+            static bool prevHover = false;
+            static bool prevPinned = false;
+            if (hover != prevHover || pinned != prevPinned) {
+                needsRender = true;
+                prevHover = hover;
+                prevPinned = pinned;
+            }
+
+            // Animated activities that require continuous rendering
+            if (primary.kind == IslandKind::Media || primary.kind == IslandKind::BatteryLow ||
+                primary.kind == IslandKind::Clipboard || primary.kind == IslandKind::Notification) {
+                needsRender = true;
+            }
+
+            // The game overlay shows a live FPS readout, so keep it refreshing.
+            if (overlayMode) {
+                needsRender = true;
+            }
+
+            // Privacy dots
+            if (snapshot.system.micActive || snapshot.system.cameraActive) {
+                needsRender = true;
+            }
+
+            // Idle dashboard clock changes once a minute
+            static SYSTEMTIME prevTime = {};
+            if (primary.kind == IslandKind::Idle && !isHidden) {
+                SYSTEMTIME local = {};
+                GetLocalTime(&local);
+                if (local.wMinute != prevTime.wMinute) {
+                    needsRender = true;
+                    prevTime = local;
+                }
+            }
+
+            // Compare data snapshot to detect changes
+            static uint64_t prevArtGen = 0;
+            static uint64_t prevSrcIconGen = 0;
+            static uint64_t prevNotifIconGen = 0;
+            static uint64_t prevClipIconGen = 0;
+            static int prevCpu = -1;
+            static int prevRam = -1;
+            static int prevDisk = -1;
+            static int prevVol = -1;
+            static bool prevMuted = false;
+            static int prevBat = -1;
+            static bool prevCharging = false;
+            static int prevProg = -1;
+            static std::wstring prevMediaTitle;
+            static double prevNetUp = -1.0;
+            static double prevNetDown = -1.0;
+            static double prevDiskRead = -1.0;
+            static double prevDiskWrite = -1.0;
+            static int prevGpuPct = -2;
+            static std::wstring prevGpuName;
+            static int prevVramPct = -2;
+            static int prevSharedVramPct = -2;
+            static float prevCpuTemp = -1000.0f;
+
+            if (snapshot.media.artGeneration != prevArtGen ||
+                snapshot.media.sourceIconGeneration != prevSrcIconGen ||
+                snapshot.media.title != prevMediaTitle ||
+                snapshot.notification.icon.generation != prevNotifIconGen ||
+                snapshot.clipboard.appIcon.generation != prevClipIconGen ||
+                snapshot.system.cpuPercent != prevCpu ||
+                snapshot.system.memoryPercent != prevRam ||
+                snapshot.system.diskFreePercent != prevDisk ||
+                snapshot.system.volumePercent != prevVol ||
+                snapshot.system.volumeMuted != prevMuted ||
+                snapshot.battery.percent != prevBat ||
+                snapshot.battery.charging != prevCharging ||
+                snapshot.progress.percent != prevProg ||
+                snapshot.system.netUpBps != prevNetUp ||
+                snapshot.system.netDownBps != prevNetDown ||
+                snapshot.system.diskReadBps != prevDiskRead ||
+                snapshot.system.diskWriteBps != prevDiskWrite ||
+                snapshot.system.gpuPercent != prevGpuPct ||
+                snapshot.system.gpuName != prevGpuName ||
+                snapshot.system.vramPercent != prevVramPct ||
+                snapshot.system.sharedVramPercent != prevSharedVramPct ||
+                snapshot.system.cpuTempC != prevCpuTemp) {
+                needsRender = true;
+                prevArtGen = snapshot.media.artGeneration;
+                prevSrcIconGen = snapshot.media.sourceIconGeneration;
+                prevMediaTitle = snapshot.media.title;
+                prevNotifIconGen = snapshot.notification.icon.generation;
+                prevClipIconGen = snapshot.clipboard.appIcon.generation;
+                prevCpu = snapshot.system.cpuPercent;
+                prevRam = snapshot.system.memoryPercent;
+                prevDisk = snapshot.system.diskFreePercent;
+                prevVol = snapshot.system.volumePercent;
+                prevMuted = snapshot.system.volumeMuted;
+                prevBat = snapshot.battery.percent;
+                prevCharging = snapshot.battery.charging;
+                prevProg = snapshot.progress.percent;
+                prevNetUp = snapshot.system.netUpBps;
+                prevNetDown = snapshot.system.netDownBps;
+                prevDiskRead = snapshot.system.diskReadBps;
+                prevDiskWrite = snapshot.system.diskWriteBps;
+                prevGpuPct = snapshot.system.gpuPercent;
+                prevGpuName = snapshot.system.gpuName;
+                prevVramPct = snapshot.system.vramPercent;
+                prevSharedVramPct = snapshot.system.sharedVramPercent;
+                prevCpuTemp = snapshot.system.cpuTempC;
+            }
+
+            if (needsRender) {
+                renderer.Render(snapshot, g_settings, primary, secondary,
+                                widthSpring.value, heightSpring.value, nudgeSpring.value,
+                                hover, pinned, now);
+            }
+
+            WaitForSingleObject(g_stopEvent, 16);
         }
 
-        // Compare data snapshot to detect changes
-        static uint64_t prevArtGen = 0;
-        static uint64_t prevSrcIconGen = 0;
-        static uint64_t prevNotifIconGen = 0;
-        static uint64_t prevClipIconGen = 0;
-        static int prevCpu = -1;
-        static int prevRam = -1;
-        static int prevDisk = -1;
-        static int prevVol = -1;
-        static bool prevMuted = false;
-        static int prevBat = -1;
-        static bool prevCharging = false;
-        static int prevProg = -1;
-        static std::wstring prevMediaTitle;
-        static double prevNetUp = -1.0;
-        static double prevNetDown = -1.0;
-        static double prevDiskRead = -1.0;
-        static double prevDiskWrite = -1.0;
-        static int prevGpuPct = -2;
-        static std::wstring prevGpuName;
-        static int prevVramPct = -2;
-        static int prevSharedVramPct = -2;
-        static float prevCpuTemp = -1000.0f;
+        renderer.Shutdown();
+        DestroyWindow(hwnd);
+        g_hwnd = nullptr;
+        UnregisterClassW(kWindowClass, wc.hInstance);
 
-        if (snapshot.media.artGeneration != prevArtGen ||
-            snapshot.media.sourceIconGeneration != prevSrcIconGen ||
-            snapshot.media.title != prevMediaTitle ||
-            snapshot.notification.icon.generation != prevNotifIconGen ||
-            snapshot.clipboard.appIcon.generation != prevClipIconGen ||
-            snapshot.system.cpuPercent != prevCpu ||
-            snapshot.system.memoryPercent != prevRam ||
-            snapshot.system.diskFreePercent != prevDisk ||
-            snapshot.system.volumePercent != prevVol ||
-            snapshot.system.volumeMuted != prevMuted ||
-            snapshot.battery.percent != prevBat ||
-            snapshot.battery.charging != prevCharging ||
-            snapshot.progress.percent != prevProg ||
-            snapshot.system.netUpBps != prevNetUp ||
-            snapshot.system.netDownBps != prevNetDown ||
-            snapshot.system.diskReadBps != prevDiskRead ||
-            snapshot.system.diskWriteBps != prevDiskWrite ||
-            snapshot.system.gpuPercent != prevGpuPct ||
-            snapshot.system.gpuName != prevGpuName ||
-            snapshot.system.vramPercent != prevVramPct ||
-            snapshot.system.sharedVramPercent != prevSharedVramPct ||
-            snapshot.system.cpuTempC != prevCpuTemp) {
-            needsRender = true;
-            prevArtGen = snapshot.media.artGeneration;
-            prevSrcIconGen = snapshot.media.sourceIconGeneration;
-            prevMediaTitle = snapshot.media.title;
-            prevNotifIconGen = snapshot.notification.icon.generation;
-            prevClipIconGen = snapshot.clipboard.appIcon.generation;
-            prevCpu = snapshot.system.cpuPercent;
-            prevRam = snapshot.system.memoryPercent;
-            prevDisk = snapshot.system.diskFreePercent;
-            prevVol = snapshot.system.volumePercent;
-            prevMuted = snapshot.system.volumeMuted;
-            prevBat = snapshot.battery.percent;
-            prevCharging = snapshot.battery.charging;
-            prevProg = snapshot.progress.percent;
-            prevNetUp = snapshot.system.netUpBps;
-            prevNetDown = snapshot.system.netDownBps;
-            prevDiskRead = snapshot.system.diskReadBps;
-            prevDiskWrite = snapshot.system.diskWriteBps;
-            prevGpuPct = snapshot.system.gpuPercent;
-            prevGpuName = snapshot.system.gpuName;
-            prevVramPct = snapshot.system.vramPercent;
-            prevSharedVramPct = snapshot.system.sharedVramPercent;
-            prevCpuTemp = snapshot.system.cpuTempC;
+        if (!g_restartOverlay.load()) {
+            break;
         }
 
-        if (needsRender) {
-            renderer.Render(snapshot, g_settings, primary, secondary,
-                            widthSpring.value, heightSpring.value, nudgeSpring.value,
-                            hover, pinned, now);
+        // Let the display arrangement settle first. Windows reports metrics for
+        // the old layout for a moment after a monitor is plugged in or pulled,
+        // and rebuilding against those is exactly the state being fixed. Any
+        // further changes during the pause are picked up by the fresh window,
+        // which just restarts again.
+        Wh_Log(L"Display arrangement changed; restarting the overlay.");
+        if (WaitForSingleObject(g_stopEvent, 700) != WAIT_TIMEOUT) {
+            break;
         }
-
-        WaitForSingleObject(g_stopEvent, 16);
     }
-
-    renderer.Shutdown();
-    DestroyWindow(hwnd);
-    g_hwnd = nullptr;
-    UnregisterClassW(kWindowClass, wc.hInstance);
 
     if (SUCCEEDED(hrCo)) {
         CoUninitialize();
