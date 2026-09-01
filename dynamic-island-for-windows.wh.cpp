@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.7.4
+// @version         1.8.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -47,6 +47,9 @@ media, downloads, clipboard, battery, and more.
 
   Flip between pages with the bars along the top and bottom edges of the
   expanded pill, or by scrolling the wheel over it.
+- Press and drag the pill down to park it at the bottom of the screen, or up
+  to bring it back to the top. Changing Position in the settings takes control
+  back from the drag.
 - Optional game overlay with FPS/CPU/RAM/GPU/disk cards, toggled from the
   context menu or with a configurable hotkey (default Ctrl+Alt+G). While the
   overlay is on it acts as the pill's collapsed look — hovering or clicking
@@ -568,6 +571,14 @@ std::atomic<bool> g_goToMediaHover = false;
 // scaled by both sizeScale and (wrongly) DPI, so the hit-test and the drawing
 // disagreed by a few units in several independent ways at once. Publishing
 // what was drawn cannot drift from it.
+// Press-and-drag on the pill body to move it between the top and bottom of
+// the screen. The start point is kept in screen coordinates: once the pill
+// jumps, client coordinates move with it.
+std::atomic<bool> g_moveGestureActive = false;
+std::atomic<bool> g_moveGestureFired = false;
+std::atomic<int> g_moveGestureStartY = 0;
+constexpr int kMoveGestureThresholdPx = 40;
+
 std::atomic<bool> g_mediaHitValid = false;
 std::atomic<float> g_scrubBarLeftPx = 0.0f;
 std::atomic<float> g_scrubBarRightPx = 0.0f;
@@ -969,12 +980,24 @@ RECT GetAnchorWorkRect() {
     return mi.rcWork;
 }
 
+// The position actually in use: the drag gesture's choice when one has been
+// made, else whatever the settings say. Cleared whenever the settings change,
+// so the settings page stays authoritative when it is used.
+Position EffectivePosition() {
+    const int chosen = Wh_GetIntValue(L"PositionOverride", -1);
+    if (chosen >= static_cast<int>(Position::TopCenter) &&
+        chosen <= static_cast<int>(Position::BottomCenter)) {
+        return static_cast<Position>(chosen);
+    }
+    return g_settings.position;
+}
+
 void PositionOverlayWindow(HWND hwnd, int width, int height) {
     RECT work = GetAnchorWorkRect();
     int x = work.left + (work.right - work.left - width) / 2;
     int y = work.top + 8;
 
-    switch (g_settings.position) {
+    switch (EffectivePosition()) {
         case Position::TopLeft:
             x = work.left + 16;
             y = work.top + 8;
@@ -7056,10 +7079,41 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                         return 0;
                     }
                 }
+
+                // Nothing else claimed the press, so it may be the start of a
+                // drag that moves the pill between the top and bottom of the
+                // screen. Capture so the move is followed even once the
+                // pointer leaves the pill.
+                POINT pressPoint = {xPos, yPos};
+                ClientToScreen(hwnd, &pressPoint);
+                g_moveGestureStartY = pressPoint.y;
+                g_moveGestureFired = false;
+                g_moveGestureActive = true;
+                SetCapture(hwnd);
             }
             break;
 
         case WM_MOUSEMOVE:
+            // Dragging down parks the pill at the bottom of the screen,
+            // dragging up brings it back to the top. It fires once per press,
+            // so a long drag does not flip back and forth.
+            if (g_moveGestureActive.load() && !g_moveGestureFired.load()) {
+                POINT here = {};
+                if (GetCursorPos(&here)) {
+                    const int dy = here.y - g_moveGestureStartY.load();
+                    int chosen = -1;
+                    if (dy >= kMoveGestureThresholdPx) {
+                        chosen = static_cast<int>(Position::BottomCenter);
+                    } else if (dy <= -kMoveGestureThresholdPx) {
+                        chosen = static_cast<int>(Position::TopCenter);
+                    }
+                    if (chosen >= 0) {
+                        g_moveGestureFired = true;
+                        Wh_SetIntValue(L"PositionOverride", chosen);
+                        g_layoutDirty = true;
+                    }
+                }
+            }
             if (g_scrubDragging.load()) {
                 const ScrubberHit hit =
                     HitTestScrubber(hwnd, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
@@ -7081,6 +7135,19 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
                 int xPos = GET_X_LPARAM(lParam);
                 int yPos = GET_Y_LPARAM(lParam);
+
+                if (g_moveGestureActive.exchange(false)) {
+                    // Read this before releasing: ReleaseCapture sends
+                    // WM_CAPTURECHANGED synchronously, and that handler
+                    // clears the flag.
+                    const bool moved = g_moveGestureFired.exchange(false);
+                    ReleaseCapture();
+                    if (moved) {
+                        // The press moved the pill, so it is not also a click.
+                        g_layoutDirty = true;
+                        return 0;
+                    }
+                }
 
                 if (g_scrubDragging.exchange(false)) {
                     ReleaseCapture();
@@ -7223,6 +7290,8 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
 
         case WM_CAPTURECHANGED:
+            g_moveGestureActive = false;
+            g_moveGestureFired = false;
             if (g_scrubDragging.exchange(false)) {
                 g_scrubFraction = -1.0f;
                 g_layoutDirty = true;
@@ -7820,7 +7889,10 @@ BOOL WhTool_ModInit() {
 }
 
 void WhTool_ModSettingsChanged() {
+    // Changing Position in the settings takes back control from the drag.
+    Wh_SetIntValue(L"PositionOverride", -1);
     LoadSettings();
+    g_layoutDirty = true;
 }
 
 void WhTool_ModUninit() {
