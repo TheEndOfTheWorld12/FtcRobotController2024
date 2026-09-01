@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.8.0
+// @version         1.8.1
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -47,9 +47,10 @@ media, downloads, clipboard, battery, and more.
 
   Flip between pages with the bars along the top and bottom edges of the
   expanded pill, or by scrolling the wheel over it.
-- Press and drag the pill down to park it at the bottom of the screen, or up
-  to bring it back to the top. Changing Position in the settings takes control
-  back from the drag.
+- Press and drag the pill: it follows the pointer, and once the drag passes
+  40 pixels it re-anchors and glides to the bottom of the screen (or back to
+  the top, dragging up). Let go before then and it glides back to where it
+  started. Changing Position in the settings takes control back from the drag.
 - Optional game overlay with FPS/CPU/RAM/GPU/disk cards, toggled from the
   context menu or with a configurable hotkey (default Ctrl+Alt+G). While the
   overlay is on it acts as the pill's collapsed look — hovering or clicking
@@ -576,8 +577,18 @@ std::atomic<bool> g_goToMediaHover = false;
 // jumps, client coordinates move with it.
 std::atomic<bool> g_moveGestureActive = false;
 std::atomic<bool> g_moveGestureFired = false;
+std::atomic<int> g_moveGestureStartX = 0;
 std::atomic<int> g_moveGestureStartY = 0;
 constexpr int kMoveGestureThresholdPx = 40;
+
+// How far the pill currently sits from its anchor, and where that offset is
+// heading. During a drag the offset tracks the pointer exactly; once the drag
+// ends or crosses the threshold the target becomes zero and the pill glides
+// onto its anchor.
+std::atomic<float> g_moveOffsetX = 0.0f;
+std::atomic<float> g_moveOffsetY = 0.0f;
+std::atomic<float> g_moveOffsetTargetX = 0.0f;
+std::atomic<float> g_moveOffsetTargetY = 0.0f;
 
 std::atomic<bool> g_mediaHitValid = false;
 std::atomic<float> g_scrubBarLeftPx = 0.0f;
@@ -992,12 +1003,14 @@ Position EffectivePosition() {
     return g_settings.position;
 }
 
-void PositionOverlayWindow(HWND hwnd, int width, int height) {
+// Where a pill of this size sits when anchored at the given position,
+// including the configured offsets but not the drag offset.
+void AnchorPointForPosition(Position position, int width, int height, int* outX, int* outY) {
     RECT work = GetAnchorWorkRect();
     int x = work.left + (work.right - work.left - width) / 2;
     int y = work.top + 8;
 
-    switch (EffectivePosition()) {
+    switch (position) {
         case Position::TopLeft:
             x = work.left + 16;
             y = work.top + 8;
@@ -1015,6 +1028,15 @@ void PositionOverlayWindow(HWND hwnd, int width, int height) {
             break;
     }
 
+    if (outX) *outX = x + g_settings.offsetX;
+    if (outY) *outY = y + g_settings.offsetY;
+}
+
+void PositionOverlayWindow(HWND hwnd, int width, int height) {
+    int x = 0;
+    int y = 0;
+    AnchorPointForPosition(EffectivePosition(), width, height, &x, &y);
+
     HWND zOrder = g_settings.alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST;
 
     // Manage owner window to firmly anchor to desktop when alwaysOnTop is false
@@ -1027,8 +1049,10 @@ void PositionOverlayWindow(HWND hwnd, int width, int height) {
         }
     }
 
-    x += g_settings.offsetX;
-    y += g_settings.offsetY;
+    // The drag offset rides on top of the anchor, so the pill can be under the
+    // pointer mid-gesture and glide home afterwards.
+    x += static_cast<int>(std::lround(g_moveOffsetX.load()));
+    y += static_cast<int>(std::lround(g_moveOffsetY.load()));
     SetWindowPos(hwnd, zOrder, x, y, width, height,
                  SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
 }
@@ -7086,6 +7110,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 // pointer leaves the pill.
                 POINT pressPoint = {xPos, yPos};
                 ClientToScreen(hwnd, &pressPoint);
+                g_moveGestureStartX = pressPoint.x;
                 g_moveGestureStartY = pressPoint.y;
                 g_moveGestureFired = false;
                 g_moveGestureActive = true;
@@ -7094,24 +7119,46 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             break;
 
         case WM_MOUSEMOVE:
-            // Dragging down parks the pill at the bottom of the screen,
-            // dragging up brings it back to the top. It fires once per press,
-            // so a long drag does not flip back and forth.
+            // The pill tracks the pointer while the drag is in progress.
+            // Crossing the threshold re-anchors it to the far end of the
+            // screen and hands the rest of the journey to the glide.
             if (g_moveGestureActive.load() && !g_moveGestureFired.load()) {
                 POINT here = {};
                 if (GetCursorPos(&here)) {
+                    const int dx = here.x - g_moveGestureStartX.load();
                     const int dy = here.y - g_moveGestureStartY.load();
+                    g_moveOffsetX = static_cast<float>(dx);
+                    g_moveOffsetY = static_cast<float>(dy);
+                    g_moveOffsetTargetX = static_cast<float>(dx);
+                    g_moveOffsetTargetY = static_cast<float>(dy);
+
                     int chosen = -1;
                     if (dy >= kMoveGestureThresholdPx) {
                         chosen = static_cast<int>(Position::BottomCenter);
                     } else if (dy <= -kMoveGestureThresholdPx) {
                         chosen = static_cast<int>(Position::TopCenter);
                     }
+
                     if (chosen >= 0) {
+                        // Re-base the offset against the new anchor so the
+                        // pill does not jump: it keeps the screen position it
+                        // has right now and glides from there.
+                        RECT wr = {};
+                        GetWindowRect(hwnd, &wr);
+                        const int w = wr.right - wr.left;
+                        const int h = wr.bottom - wr.top;
+                        int oldX = 0, oldY = 0, newX = 0, newY = 0;
+                        AnchorPointForPosition(EffectivePosition(), w, h, &oldX, &oldY);
+                        AnchorPointForPosition(static_cast<Position>(chosen), w, h, &newX, &newY);
+
                         g_moveGestureFired = true;
                         Wh_SetIntValue(L"PositionOverride", chosen);
-                        g_layoutDirty = true;
+                        g_moveOffsetX = static_cast<float>(oldX + dx - newX);
+                        g_moveOffsetY = static_cast<float>(oldY + dy - newY);
+                        g_moveOffsetTargetX = 0.0f;
+                        g_moveOffsetTargetY = 0.0f;
                     }
+                    g_layoutDirty = true;
                 }
             }
             if (g_scrubDragging.load()) {
@@ -7142,9 +7189,13 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     // clears the flag.
                     const bool moved = g_moveGestureFired.exchange(false);
                     ReleaseCapture();
+                    // Either way the pill glides onto its anchor from wherever
+                    // the drag left it.
+                    g_moveOffsetTargetX = 0.0f;
+                    g_moveOffsetTargetY = 0.0f;
+                    g_layoutDirty = true;
                     if (moved) {
                         // The press moved the pill, so it is not also a click.
-                        g_layoutDirty = true;
                         return 0;
                     }
                 }
@@ -7292,6 +7343,8 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_CAPTURECHANGED:
             g_moveGestureActive = false;
             g_moveGestureFired = false;
+            g_moveOffsetTargetX = 0.0f;
+            g_moveOffsetTargetY = 0.0f;
             if (g_scrubDragging.exchange(false)) {
                 g_scrubFraction = -1.0f;
                 g_layoutDirty = true;
@@ -7624,6 +7677,30 @@ DWORD WINAPI RenderThreadProc(void*) {
         }
 
         SetClickThrough(hwnd, primary.kind == IslandKind::Idle && !hover && !pinned);
+
+        // Glide the pill onto its anchor. While a drag is in progress the
+        // offset is written straight from the pointer and left alone here; the
+        // easing only runs once the drag has let go of it.
+        if (!g_moveGestureActive.load() || g_moveGestureFired.load()) {
+            const float targetX = g_moveOffsetTargetX.load();
+            const float targetY = g_moveOffsetTargetY.load();
+            float x = g_moveOffsetX.load();
+            float y = g_moveOffsetY.load();
+            if (std::fabs(targetX - x) > 0.5f || std::fabs(targetY - y) > 0.5f) {
+                const float k = std::min(1.0f, dt * 11.0f);
+                x += (targetX - x) * k;
+                y += (targetY - y) * k;
+                g_moveOffsetX = x;
+                g_moveOffsetY = y;
+                g_layoutDirty = true;
+                needsRender = true;
+            } else if (x != targetX || y != targetY) {
+                g_moveOffsetX = targetX;
+                g_moveOffsetY = targetY;
+                g_layoutDirty = true;
+                needsRender = true;
+            }
+        }
 
         // The timeline's hover look. The pointer has to be over the bar itself,
         // and the transition is eased so the knob grows in rather than popping.
