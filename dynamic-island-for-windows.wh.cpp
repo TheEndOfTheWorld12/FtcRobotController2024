@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.7.3
+// @version         1.7.4
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -559,6 +559,24 @@ std::atomic<bool> g_scrubDragging = false;
 std::atomic<float> g_scrubEmphasis = 0.0f;
 // Whether the pointer is over the media page's "Go to media" button.
 std::atomic<bool> g_goToMediaHover = false;
+
+// Where the renderer actually put the media page's scrubber and its
+// "Go to media" button, in client pixels, recorded as they are drawn.
+//
+// Reconstructing these from the client rect was a losing game: the pill is
+// inflated by 2.5% while hovered, offset vertically by the nudge spring, and
+// scaled by both sizeScale and (wrongly) DPI, so the hit-test and the drawing
+// disagreed by a few units in several independent ways at once. Publishing
+// what was drawn cannot drift from it.
+std::atomic<bool> g_mediaHitValid = false;
+std::atomic<float> g_scrubBarLeftPx = 0.0f;
+std::atomic<float> g_scrubBarRightPx = 0.0f;
+std::atomic<float> g_scrubBarCentreYPx = 0.0f;
+std::atomic<float> g_scrubBarSlackPx = 0.0f;   // grab margin around the bar
+std::atomic<float> g_goToMediaLeftPx = 0.0f;
+std::atomic<float> g_goToMediaRightPx = 0.0f;
+std::atomic<float> g_goToMediaTopPx = 0.0f;
+std::atomic<float> g_goToMediaBottomPx = 0.0f;
 std::atomic<float> g_scrubFraction = -1.0f;
 std::atomic<uint64_t> g_scrubHoldUntil = 0;
 FILETIME g_prevIdleTime = {};
@@ -4061,6 +4079,10 @@ class Renderer {
 
         EnsureBrushes(settings, state);
         settingsOpacity_ = settings.pillOpacity;
+        sizeScale_ = std::max(settings.sizeScale, 0.01f);
+        // Cleared every frame and set again only if the media page draws its
+        // controls, so a stale rectangle can never take a click.
+        g_mediaHitValid = false;
 
         const float hoverScale = hover || pinned ? 1.025f : 1.0f;
         const float scale = hoverScale;
@@ -5656,6 +5678,20 @@ class Renderer {
                 const float barRight = scrubRight - 38.0f;
                 const float progress = duration > 0.0 ? static_cast<float>(currentPosition / duration) : 0.0f;
 
+                // Publish where the bar really lands, in client pixels, for
+                // the hit-tests. The drawing transform scales about the pill's
+                // centre, so a point converts with that one relation — and
+                // this rect already carries the hover inflation and the nudge
+                // offset, which a reconstruction from the window size misses.
+                {
+                    const float pcx = (rect.left + rect.right) * 0.5f;
+                    const float pcy = (rect.top + rect.bottom) * 0.5f;
+                    g_scrubBarLeftPx = pcx + (barLeft - pcx) * sizeScale_;
+                    g_scrubBarRightPx = pcx + (barRight - pcx) * sizeScale_;
+                    g_scrubBarCentreYPx = pcy + (scrubberY - pcy) * sizeScale_;
+                    g_scrubBarSlackPx = 10.0f * sizeScale_;
+                }
+
                 // Hovering thickens the bar from 5 units to 8 and brightens
                 // the unplayed part, the way a video player's does.
                 const float emphasis = Clamp(g_scrubEmphasis.load(), 0.0f, 1.0f);
@@ -5711,6 +5747,16 @@ class Renderer {
                     target_->FillRoundedRectangle(D2D1::RoundedRect(goRect, 12.0f, 12.0f),
                                                   goBg.Get());
                 }
+                {
+                    const float pcx = (rect.left + rect.right) * 0.5f;
+                    const float pcy = (rect.top + rect.bottom) * 0.5f;
+                    g_goToMediaLeftPx = pcx + (goRect.left - pcx) * sizeScale_;
+                    g_goToMediaRightPx = pcx + (goRect.right - pcx) * sizeScale_;
+                    g_goToMediaTopPx = pcy + (goRect.top - pcy) * sizeScale_;
+                    g_goToMediaBottomPx = pcy + (goRect.bottom - pcy) * sizeScale_;
+                    g_mediaHitValid = true;
+                }
+
                 accentBrush_->SetOpacity(goHover ? 1.0f : 0.82f);
                 smallTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
                 target_->DrawTextW(L"Go to media", 11, smallTextFormat_.Get(),
@@ -6599,6 +6645,7 @@ class Renderer {
     uint64_t mediaSourceIconGeneration_ = 0;
     uint64_t clipboardIconGeneration_ = 0;
     float settingsOpacity_ = 0.96f;
+    float sizeScale_ = 1.0f;
     D2D1_COLOR_F pillBgColor_ = D2D1::ColorF(0.051f, 0.051f, 0.059f, 1.0f);
 };
 
@@ -6808,82 +6855,49 @@ DWORD WINAPI KeyboardThreadProc(void*) {
     return 0;
 }
 
-// Where a click lands on the expanded media scrubber. Mirrors the layout in
-// DrawMedia: the bar runs from rect.left + 60 to rect.right - 62, at
-// rect.top + 118, in the unscaled coordinates the renderer draws in.
+// Where a click lands on the expanded media scrubber, tested against the
+// rectangle the renderer recorded as it drew the bar.
 struct ScrubberHit {
-    bool valid = false;   // the pill is wide enough to hold a bar
+    bool valid = false;   // the bar is on screen
     bool onBar = false;   // the pointer is on it
     float fraction = 0.0f;
 };
 
-// A point in the client area, expressed the way the renderer draws: unscaled
-// units measured from the pill's centre, alongside the pill's half extents.
-struct PillPoint {
-    bool valid = false;
-    float x = 0.0f;
-    float y = 0.0f;
-    float halfW = 0.0f;
-    float halfH = 0.0f;
-};
-
-static PillPoint PillPointFromClient(HWND hwnd, int xPos, int yPos) {
-    PillPoint point;
-
-    RECT clientRect = {};
-    GetClientRect(hwnd, &clientRect);
-    const float width = static_cast<float>(clientRect.right - clientRect.left);
-    const float height = static_cast<float>(clientRect.bottom - clientRect.top);
-    if (width <= 0.0f || height <= 0.0f) {
-        return point;
-    }
-
-    // No DPI term: the renderer sizes its bitmap as (pill + 2 * kRenderPad)
-    // raw pixels and draws one unit per pixel at sizeScale 1, so client pixels
-    // convert with sizeScale alone. Folding in GetDpiForWindow divided twice
-    // over on a scaled display and pushed every hit-test off target.
-    const float sizeScale = std::max(g_settings.sizeScale, 0.01f);
-
-    point.valid = true;
-    point.x = (xPos - width * 0.5f) / sizeScale;
-    point.y = (yPos - height * 0.5f) / sizeScale;
-    point.halfW = (width - kRenderPadX * 2.0f) / sizeScale * 0.5f;
-    point.halfH = (height - kRenderPadY * 2.0f) / sizeScale * 0.5f;
-    return point;
-}
-
 static ScrubberHit HitTestScrubber(HWND hwnd, int xPos, int yPos) {
+    UNREFERENCED_PARAMETER(hwnd);
     ScrubberHit hit;
 
-    const PillPoint point = PillPointFromClient(hwnd, xPos, yPos);
-    if (!point.valid) {
+    if (!g_mediaHitValid.load()) {
         return hit;
     }
-
-    const float barLeft = -point.halfW + 60.0f;
-    const float barRight = point.halfW - 62.0f;
-    if (barRight <= barLeft) {
+    const float left = g_scrubBarLeftPx.load();
+    const float right = g_scrubBarRightPx.load();
+    const float centreY = g_scrubBarCentreYPx.load();
+    const float slack = g_scrubBarSlackPx.load();
+    if (right <= left || slack <= 0.0f) {
         return hit;
     }
 
     hit.valid = true;
-    hit.fraction = Clamp((point.x - barLeft) / (barRight - barLeft), 0.0f, 1.0f);
-    // The bar is only 5 units tall, so accept a band around it and a little
-    // past each end rather than making it fiddly to grab.
-    hit.onBar = std::fabs(point.y - (118.0f - point.halfH)) <= 10.0f &&
-                point.x >= barLeft - 8.0f && point.x <= barRight + 8.0f;
+    hit.fraction = Clamp((static_cast<float>(xPos) - left) / (right - left), 0.0f, 1.0f);
+    // The bar is thin, so accept a band around it and a little past each end
+    // rather than making it fiddly to grab.
+    hit.onBar = std::fabs(static_cast<float>(yPos) - centreY) <= slack &&
+                static_cast<float>(xPos) >= left - slack &&
+                static_cast<float>(xPos) <= right + slack;
     return hit;
 }
 
-// The "Go to media" button, drawn to the right of the transport controls:
-// cx + 86 to cx + 164, centred on the control row at rect.top + 148.
+// The "Go to media" button, likewise tested against what was drawn.
 static bool HitTestGoToMedia(HWND hwnd, int xPos, int yPos) {
-    const PillPoint point = PillPointFromClient(hwnd, xPos, yPos);
-    if (!point.valid || point.halfW < 120.0f) {
+    UNREFERENCED_PARAMETER(hwnd);
+    if (!g_mediaHitValid.load()) {
         return false;
     }
-    return point.x >= 86.0f && point.x <= 164.0f &&
-           std::fabs(point.y - (148.0f - point.halfH)) <= 12.0f;
+    const float x = static_cast<float>(xPos);
+    const float y = static_cast<float>(yPos);
+    return x >= g_goToMediaLeftPx.load() && x <= g_goToMediaRightPx.load() &&
+           y >= g_goToMediaTopPx.load() && y <= g_goToMediaBottomPx.load();
 }
 
 // Moves the session the pill is showing to a point in the track.
@@ -7010,13 +7024,14 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 RECT clientRect;
                 GetClientRect(hwnd, &clientRect);
                 const float height = static_cast<float>(clientRect.bottom - clientRect.top);
+                const float width = static_cast<float>(clientRect.right - clientRect.left);
 
                 if (mediaActive && height > 60.0f && (g_idleTab % kMediaTabCount) == 0) {
-                    const PillPoint point = PillPointFromClient(hwnd, xPos, yPos);
-                    const float unX = point.x;
-                    const float unY = point.y;
+                    const float sizeScale = std::max(g_settings.sizeScale, 0.01f);
+                    const float unX = (xPos - width * 0.5f) / sizeScale;
+                    const float unY = (yPos - height * 0.5f) / sizeScale;
 
-                    if (point.valid && unY > 48.0f - 26.0f && unY < 48.0f + 26.0f) {
+                    if (unY > 48.0f - 26.0f && unY < 48.0f + 26.0f) {
                         int cmd = -1;
                         if (unX > -84.0f && unX < -44.0f) cmd = 0; // Prev
                         else if (unX > -24.0f && unX < 24.0f) cmd = 1; // Play/Pause
@@ -7111,11 +7126,11 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 const float width = static_cast<float>(clientRect.right - clientRect.left);
 
                 if (mediaActive && height > 60.0f && (g_idleTab % kMediaTabCount) == 0) {
-                    const PillPoint point = PillPointFromClient(hwnd, xPos, yPos);
-                    const float unX = point.x;
-                    const float unY = point.y;
+                    const float sizeScale = std::max(g_settings.sizeScale, 0.01f);
+                    const float unX = (xPos - width * 0.5f) / sizeScale;
+                    const float unY = (yPos - height * 0.5f) / sizeScale;
 
-                    if (point.valid && unY > 48.0f - 26.0f && unY < 48.0f + 26.0f) {
+                    if (unY > 48.0f - 26.0f && unY < 48.0f + 26.0f) {
                         // Check button clicks in expanded media view
                         int cmd = -1;
                         if (unX > -84.0f && unX < -44.0f) cmd = 0; // Prev
