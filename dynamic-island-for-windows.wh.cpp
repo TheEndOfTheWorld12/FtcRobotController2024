@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.8.4
+// @version         1.8.5
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -1045,6 +1045,37 @@ void AnchorPointForPosition(Position position, int width, int height, int* outX,
     // vertical offset sits 100px below the top edge up there and 100px above
     // the bottom edge down here — mirrored, rather than pushed off-screen.
     if (outY) *outY = bottomAnchored ? y - g_settings.offsetY : y + g_settings.offsetY;
+}
+
+// A fingerprint of the display arrangement: monitor count, the bounds of the
+// virtual desktop, the primary work area and the DPI factor. Monitors coming
+// and going does not reliably reach this window as a message, so the
+// arrangement is sampled directly as well.
+uint64_t DisplaySignature() {
+    auto mix = [](uint64_t seed, long value) {
+        return seed * 1000003ull + static_cast<uint64_t>(value + 100000);
+    };
+
+    uint64_t signature = 1469598103934665603ull;
+    signature = mix(signature, GetSystemMetrics(SM_CMONITORS));
+    signature = mix(signature, GetSystemMetrics(SM_XVIRTUALSCREEN));
+    signature = mix(signature, GetSystemMetrics(SM_YVIRTUALSCREEN));
+    signature = mix(signature, GetSystemMetrics(SM_CXVIRTUALSCREEN));
+    signature = mix(signature, GetSystemMetrics(SM_CYVIRTUALSCREEN));
+
+    // Deliberately the primary work area rather than the anchor monitor's:
+    // with "follow the mouse" the anchor changes as the pointer moves between
+    // screens, which is not a display change.
+    RECT work = {};
+    if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0)) {
+        signature = mix(signature, work.left);
+        signature = mix(signature, work.top);
+        signature = mix(signature, work.right);
+        signature = mix(signature, work.bottom);
+    }
+
+    signature = mix(signature, static_cast<long>(GetPrimaryMonitorDpiScale() * 100.0f + 0.5f));
+    return signature;
 }
 
 void PositionOverlayWindow(HWND hwnd, int width, int height) {
@@ -7490,6 +7521,8 @@ DWORD WINAPI RenderThreadProc(void*) {
         nudgeSpring.Reset(0.0f);
 
         IslandKind previousPrimary = IslandKind::Idle;
+        uint64_t displaySignature = DisplaySignature();
+        double nextDisplayPoll = 0.0;
         auto previousFrame = std::chrono::steady_clock::now();
         double nextBatteryPoll = 0.0;
         double nextProgressPoll = 0.0;
@@ -7529,6 +7562,14 @@ DWORD WINAPI RenderThreadProc(void*) {
             if (now >= nextPrivacyPoll) {
                 UpdatePrivacyIndicators();
                 nextPrivacyPoll = now + 2.0;  // poll every 2 s
+            }
+            if (now >= nextDisplayPoll) {
+                nextDisplayPoll = now + 1.0;
+                const uint64_t signature = DisplaySignature();
+                if (signature != displaySignature) {
+                    displaySignature = signature;
+                    g_restartOverlay = true;
+                }
             }
 
             SharedState snapshot;
