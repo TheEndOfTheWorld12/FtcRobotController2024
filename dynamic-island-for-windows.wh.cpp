@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.8.3
+// @version         1.8.4
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -7931,6 +7931,11 @@ DWORD WINAPI RenderThreadProc(void*) {
         if (WaitForSingleObject(g_stopEvent, 700) != WAIT_TIMEOUT) {
             break;
         }
+
+        // Re-read the settings before rebuilding. sizeScale is multiplied by
+        // the monitor DPI factor at load time, so without this the pill comes
+        // back at the size the old display called for.
+        LoadSettings();
     }
 
     if (SUCCEEDED(hrCo)) {
