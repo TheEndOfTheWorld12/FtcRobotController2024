@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.9.4
+// @version         1.9.5
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -1847,6 +1847,32 @@ DWORD WINAPI MediaThreadProc(void*) {
                         seen.emplace_back(appId, 0);
                     }
                     keyed.emplace_back(appId + L"#" + std::to_wstring(ordinal), candidate);
+                }
+
+                // The arrows can only offer what Windows reports, so log that
+                // list whenever it changes. A browser that exposes one session
+                // for all its tabs — re-pointing it at whatever last started
+                // playing — shows up here as a single entry, and no amount of
+                // filtering on this side can turn that into two.
+                {
+                    static std::wstring s_lastReported;
+                    std::wstring reported;
+                    for (auto const& entry : keyed) {
+                        bool playing = false;
+                        try {
+                            auto info = entry.second.GetPlaybackInfo();
+                            playing = info && info.PlaybackStatus() == PlaybackStatus::Playing;
+                        } catch (...) {
+                        }
+                        reported += entry.first;
+                        reported += playing ? L" [playing]; " : L" [not playing]; ";
+                    }
+                    if (reported != s_lastReported) {
+                        s_lastReported = reported;
+                        Wh_Log(L"Media sessions Windows reports (%u): %s",
+                               static_cast<unsigned int>(keyed.size()),
+                               reported.empty() ? L"(none)" : reported.c_str());
+                    }
                 }
 
                 // Anything that has played while the mod has been running stays
