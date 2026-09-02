@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.9.5
+// @version         1.9.6
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -1921,9 +1921,26 @@ DWORD WINAPI MediaThreadProc(void*) {
                     }
                 }
                 if (!session) {
-                    // Either nothing was picked, or what was picked has gone
-                    // away — fall back to whatever Windows considers current
-                    // and forget the stale choice.
+                    // Nothing picked, or the pick has gone away. Prefer a
+                    // session that is actually playing: GetCurrentSession
+                    // often names a silent tab that merely holds the transport
+                    // controls, which is how a paused page kept appearing as
+                    // the pill's "now playing".
+                    for (auto const& entry : keyed) {
+                        try {
+                            auto info = entry.second.GetPlaybackInfo();
+                            if (info && info.PlaybackStatus() == PlaybackStatus::Playing) {
+                                session = entry.second;
+                                sessionKey = entry.first;
+                                break;
+                            }
+                        } catch (...) {
+                        }
+                    }
+                }
+                if (!session) {
+                    // Nothing is playing at all, so fall back to whatever
+                    // Windows considers current.
                     session = manager.GetCurrentSession();
                     if (session) {
                         std::wstring appId = session.SourceAppUserModelId().c_str();
@@ -1934,11 +1951,12 @@ DWORD WINAPI MediaThreadProc(void*) {
                             }
                         }
                     }
-                    if (!wanted.empty()) {
-                        std::lock_guard lock(g_stateMutex);
-                        if (g_selectedSessionId == wanted) {
-                            g_selectedSessionId.clear();
-                        }
+                }
+                if (!wanted.empty() && sessionKey != wanted) {
+                    // The pick has gone away; stop asking for it.
+                    std::lock_guard lock(g_stateMutex);
+                    if (g_selectedSessionId == wanted) {
+                        g_selectedSessionId.clear();
                     }
                 }
                 next.sessionKey = sessionKey;
