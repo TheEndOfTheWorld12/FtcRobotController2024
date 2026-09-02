@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.9.1
+// @version         1.9.2
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -571,9 +571,6 @@ std::atomic<bool> g_scrubDragging = false;
 // How far the timeline is into its hover look, 0 to 1: the bar thickens and a
 // knob grows at the playhead, the way a video player's scrubber does.
 std::atomic<float> g_scrubEmphasis = 0.0f;
-// Whether the pointer is over the media page's "Go to media" button.
-std::atomic<bool> g_goToMediaHover = false;
-
 // Where the renderer actually put the media page's scrubber and its
 // "Go to media" button, in client pixels, recorded as they are drawn.
 //
@@ -635,6 +632,22 @@ struct AtomicRect {
 AtomicRect g_goToMediaRectPx;
 AtomicRect g_prevSourceRectPx;
 AtomicRect g_nextSourceRectPx;
+AtomicRect g_prevTrackRectPx;
+AtomicRect g_playPauseRectPx;
+AtomicRect g_nextTrackRectPx;
+
+// Which control on the media page the pointer is over, so every button can
+// light up the way the "Go to media" button does.
+enum class MediaControl {
+    None = 0,
+    PrevSource,
+    NextSource,
+    PrevTrack,
+    PlayPause,
+    NextTrack,
+    GoToMedia,
+};
+std::atomic<int> g_hoveredMediaControl = static_cast<int>(MediaControl::None);
 
 // The media session the user stepped to, empty while the pill simply follows
 // whichever session Windows considers current.
@@ -5900,30 +5913,33 @@ class Renderer {
                 {
                     const float pcx = (rect.left + rect.right) * 0.5f;
                     const float pcy = (rect.top + rect.bottom) * 0.5f;
-                    // Centred in the space between the content edge (cx - 166)
-                    // and the prev button (which starts at cx - 79): 17 units
-                    // of clearance on each side, rather than crowding prev.
                     const float arrowR = 11.0f;
-                    const float leftX = cx - 138.0f;
-                    const float rightX = cx - 106.0f;
+                    const float leftX = cx - 145.0f;
+                    const float rightX = cx - 113.0f;
 
-                    DrawSourceArrow(D2D1::Point2F(leftX, cy), arrowR, true, canCycle);
-                    DrawSourceArrow(D2D1::Point2F(rightX, cy), arrowR, false, canCycle);
+                    DrawSourceArrow(D2D1::Point2F(leftX, cy), arrowR, true, canCycle,
+                                    MediaControl::PrevSource);
+                    DrawSourceArrow(D2D1::Point2F(rightX, cy), arrowR, false, canCycle,
+                                    MediaControl::NextSource);
 
-                    auto publish = [&](AtomicRect& target, float centreX) {
-                        const float l = pcx + (centreX - arrowR - pcx) * sizeScale_;
-                        const float r = pcx + (centreX + arrowR - pcx) * sizeScale_;
-                        const float t = pcy + (cy - arrowR - pcy) * sizeScale_;
-                        const float b = pcy + (cy + arrowR - pcy) * sizeScale_;
-                        target.Set(l, t, r, b);
+                    // Every control on this row publishes the disc it drew, so
+                    // the hover highlight and the click land on the same pixels.
+                    auto publishDisc = [&](AtomicRect& target, float centreX, float radius) {
+                        target.Set(pcx + (centreX - radius - pcx) * sizeScale_,
+                                   pcy + (cy - radius - pcy) * sizeScale_,
+                                   pcx + (centreX + radius - pcx) * sizeScale_,
+                                   pcy + (cy + radius - pcy) * sizeScale_);
                     };
-                    publish(g_prevSourceRectPx, leftX);
-                    publish(g_nextSourceRectPx, rightX);
+                    publishDisc(g_prevSourceRectPx, leftX, arrowR);
+                    publishDisc(g_nextSourceRectPx, rightX, arrowR);
+                    publishDisc(g_prevTrackRectPx, cx - 64.0f, 15.0f);
+                    publishDisc(g_playPauseRectPx, cx, 20.0f);
+                    publishDisc(g_nextTrackRectPx, cx + 64.0f, 15.0f);
                 }
 
                 // Bringing the player to the front is a deliberate press now,
                 // rather than something a click anywhere on the pill does.
-                const bool goHover = g_goToMediaHover.load();
+                const bool goHover = IsHovered(MediaControl::GoToMedia);
                 const D2D1_RECT_F goRect =
                     D2D1::RectF(cx + 86.0f, cy - 12.0f, cx + 164.0f, cy + 12.0f);
                 ComPtr<ID2D1SolidColorBrush> goBg;
@@ -6009,20 +6025,28 @@ class Renderer {
     }
 
     void DrawMediaControls(bool playing, D2D1_POINT_2F prev, D2D1_POINT_2F play, D2D1_POINT_2F next) {
-        DrawMediaButton(prev, 15.0f, 0, false);
-        DrawMediaButton(play, 20.0f, playing ? 1 : 2, true);
-        DrawMediaButton(next, 15.0f, 3, false);
+        DrawMediaButton(prev, 15.0f, 0, false, MediaControl::PrevTrack);
+        DrawMediaButton(play, 20.0f, playing ? 1 : 2, true, MediaControl::PlayPause);
+        DrawMediaButton(next, 15.0f, 3, false, MediaControl::NextTrack);
     }
 
     // A small chevron-in-a-circle for stepping between audio sources. Kept
     // visually lighter than the transport controls: it changes what the pill
     // is showing, not what is playing.
-    void DrawSourceArrow(D2D1_POINT_2F center, float radius, bool pointsLeft, bool enabled) {
+    bool IsHovered(MediaControl control) const {
+        return g_hoveredMediaControl.load() == static_cast<int>(control);
+    }
+
+    void DrawSourceArrow(D2D1_POINT_2F center, float radius, bool pointsLeft, bool enabled,
+                         MediaControl control) {
         // Same disc and accent brush as the prev/next transport buttons, so
         // the whole control row reads as one set.
+        const bool hovered = enabled && IsHovered(control);
         ComPtr<ID2D1SolidColorBrush> bg;
         target_->CreateSolidColorBrush(
-            D2D1::ColorF(1, 1, 1, (enabled ? 0.040f : 0.018f) * settingsOpacity_), &bg);
+            D2D1::ColorF(1, 1, 1,
+                         (enabled ? (hovered ? 0.075f : 0.040f) : 0.018f) * settingsOpacity_),
+            &bg);
         if (bg) {
             target_->FillEllipse(D2D1::Ellipse(center, radius, radius), bg.Get());
         }
@@ -6030,7 +6054,7 @@ class Renderer {
         const float dir = pointsLeft ? -1.0f : 1.0f;
         const float w = radius * 0.30f;
         const float h = radius * 0.42f;
-        accentBrush_->SetOpacity(enabled ? 0.62f : 0.20f);
+        accentBrush_->SetOpacity(enabled ? (hovered ? 0.92f : 0.62f) : 0.20f);
         target_->DrawLine(D2D1::Point2F(center.x - dir * w, center.y - h),
                           D2D1::Point2F(center.x + dir * w, center.y),
                           accentBrush_.Get(), 1.7f);
@@ -6040,18 +6064,24 @@ class Renderer {
         accentBrush_->SetOpacity(1.0f);
     }
 
-    void DrawMediaButton(D2D1_POINT_2F center, float radius, int kind, bool primary) {
+    void DrawMediaButton(D2D1_POINT_2F center, float radius, int kind, bool primary,
+                        MediaControl control) {
         int buttonCmd = (kind == 0) ? 0 : ((kind == 1 || kind == 2) ? 1 : 2);
         bool isPressed = (g_pressedMediaButton.load() == buttonCmd);
+        const bool hovered = !isPressed && IsHovered(control);
 
         if (isPressed) {
             radius *= 0.88f; // Shrink by 12% on click
         }
 
+        // Three tiers: resting, hovered, pressed.
+        const float disc = primary ? (isPressed ? 0.16f : (hovered ? 0.120f : 0.080f))
+                                   : (isPressed ? 0.10f : (hovered ? 0.075f : 0.040f));
         ComPtr<ID2D1SolidColorBrush> bg;
-        target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, primary ? (isPressed ? 0.16f : 0.080f) : (isPressed ? 0.10f : 0.040f)), &bg);
+        target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, disc * settingsOpacity_), &bg);
         target_->FillEllipse(D2D1::Ellipse(center, radius, radius), bg.Get());
-        accentBrush_->SetOpacity(primary ? (isPressed ? 1.0f : 0.88f) : (isPressed ? 0.80f : 0.62f));
+        accentBrush_->SetOpacity(primary ? (isPressed ? 1.0f : (hovered ? 0.98f : 0.88f))
+                                         : (isPressed ? 0.80f : (hovered ? 0.80f : 0.62f)));
 
         if (kind == 1) {  // pause
             const float h = radius * 0.72f;
@@ -7103,29 +7133,22 @@ static ScrubberHit HitTestScrubber(HWND hwnd, int xPos, int yPos) {
     return hit;
 }
 
-// The "Go to media" button and the source arrows, likewise tested against
-// what was drawn.
-static bool HitTestGoToMedia(HWND hwnd, int xPos, int yPos) {
-    UNREFERENCED_PARAMETER(hwnd);
-    return g_mediaHitValid.load() &&
-           g_goToMediaRectPx.Contains(static_cast<float>(xPos), static_cast<float>(yPos));
-}
-
-// Returns -1 for the previous source, +1 for the next, 0 for neither.
-static int HitTestSourceArrows(HWND hwnd, int xPos, int yPos) {
-    UNREFERENCED_PARAMETER(hwnd);
+// Which control on the media page a point falls on, tested against the
+// rectangles the renderer published as it drew them.
+static MediaControl HitTestMediaControl(int xPos, int yPos) {
     if (!g_mediaHitValid.load()) {
-        return 0;
+        return MediaControl::None;
     }
     const float x = static_cast<float>(xPos);
     const float y = static_cast<float>(yPos);
-    if (g_prevSourceRectPx.Contains(x, y)) {
-        return -1;
-    }
-    if (g_nextSourceRectPx.Contains(x, y)) {
-        return 1;
-    }
-    return 0;
+
+    if (g_prevSourceRectPx.Contains(x, y)) return MediaControl::PrevSource;
+    if (g_nextSourceRectPx.Contains(x, y)) return MediaControl::NextSource;
+    if (g_prevTrackRectPx.Contains(x, y)) return MediaControl::PrevTrack;
+    if (g_playPauseRectPx.Contains(x, y)) return MediaControl::PlayPause;
+    if (g_nextTrackRectPx.Contains(x, y)) return MediaControl::NextTrack;
+    if (g_goToMediaRectPx.Contains(x, y)) return MediaControl::GoToMedia;
+    return MediaControl::None;
 }
 
 // Steps the pill to the previous or next app producing audio. The choice is
@@ -7294,25 +7317,19 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 RECT clientRect;
                 GetClientRect(hwnd, &clientRect);
                 const float height = static_cast<float>(clientRect.bottom - clientRect.top);
-                const float width = static_cast<float>(clientRect.right - clientRect.left);
 
                 if (mediaActive && height > 60.0f && (g_idleTab % kMediaTabCount) == 0) {
-                    const float sizeScale = std::max(g_settings.sizeScale, 0.01f);
-                    const float unX = (xPos - width * 0.5f) / sizeScale;
-                    const float unY = (yPos - height * 0.5f) / sizeScale;
+                    const MediaControl control = HitTestMediaControl(xPos, yPos);
+                    int cmd = -1;
+                    if (control == MediaControl::PrevTrack) cmd = 0;
+                    else if (control == MediaControl::PlayPause) cmd = 1;
+                    else if (control == MediaControl::NextTrack) cmd = 2;
 
-                    if (unY > 48.0f - 26.0f && unY < 48.0f + 26.0f) {
-                        int cmd = -1;
-                        if (unX > -84.0f && unX < -44.0f) cmd = 0; // Prev
-                        else if (unX > -24.0f && unX < 24.0f) cmd = 1; // Play/Pause
-                        else if (unX > 44.0f && unX < 84.0f) cmd = 2; // Next
-
-                        if (cmd != -1) {
-                            g_pressedMediaButton = cmd;
-                            SetCapture(hwnd);
-                            g_layoutDirty = true;
-                            return 0;
-                        }
+                    if (cmd != -1) {
+                        g_pressedMediaButton = cmd;
+                        SetCapture(hwnd);
+                        g_layoutDirty = true;
+                        return 0;
                     }
 
                     // Pressing anywhere along the timeline starts a scrub; the
@@ -7467,16 +7484,12 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 const float width = static_cast<float>(clientRect.right - clientRect.left);
 
                 if (mediaActive && height > 60.0f && (g_idleTab % kMediaTabCount) == 0) {
-                    const float sizeScale = std::max(g_settings.sizeScale, 0.01f);
-                    const float unX = (xPos - width * 0.5f) / sizeScale;
-                    const float unY = (yPos - height * 0.5f) / sizeScale;
-
-                    if (unY > 48.0f - 26.0f && unY < 48.0f + 26.0f) {
-                        // Check button clicks in expanded media view
+                    {
+                        const MediaControl control = HitTestMediaControl(xPos, yPos);
                         int cmd = -1;
-                        if (unX > -84.0f && unX < -44.0f) cmd = 0; // Prev
-                        else if (unX > -24.0f && unX < 24.0f) cmd = 1; // Play/Pause
-                        else if (unX > 44.0f && unX < 84.0f) cmd = 2; // Next
+                        if (control == MediaControl::PrevTrack) cmd = 0;
+                        else if (control == MediaControl::PlayPause) cmd = 1;
+                        else if (control == MediaControl::NextTrack) cmd = 2;
 
                         if (cmd != -1) {
                             std::thread([cmd]() {
@@ -7554,11 +7567,20 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     // the pill used to yank the app to the foreground, which
                     // made the pill hazardous to click for any other reason.
                     if ((g_idleTab % kMediaTabCount) == 0 && height > 60.0f) {
-                        if (const int step = HitTestSourceArrows(hwnd, xPos, yPos)) {
-                            CycleMediaSource(step);
-                            g_layoutDirty = true;
-                        } else if (HitTestGoToMedia(hwnd, xPos, yPos)) {
-                            OpenRelevantApp();
+                        switch (HitTestMediaControl(xPos, yPos)) {
+                            case MediaControl::PrevSource:
+                                CycleMediaSource(-1);
+                                g_layoutDirty = true;
+                                break;
+                            case MediaControl::NextSource:
+                                CycleMediaSource(1);
+                                g_layoutDirty = true;
+                                break;
+                            case MediaControl::GoToMedia:
+                                OpenRelevantApp();
+                                break;
+                            default:
+                                break;
                         }
                     }
                 } else {
@@ -7948,7 +7970,7 @@ DWORD WINAPI RenderThreadProc(void*) {
             // and the transition is eased so the knob grows in rather than popping.
             {
                 bool overScrubber = g_scrubDragging.load();
-                bool overGoToMedia = false;
+                MediaControl hoveredControl = MediaControl::None;
                 if (hover && primary.kind == IslandKind::Media &&
                     (g_idleTab % kMediaTabCount) == 0) {
                     POINT local = cursor;
@@ -7957,11 +7979,12 @@ DWORD WINAPI RenderThreadProc(void*) {
                             const ScrubberHit hit = HitTestScrubber(hwnd, local.x, local.y);
                             overScrubber = hit.valid && hit.onBar;
                         }
-                        overGoToMedia = HitTestGoToMedia(hwnd, local.x, local.y);
+                        hoveredControl = HitTestMediaControl(local.x, local.y);
                     }
                 }
 
-                if (g_goToMediaHover.exchange(overGoToMedia) != overGoToMedia) {
+                const int hoveredValue = static_cast<int>(hoveredControl);
+                if (g_hoveredMediaControl.exchange(hoveredValue) != hoveredValue) {
                     needsRender = true;
                 }
 
