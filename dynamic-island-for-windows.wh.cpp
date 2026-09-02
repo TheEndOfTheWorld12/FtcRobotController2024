@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.9.0
+// @version         1.9.1
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -5900,9 +5900,12 @@ class Renderer {
                 {
                     const float pcx = (rect.left + rect.right) * 0.5f;
                     const float pcy = (rect.top + rect.bottom) * 0.5f;
+                    // Centred in the space between the content edge (cx - 166)
+                    // and the prev button (which starts at cx - 79): 17 units
+                    // of clearance on each side, rather than crowding prev.
                     const float arrowR = 11.0f;
-                    const float leftX = cx - 134.0f;
-                    const float rightX = cx - 102.0f;
+                    const float leftX = cx - 138.0f;
+                    const float rightX = cx - 106.0f;
 
                     DrawSourceArrow(D2D1::Point2F(leftX, cy), arrowR, true, canCycle);
                     DrawSourceArrow(D2D1::Point2F(rightX, cy), arrowR, false, canCycle);
@@ -6015,9 +6018,11 @@ class Renderer {
     // visually lighter than the transport controls: it changes what the pill
     // is showing, not what is playing.
     void DrawSourceArrow(D2D1_POINT_2F center, float radius, bool pointsLeft, bool enabled) {
+        // Same disc and accent brush as the prev/next transport buttons, so
+        // the whole control row reads as one set.
         ComPtr<ID2D1SolidColorBrush> bg;
         target_->CreateSolidColorBrush(
-            D2D1::ColorF(1, 1, 1, (enabled ? 0.045f : 0.020f) * settingsOpacity_), &bg);
+            D2D1::ColorF(1, 1, 1, (enabled ? 0.040f : 0.018f) * settingsOpacity_), &bg);
         if (bg) {
             target_->FillEllipse(D2D1::Ellipse(center, radius, radius), bg.Get());
         }
@@ -6025,14 +6030,14 @@ class Renderer {
         const float dir = pointsLeft ? -1.0f : 1.0f;
         const float w = radius * 0.30f;
         const float h = radius * 0.42f;
-        textBrush_->SetOpacity(enabled ? 0.80f : 0.22f);
+        accentBrush_->SetOpacity(enabled ? 0.62f : 0.20f);
         target_->DrawLine(D2D1::Point2F(center.x - dir * w, center.y - h),
                           D2D1::Point2F(center.x + dir * w, center.y),
-                          textBrush_.Get(), 1.7f);
+                          accentBrush_.Get(), 1.7f);
         target_->DrawLine(D2D1::Point2F(center.x + dir * w, center.y),
                           D2D1::Point2F(center.x - dir * w, center.y + h),
-                          textBrush_.Get(), 1.7f);
-        textBrush_->SetOpacity(0.90f);
+                          accentBrush_.Get(), 1.7f);
+        accentBrush_->SetOpacity(1.0f);
     }
 
     void DrawMediaButton(D2D1_POINT_2F center, float radius, int kind, bool primary) {
