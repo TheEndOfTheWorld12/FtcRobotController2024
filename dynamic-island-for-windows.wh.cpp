@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.8.5
+// @version         1.9.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -18,6 +18,9 @@ A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to
 media, downloads, clipboard, battery, and more.
 
 ## Features
+- Arrows left of the transport controls step between every app producing
+  audio, so the pill can be pointed at a second player without pausing the
+  first. They dim when there is only one.
 - Live media pill with album art, waveform, playback controls, and a
   video-player-style scrubber: hovering thickens the bar and grows a knob at
   the playhead, and clicking or dragging seeks within the track. A
@@ -368,6 +371,9 @@ struct MediaSnapshot {
     int64_t positionTicks = 0;
     int64_t endTicks = 0;
     int64_t lastUpdatedTicks = 0;
+    // Every app currently holding a media session, in the order Windows
+    // reports them, so the pill can step between them.
+    std::vector<std::wstring> sessionIds;
 };
 
 struct ClipboardSnapshot {
@@ -605,10 +611,34 @@ std::atomic<float> g_scrubBarLeftPx = 0.0f;
 std::atomic<float> g_scrubBarRightPx = 0.0f;
 std::atomic<float> g_scrubBarCentreYPx = 0.0f;
 std::atomic<float> g_scrubBarSlackPx = 0.0f;   // grab margin around the bar
-std::atomic<float> g_goToMediaLeftPx = 0.0f;
-std::atomic<float> g_goToMediaRightPx = 0.0f;
-std::atomic<float> g_goToMediaTopPx = 0.0f;
-std::atomic<float> g_goToMediaBottomPx = 0.0f;
+
+// A rectangle in client pixels, written by the renderer as it draws the
+// control and read by the hit-tests, so the two cannot disagree.
+struct AtomicRect {
+    std::atomic<float> left{0.0f};
+    std::atomic<float> top{0.0f};
+    std::atomic<float> right{0.0f};
+    std::atomic<float> bottom{0.0f};
+
+    void Set(float l, float t, float r, float b) {
+        left = l;
+        top = t;
+        right = r;
+        bottom = b;
+    }
+
+    bool Contains(float x, float y) const {
+        return x >= left.load() && x <= right.load() && y >= top.load() && y <= bottom.load();
+    }
+};
+
+AtomicRect g_goToMediaRectPx;
+AtomicRect g_prevSourceRectPx;
+AtomicRect g_nextSourceRectPx;
+
+// The media session the user stepped to, empty while the pill simply follows
+// whichever session Windows considers current.
+std::wstring g_selectedSessionId;   // guarded by g_stateMutex
 std::atomic<float> g_scrubFraction = -1.0f;
 std::atomic<uint64_t> g_scrubHoldUntil = 0;
 FILETIME g_prevIdleTime = {};
@@ -1767,7 +1797,42 @@ DWORD WINAPI MediaThreadProc(void*) {
             }
 
             if (manager) {
-                auto session = manager.GetCurrentSession();
+                // Every session, in Windows' own order, so the arrows have a
+                // stable list to step through.
+                auto sessions = manager.GetSessions();
+                for (auto const& candidate : sessions) {
+                    next.sessionIds.push_back(candidate.SourceAppUserModelId().c_str());
+                }
+
+                std::wstring wanted;
+                {
+                    std::lock_guard lock(g_stateMutex);
+                    wanted = g_selectedSessionId;
+                }
+
+                winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSession
+                    session{nullptr};
+                if (!wanted.empty()) {
+                    for (auto const& candidate : sessions) {
+                        if (candidate.SourceAppUserModelId().c_str() == wanted) {
+                            session = candidate;
+                            break;
+                        }
+                    }
+                }
+                if (!session) {
+                    // Either nothing was picked, or what was picked has gone
+                    // away — fall back to whatever Windows considers current
+                    // and forget the stale choice.
+                    session = manager.GetCurrentSession();
+                    if (!wanted.empty()) {
+                        std::lock_guard lock(g_stateMutex);
+                        if (g_selectedSessionId == wanted) {
+                            g_selectedSessionId.clear();
+                        }
+                    }
+                }
+
                 if (session) {
                     auto properties = session.TryGetMediaPropertiesAsync().get();
                     auto playback = session.GetPlaybackInfo();
@@ -5828,6 +5893,31 @@ class Renderer {
                                   D2D1::Point2F(cx, cy),
                                   D2D1::Point2F(cx + 64.0f, cy));
 
+                // Stepping between everything that is producing audio. These
+                // sit left of the transport controls and dim when there is
+                // only one session to show.
+                const bool canCycle = state.media.sessionIds.size() > 1;
+                {
+                    const float pcx = (rect.left + rect.right) * 0.5f;
+                    const float pcy = (rect.top + rect.bottom) * 0.5f;
+                    const float arrowR = 11.0f;
+                    const float leftX = cx - 134.0f;
+                    const float rightX = cx - 102.0f;
+
+                    DrawSourceArrow(D2D1::Point2F(leftX, cy), arrowR, true, canCycle);
+                    DrawSourceArrow(D2D1::Point2F(rightX, cy), arrowR, false, canCycle);
+
+                    auto publish = [&](AtomicRect& target, float centreX) {
+                        const float l = pcx + (centreX - arrowR - pcx) * sizeScale_;
+                        const float r = pcx + (centreX + arrowR - pcx) * sizeScale_;
+                        const float t = pcy + (cy - arrowR - pcy) * sizeScale_;
+                        const float b = pcy + (cy + arrowR - pcy) * sizeScale_;
+                        target.Set(l, t, r, b);
+                    };
+                    publish(g_prevSourceRectPx, leftX);
+                    publish(g_nextSourceRectPx, rightX);
+                }
+
                 // Bringing the player to the front is a deliberate press now,
                 // rather than something a click anywhere on the pill does.
                 const bool goHover = g_goToMediaHover.load();
@@ -5843,10 +5933,10 @@ class Renderer {
                 {
                     const float pcx = (rect.left + rect.right) * 0.5f;
                     const float pcy = (rect.top + rect.bottom) * 0.5f;
-                    g_goToMediaLeftPx = pcx + (goRect.left - pcx) * sizeScale_;
-                    g_goToMediaRightPx = pcx + (goRect.right - pcx) * sizeScale_;
-                    g_goToMediaTopPx = pcy + (goRect.top - pcy) * sizeScale_;
-                    g_goToMediaBottomPx = pcy + (goRect.bottom - pcy) * sizeScale_;
+                    g_goToMediaRectPx.Set(pcx + (goRect.left - pcx) * sizeScale_,
+                                          pcy + (goRect.top - pcy) * sizeScale_,
+                                          pcx + (goRect.right - pcx) * sizeScale_,
+                                          pcy + (goRect.bottom - pcy) * sizeScale_);
                     g_mediaHitValid = true;
                 }
 
@@ -5919,6 +6009,30 @@ class Renderer {
         DrawMediaButton(prev, 15.0f, 0, false);
         DrawMediaButton(play, 20.0f, playing ? 1 : 2, true);
         DrawMediaButton(next, 15.0f, 3, false);
+    }
+
+    // A small chevron-in-a-circle for stepping between audio sources. Kept
+    // visually lighter than the transport controls: it changes what the pill
+    // is showing, not what is playing.
+    void DrawSourceArrow(D2D1_POINT_2F center, float radius, bool pointsLeft, bool enabled) {
+        ComPtr<ID2D1SolidColorBrush> bg;
+        target_->CreateSolidColorBrush(
+            D2D1::ColorF(1, 1, 1, (enabled ? 0.045f : 0.020f) * settingsOpacity_), &bg);
+        if (bg) {
+            target_->FillEllipse(D2D1::Ellipse(center, radius, radius), bg.Get());
+        }
+
+        const float dir = pointsLeft ? -1.0f : 1.0f;
+        const float w = radius * 0.30f;
+        const float h = radius * 0.42f;
+        textBrush_->SetOpacity(enabled ? 0.80f : 0.22f);
+        target_->DrawLine(D2D1::Point2F(center.x - dir * w, center.y - h),
+                          D2D1::Point2F(center.x + dir * w, center.y),
+                          textBrush_.Get(), 1.7f);
+        target_->DrawLine(D2D1::Point2F(center.x + dir * w, center.y),
+                          D2D1::Point2F(center.x - dir * w, center.y + h),
+                          textBrush_.Get(), 1.7f);
+        textBrush_->SetOpacity(0.90f);
     }
 
     void DrawMediaButton(D2D1_POINT_2F center, float radius, int kind, bool primary) {
@@ -6984,16 +7098,55 @@ static ScrubberHit HitTestScrubber(HWND hwnd, int xPos, int yPos) {
     return hit;
 }
 
-// The "Go to media" button, likewise tested against what was drawn.
+// The "Go to media" button and the source arrows, likewise tested against
+// what was drawn.
 static bool HitTestGoToMedia(HWND hwnd, int xPos, int yPos) {
     UNREFERENCED_PARAMETER(hwnd);
+    return g_mediaHitValid.load() &&
+           g_goToMediaRectPx.Contains(static_cast<float>(xPos), static_cast<float>(yPos));
+}
+
+// Returns -1 for the previous source, +1 for the next, 0 for neither.
+static int HitTestSourceArrows(HWND hwnd, int xPos, int yPos) {
+    UNREFERENCED_PARAMETER(hwnd);
     if (!g_mediaHitValid.load()) {
-        return false;
+        return 0;
     }
     const float x = static_cast<float>(xPos);
     const float y = static_cast<float>(yPos);
-    return x >= g_goToMediaLeftPx.load() && x <= g_goToMediaRightPx.load() &&
-           y >= g_goToMediaTopPx.load() && y <= g_goToMediaBottomPx.load();
+    if (g_prevSourceRectPx.Contains(x, y)) {
+        return -1;
+    }
+    if (g_nextSourceRectPx.Contains(x, y)) {
+        return 1;
+    }
+    return 0;
+}
+
+// Steps the pill to the previous or next app producing audio. The choice is
+// remembered until that session disappears, at which point the pill goes back
+// to following whatever Windows considers current.
+static void CycleMediaSource(int delta) {
+    std::lock_guard lock(g_stateMutex);
+    const std::vector<std::wstring>& ids = g_state.media.sessionIds;
+    if (ids.size() < 2) {
+        return;
+    }
+
+    int current = 0;
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (ids[i] == g_state.media.sourceAppUserModelId) {
+            current = static_cast<int>(i);
+            break;
+        }
+    }
+
+    const int count = static_cast<int>(ids.size());
+    int chosen = (current + delta) % count;
+    if (chosen < 0) {
+        chosen += count;
+    }
+    g_selectedSessionId = ids[chosen];
 }
 
 // Moves the session the pill is showing to a point in the track.
@@ -7395,9 +7548,13 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     // Only the button opens the player. Clicking anywhere on
                     // the pill used to yank the app to the foreground, which
                     // made the pill hazardous to click for any other reason.
-                    if ((g_idleTab % kMediaTabCount) == 0 && height > 60.0f &&
-                        HitTestGoToMedia(hwnd, xPos, yPos)) {
-                        OpenRelevantApp();
+                    if ((g_idleTab % kMediaTabCount) == 0 && height > 60.0f) {
+                        if (const int step = HitTestSourceArrows(hwnd, xPos, yPos)) {
+                            CycleMediaSource(step);
+                            g_layoutDirty = true;
+                        } else if (HitTestGoToMedia(hwnd, xPos, yPos)) {
+                            OpenRelevantApp();
+                        }
                     }
                 } else {
                     HandleStatusClickAtPoint(hwnd, lParam);
@@ -7888,6 +8045,7 @@ DWORD WINAPI RenderThreadProc(void*) {
             static bool prevCharging = false;
             static int prevProg = -1;
             static std::wstring prevMediaTitle;
+        static size_t prevSessionCount = 0;
             static double prevNetUp = -1.0;
             static double prevNetDown = -1.0;
             static double prevDiskRead = -1.0;
@@ -7901,6 +8059,7 @@ DWORD WINAPI RenderThreadProc(void*) {
             if (snapshot.media.artGeneration != prevArtGen ||
                 snapshot.media.sourceIconGeneration != prevSrcIconGen ||
                 snapshot.media.title != prevMediaTitle ||
+            snapshot.media.sessionIds.size() != prevSessionCount ||
                 snapshot.notification.icon.generation != prevNotifIconGen ||
                 snapshot.clipboard.appIcon.generation != prevClipIconGen ||
                 snapshot.system.cpuPercent != prevCpu ||
@@ -7924,6 +8083,7 @@ DWORD WINAPI RenderThreadProc(void*) {
                 prevArtGen = snapshot.media.artGeneration;
                 prevSrcIconGen = snapshot.media.sourceIconGeneration;
                 prevMediaTitle = snapshot.media.title;
+            prevSessionCount = snapshot.media.sessionIds.size();
                 prevNotifIconGen = snapshot.notification.icon.generation;
                 prevClipIconGen = snapshot.clipboard.appIcon.generation;
                 prevCpu = snapshot.system.cpuPercent;
