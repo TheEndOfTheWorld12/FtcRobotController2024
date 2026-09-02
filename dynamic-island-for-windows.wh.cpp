@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.9.2
+// @version         1.9.3
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -18,9 +18,11 @@ A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to
 media, downloads, clipboard, battery, and more.
 
 ## Features
-- Arrows left of the transport controls step between every app producing
-  audio, so the pill can be pointed at a second player without pausing the
-  first. They dim when there is only one.
+- Arrows left of the transport controls step between the apps actually
+  producing audio, so the pill can be pointed at a second player without
+  pausing the first. Apps that merely registered with Windows' transport
+  controls and sit paused — browser tabs that once played a notification
+  sound, for instance — are left out. They dim when there is only one.
 - Live media pill with album art, waveform, playback controls, and a
   video-player-style scrubber: hovering thickens the bar and grows a knob at
   the playhead, and clicking or dragging seeks within the track. A
@@ -1810,17 +1812,38 @@ DWORD WINAPI MediaThreadProc(void*) {
             }
 
             if (manager) {
-                // Every session, in Windows' own order, so the arrows have a
-                // stable list to step through.
                 auto sessions = manager.GetSessions();
-                for (auto const& candidate : sessions) {
-                    next.sessionIds.push_back(candidate.SourceAppUserModelId().c_str());
-                }
 
                 std::wstring wanted;
+                std::wstring showing;
                 {
                     std::lock_guard lock(g_stateMutex);
                     wanted = g_selectedSessionId;
+                    showing = g_state.media.sourceAppUserModelId;
+                }
+
+                // The arrows step through what is actually producing audio.
+                // GetSessions returns every app registered with the system
+                // transport controls, which includes browser tabs that merely
+                // played a notification sound once and have sat paused ever
+                // since — that is where the phantom entries came from. The
+                // session on screen is always kept, so it does not disappear
+                // from the list the moment it is paused.
+                for (auto const& candidate : sessions) {
+                    std::wstring id = candidate.SourceAppUserModelId().c_str();
+                    bool keep = (!wanted.empty() && id == wanted) ||
+                                (!showing.empty() && id == showing);
+                    if (!keep) {
+                        try {
+                            auto info = candidate.GetPlaybackInfo();
+                            keep = info && info.PlaybackStatus() == PlaybackStatus::Playing;
+                        } catch (...) {
+                            keep = false;
+                        }
+                    }
+                    if (keep) {
+                        next.sessionIds.push_back(std::move(id));
+                    }
                 }
 
                 winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSession
