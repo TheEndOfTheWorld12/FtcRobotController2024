@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.9.3
+// @version         1.9.4
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -373,9 +373,13 @@ struct MediaSnapshot {
     int64_t positionTicks = 0;
     int64_t endTicks = 0;
     int64_t lastUpdatedTicks = 0;
-    // Every app currently holding a media session, in the order Windows
-    // reports them, so the pill can step between them.
+    // Every source the arrows can step to, in the order Windows reports them.
+    // These are not raw AppUserModelIds: a browser gives every tab the same
+    // one, so each carries an ordinal to tell two tabs of the same browser
+    // apart.
     std::vector<std::wstring> sessionIds;
+    // Which of those the pill is currently showing.
+    std::wstring sessionKey;
 };
 
 struct ClipboardSnapshot {
@@ -651,8 +655,8 @@ enum class MediaControl {
 };
 std::atomic<int> g_hoveredMediaControl = static_cast<int>(MediaControl::None);
 
-// The media session the user stepped to, empty while the pill simply follows
-// whichever session Windows considers current.
+// The source the user stepped to, as one of the keys above; empty while the
+// pill simply follows whichever session Windows considers current.
 std::wstring g_selectedSessionId;   // guarded by g_stateMutex
 std::atomic<float> g_scrubFraction = -1.0f;
 std::atomic<uint64_t> g_scrubHoldUntil = 0;
@@ -1819,39 +1823,73 @@ DWORD WINAPI MediaThreadProc(void*) {
                 {
                     std::lock_guard lock(g_stateMutex);
                     wanted = g_selectedSessionId;
-                    showing = g_state.media.sourceAppUserModelId;
+                    showing = g_state.media.sessionKey;
                 }
 
-                // The arrows step through what is actually producing audio.
-                // GetSessions returns every app registered with the system
-                // transport controls, which includes browser tabs that merely
-                // played a notification sound once and have sat paused ever
-                // since — that is where the phantom entries came from. The
-                // session on screen is always kept, so it does not disappear
-                // from the list the moment it is paused.
+                // Key each session by its app id plus an ordinal among the
+                // sessions sharing that id. Chrome hands every tab the same
+                // AppUserModelId, so the raw id cannot tell two tabs apart —
+                // which made the arrows unable to step between them.
+                using Session =
+                    winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSession;
+                std::vector<std::pair<std::wstring, Session>> keyed;
+                std::vector<std::pair<std::wstring, int>> seen;
                 for (auto const& candidate : sessions) {
-                    std::wstring id = candidate.SourceAppUserModelId().c_str();
-                    bool keep = (!wanted.empty() && id == wanted) ||
-                                (!showing.empty() && id == showing);
-                    if (!keep) {
-                        try {
-                            auto info = candidate.GetPlaybackInfo();
-                            keep = info && info.PlaybackStatus() == PlaybackStatus::Playing;
-                        } catch (...) {
-                            keep = false;
+                    std::wstring appId = candidate.SourceAppUserModelId().c_str();
+                    int ordinal = 0;
+                    for (auto& entry : seen) {
+                        if (entry.first == appId) {
+                            ordinal = ++entry.second;
+                            break;
                         }
                     }
-                    if (keep) {
-                        next.sessionIds.push_back(std::move(id));
+                    if (ordinal == 0) {
+                        seen.emplace_back(appId, 0);
                     }
+                    keyed.emplace_back(appId + L"#" + std::to_wstring(ordinal), candidate);
                 }
 
-                winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSession
-                    session{nullptr};
+                // Anything that has played while the mod has been running stays
+                // in the list even once it is paused, so pausing one track and
+                // starting another does not lose the first. Sessions that never
+                // played — browser tabs registered by a notification sound and
+                // sat idle ever since — stay out.
+                static std::vector<std::wstring> s_playedKeys;
+                for (auto const& entry : keyed) {
+                    bool playing = false;
+                    try {
+                        auto info = entry.second.GetPlaybackInfo();
+                        playing = info && info.PlaybackStatus() == PlaybackStatus::Playing;
+                    } catch (...) {
+                    }
+                    if (playing &&
+                        std::find(s_playedKeys.begin(), s_playedKeys.end(), entry.first) ==
+                            s_playedKeys.end()) {
+                        s_playedKeys.push_back(entry.first);
+                    }
+                    if (std::find(s_playedKeys.begin(), s_playedKeys.end(), entry.first) !=
+                            s_playedKeys.end() ||
+                        entry.first == wanted || entry.first == showing) {
+                        next.sessionIds.push_back(entry.first);
+                    }
+                }
+                // Forget sources that have gone away entirely.
+                s_playedKeys.erase(std::remove_if(s_playedKeys.begin(), s_playedKeys.end(),
+                                                  [&keyed](const std::wstring& key) {
+                                                      for (auto const& entry : keyed) {
+                                                          if (entry.first == key) return false;
+                                                      }
+                                                      return true;
+                                                  }),
+                                   s_playedKeys.end());
+
+                Session session{nullptr};
+                std::wstring sessionKey;
                 if (!wanted.empty()) {
-                    for (auto const& candidate : sessions) {
-                        if (candidate.SourceAppUserModelId().c_str() == wanted) {
-                            session = candidate;
+                    for (auto const& entry : keyed) {
+                        if (entry.first == wanted) {
+                            session = entry.second;
+                            sessionKey = entry.first;
                             break;
                         }
                     }
@@ -1861,6 +1899,15 @@ DWORD WINAPI MediaThreadProc(void*) {
                     // away — fall back to whatever Windows considers current
                     // and forget the stale choice.
                     session = manager.GetCurrentSession();
+                    if (session) {
+                        std::wstring appId = session.SourceAppUserModelId().c_str();
+                        for (auto const& entry : keyed) {
+                            if (entry.first.rfind(appId + L"#", 0) == 0) {
+                                sessionKey = entry.first;
+                                break;
+                            }
+                        }
+                    }
                     if (!wanted.empty()) {
                         std::lock_guard lock(g_stateMutex);
                         if (g_selectedSessionId == wanted) {
@@ -1868,6 +1915,7 @@ DWORD WINAPI MediaThreadProc(void*) {
                         }
                     }
                 }
+                next.sessionKey = sessionKey;
 
                 if (session) {
                     auto properties = session.TryGetMediaPropertiesAsync().get();
@@ -7186,7 +7234,7 @@ static void CycleMediaSource(int delta) {
 
     int current = 0;
     for (size_t i = 0; i < ids.size(); ++i) {
-        if (ids[i] == g_state.media.sourceAppUserModelId) {
+        if (ids[i] == g_state.media.sessionKey) {
             current = static_cast<int>(i);
             break;
         }
