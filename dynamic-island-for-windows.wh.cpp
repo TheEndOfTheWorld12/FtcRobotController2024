@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.9.6
+// @version         1.10.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -30,6 +30,8 @@ media, downloads, clipboard, battery, and more.
   the front — clicking elsewhere on the pill no longer does.
 - Clipboard, notification, volume, Caps/Num lock, device connect/disconnect and
   battery alerts.
+- Privacy dots stacked at the right edge: green for the camera, orange for the
+  microphone, blue for location.
 - Resting pill shows the weather at a glance — icon and temperature, then
   place and condition, feels-like, humidity and wind. No clock: the date and
   time live on the calendar page one hover away.
@@ -452,8 +454,9 @@ struct SystemSnapshot {
     int renderFps = 0;
     int gpuPercent = -1;
     bool charging = false;
-    bool micActive = false;      // orange dot: microphone in use
-    bool cameraActive = false;   // green dot: camera in use
+    bool micActive = false;       // orange dot: microphone in use
+    bool cameraActive = false;    // green dot: camera in use
+    bool locationActive = false;  // blue dot: location in use
     std::wstring foregroundTitle;
     // Network / disk transfer rates, in bytes per second (system-wide).
     double netUpBps = 0.0;
@@ -485,11 +488,10 @@ struct SystemSnapshot {
 
 // The privacy dots sit at the same right edge, so page controls shift left
 // to make room for them.
-float PrivacyShiftX(bool micActive, bool cameraActive) {
-    if (micActive && cameraActive) {
-        return 30.0f;
-    }
-    return (micActive || cameraActive) ? 16.0f : 0.0f;
+float PrivacyShiftX(bool micActive, bool cameraActive, bool locationActive) {
+    // The dots stack vertically now, so they occupy one column whatever is
+    // lit — the shift no longer grows with the number of indicators.
+    return (micActive || cameraActive || locationActive) ? 16.0f : 0.0f;
 }
 
 struct Activity {
@@ -3688,6 +3690,10 @@ bool IsCameraActive() {
     return IsDeviceActiveViaRegistry(L"webcam");
 }
 
+bool IsLocationActive() {
+    return IsDeviceActiveViaRegistry(L"location");
+}
+
 void UpdateProgressSnapshot() {
     const int progress = Wh_GetIntValue(L"ProgressPercent", -1);
     std::lock_guard lock(g_stateMutex);
@@ -3698,9 +3704,11 @@ void UpdateProgressSnapshot() {
 void UpdatePrivacyIndicators() {
     const bool mic = IsMicrophoneActive();
     const bool cam = IsCameraActive();
+    const bool location = IsLocationActive();
     std::lock_guard lock(g_stateMutex);
     g_state.system.micActive = mic;
     g_state.system.cameraActive = cam;
+    g_state.system.locationActive = location;
 }
 
 std::wstring ReadClipboardText(HWND hwnd) {
@@ -4696,56 +4704,65 @@ class Renderer {
     void DrawPrivacyDots(const SharedState& state, D2D1_RECT_F rect, double now) {
         const bool mic = state.system.micActive;
         const bool cam = state.system.cameraActive;
-        if (!mic && !cam) return;
+        const bool location = state.system.locationActive;
+        if (!mic && !cam && !location) {
+            return;
+        }
 
         // Soft breathing pulse (0.75 Hz like iPhone).
         const float pulse = 0.72f + 0.28f * std::sin(static_cast<float>(now * 2.0 * 3.14159265 * 0.75));
 
-        const float dotR   = 4.5f;   // dot radius
-        const float gap    = 5.5f;   // gap between dots
-        const float margin = 10.0f;  // from right edge
-        const float dotY   = rect.top + (rect.bottom - rect.top) * 0.5f;
+        // Stacked in one column at the right edge. Sized so that all three fit
+        // inside the collapsed pill, which is only 36 units tall.
+        const float dotR = 3.5f;
+        const float gap = 3.5f;
+        const float margin = 10.0f;
+        const float dotX = rect.right - margin - dotR;
 
-        float x = rect.right - margin - dotR;
+        struct Indicator {
+            bool active;
+            D2D1_COLOR_F color;
+        };
+        const Indicator indicators[] = {
+            {cam, D2D1::ColorF(0.133f, 0.776f, 0.239f, 1.0f)},   // camera: iOS green
+            {mic, D2D1::ColorF(1.000f, 0.584f, 0.000f, 1.0f)},   // microphone: iOS orange
+            {location, D2D1::ColorF(0.000f, 0.478f, 1.000f, 1.0f)},  // location: iOS blue
+        };
 
-        // Green = camera (rightmost when both active).
-        if (cam) {
-            ComPtr<ID2D1SolidColorBrush> camBrush;
-            // Bright iOS camera green.
-            target_->CreateSolidColorBrush(
-                D2D1::ColorF(0.133f, 0.776f, 0.239f, pulse * settingsOpacity_), &camBrush);
-            if (camBrush) {
-                target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x, dotY), dotR, dotR),
-                                     camBrush.Get());
-                // Glow halo.
-                ComPtr<ID2D1SolidColorBrush> glow;
-                target_->CreateSolidColorBrush(
-                    D2D1::ColorF(0.133f, 0.776f, 0.239f, 0.18f * pulse * settingsOpacity_), &glow);
-                if (glow) {
-                    target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x, dotY),
-                                                        dotR * 2.2f, dotR * 2.2f), glow.Get());
-                }
+        int count = 0;
+        for (const Indicator& indicator : indicators) {
+            if (indicator.active) {
+                ++count;
             }
-            x -= (dotR * 2.0f + gap);
         }
 
-        // Orange = microphone.
-        if (mic) {
-            ComPtr<ID2D1SolidColorBrush> micBrush;
-            // iOS orange.
-            target_->CreateSolidColorBrush(
-                D2D1::ColorF(1.0f, 0.584f, 0.0f, pulse * settingsOpacity_), &micBrush);
-            if (micBrush) {
-                target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x, dotY), dotR, dotR),
-                                     micBrush.Get());
+        const float step = dotR * 2.0f + gap;
+        const float centreY = (rect.top + rect.bottom) * 0.5f;
+        float y = centreY - ((count - 1) * step) * 0.5f;
+
+        for (const Indicator& indicator : indicators) {
+            if (!indicator.active) {
+                continue;
+            }
+
+            D2D1_COLOR_F color = indicator.color;
+            color.a = pulse * settingsOpacity_;
+            ComPtr<ID2D1SolidColorBrush> dot;
+            target_->CreateSolidColorBrush(color, &dot);
+            if (dot) {
+                target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(dotX, y), dotR, dotR), dot.Get());
+
+                D2D1_COLOR_F halo = indicator.color;
+                halo.a = 0.18f * pulse * settingsOpacity_;
                 ComPtr<ID2D1SolidColorBrush> glow;
-                target_->CreateSolidColorBrush(
-                    D2D1::ColorF(1.0f, 0.584f, 0.0f, 0.18f * pulse * settingsOpacity_), &glow);
+                target_->CreateSolidColorBrush(halo, &glow);
                 if (glow) {
-                    target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x, dotY),
-                                                        dotR * 2.2f, dotR * 2.2f), glow.Get());
+                    target_->FillEllipse(
+                        D2D1::Ellipse(D2D1::Point2F(dotX, y), dotR * 2.2f, dotR * 2.2f),
+                        glow.Get());
                 }
             }
+            y += step;
         }
     }
 
@@ -5224,7 +5241,8 @@ class Renderer {
         }
 
         const float cy = (rect.top + rect.bottom) * 0.5f;
-        const float shiftX = PrivacyShiftX(state.system.micActive, state.system.cameraActive);
+        const float shiftX = PrivacyShiftX(state.system.micActive, state.system.cameraActive,
+                                           state.system.locationActive);
         const float dotX = rect.right - kPageDotsRightInset - shiftX;
         const float spacing = 8.0f;
         const float span = (count - 1) * spacing;
@@ -5248,7 +5266,8 @@ class Renderer {
         }
         target_->PushAxisAlignedClip(rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
-        bool privacyActive = state.system.micActive || state.system.cameraActive;
+        bool privacyActive = state.system.micActive || state.system.cameraActive ||
+                             state.system.locationActive;
         if (!clockFormat_) return;
 
         SYSTEMTIME local = {};
@@ -5270,7 +5289,8 @@ class Renderer {
         if ((rect.bottom - rect.top) / scale < 100.0f) {
             // The privacy dots occupy the right edge, so give way to them.
             const float right =
-                rect.right - PrivacyShiftX(state.system.micActive, state.system.cameraActive);
+                rect.right - PrivacyShiftX(state.system.micActive, state.system.cameraActive,
+                                           state.system.locationActive);
 
             wchar_t nowLabel[32] = {};
             if (hasWeather) {
@@ -5884,11 +5904,8 @@ class Renderer {
                 DrawAlbumArt(state.media, artRect, now, 16.0f, true);
 
                 float shiftX = 0.0f;
-                if (state.system.micActive && state.system.cameraActive) {
-                    shiftX = 30.0f;
-                } else if (state.system.micActive || state.system.cameraActive) {
-                    shiftX = 16.0f;
-                }
+                shiftX = PrivacyShiftX(state.system.micActive, state.system.cameraActive,
+                                       state.system.locationActive);
 
                 const float waveW = 32.0f;
                 const float waveH = 20.0f;
@@ -6118,11 +6135,8 @@ class Renderer {
             DrawAlbumArt(state.media, artRect, now, artSize * 0.5f, false);
 
             float shiftX = 0.0f;
-            if (state.system.micActive && state.system.cameraActive) {
-                shiftX = 30.0f;
-            } else if (state.system.micActive || state.system.cameraActive) {
-                shiftX = 16.0f;
-            }
+            shiftX = PrivacyShiftX(state.system.micActive, state.system.cameraActive,
+                                   state.system.locationActive);
 
             D2D1_RECT_F waveRect = D2D1::RectF(rect.right - 42.0f - shiftX, cy - 10.0f,
                                                rect.right - 14.0f - shiftX, cy + 10.0f);
