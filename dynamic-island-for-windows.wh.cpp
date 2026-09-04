@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.10.0
+// @version         1.11.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -32,6 +32,8 @@ media, downloads, clipboard, battery, and more.
   battery alerts.
 - Privacy dots stacked at the right edge: green for the camera, orange for the
   microphone, blue for location.
+- Optionally suppresses the Windows volume popup, so volume changes show only
+  in the pill.
 - Resting pill shows the weather at a glance — icon and temperature, then
   place and condition, feels-like, humidity and wind. No clock: the date and
   time live on the calendar page one hover away.
@@ -160,6 +162,9 @@ shown; that is a platform limitation, not a mod bug.
   - GameOverlayHotkey: "Ctrl+Alt+G"
     $name: Game overlay hotkey
     $description: Toggles the game overlay from anywhere. Examples - Ctrl+Alt+G, Ctrl+Shift+F9, Win+End. Set to none to disable.
+  - HideSystemVolumeOsd: true
+    $name: Hide the Windows volume popup
+    $description: Suppresses the system volume on-screen display, so volume changes only appear in the pill. Turning this off brings it straight back.
   - ShowMetricText: true
     $name: Show metric labels
   - WeatherCity: ""
@@ -329,6 +334,7 @@ struct Settings {
     D2D1_COLOR_F customAccent = D2D1::ColorF(0x4cc9f0);
     float animationSpeed = 1.0f;
     bool media = true;
+    bool hideSystemVolumeOsd = true;
     bool clipboard = true;
     bool battery = true;
     bool progress = true;
@@ -924,6 +930,7 @@ void LoadSettings() {
     }
 
     next.media = Wh_GetIntSetting(L"Modules.Media") != 0;
+    next.hideSystemVolumeOsd = Wh_GetIntSetting(L"Modules.HideSystemVolumeOsd") != 0;
     next.clipboard = Wh_GetIntSetting(L"Modules.Clipboard") != 0;
     next.battery = Wh_GetIntSetting(L"Modules.Battery") != 0;
     next.progress = Wh_GetIntSetting(L"Modules.Progress") != 0;
@@ -3699,6 +3706,50 @@ void UpdateProgressSnapshot() {
     std::lock_guard lock(g_stateMutex);
     g_state.progress.active = progress >= 0 && progress <= 100;
     g_state.progress.percent = ClampInt(progress, 0, 100);
+}
+
+// Windows' volume on-screen display is a plain Win32 window: class
+// NativeHWNDHost owning a DirectUIHWND child. That pair is what identifies it
+// — no XAML, no shell internals — so hiding it is just ShowWindow.
+//
+// It is re-shown by the shell on every volume change, so this runs each frame
+// and hides it again. Stop calling it and the next volume change brings the
+// popup straight back; nothing needs undoing.
+BOOL CALLBACK FindVolumeOsdProc(HWND hwnd, LPARAM lParam) {
+    wchar_t className[64] = {};
+    GetClassNameW(hwnd, className, ARRAYSIZE(className));
+    if (wcscmp(className, L"NativeHWNDHost") != 0) {
+        return TRUE;
+    }
+    // Other shell windows use NativeHWNDHost too; the DirectUIHWND child is
+    // what distinguishes the volume display.
+    if (!FindWindowExW(hwnd, nullptr, L"DirectUIHWND", nullptr)) {
+        return TRUE;
+    }
+    *reinterpret_cast<HWND*>(lParam) = hwnd;
+    return FALSE;
+}
+
+void HideSystemVolumeOsd() {
+    static HWND s_osd = nullptr;
+    static double s_nextScan = 0.0;
+
+    if (s_osd && !IsWindow(s_osd)) {
+        s_osd = nullptr;
+    }
+    if (!s_osd) {
+        // Enumerating every top-level window is not something to do per frame,
+        // so only look again once a second until it is found.
+        if (NowSeconds() < s_nextScan) {
+            return;
+        }
+        s_nextScan = NowSeconds() + 1.0;
+        EnumWindows(FindVolumeOsdProc, reinterpret_cast<LPARAM>(&s_osd));
+    }
+
+    if (s_osd && IsWindowVisible(s_osd)) {
+        ShowWindow(s_osd, SW_HIDE);
+    }
 }
 
 void UpdatePrivacyIndicators() {
@@ -8070,6 +8121,12 @@ DWORD WINAPI RenderThreadProc(void*) {
             }
 
             SetClickThrough(hwnd, primary.kind == IslandKind::Idle && !hover && !pinned);
+
+        // Keep the system volume popup down, so a volume change shows only in
+        // the pill. Checked every frame: the shell re-shows it each time.
+        if (g_settings.hideSystemVolumeOsd) {
+            HideSystemVolumeOsd();
+        }
 
             // Glide the pill onto its anchor. While a drag is in progress the
             // offset is written straight from the pointer and left alone here; the
