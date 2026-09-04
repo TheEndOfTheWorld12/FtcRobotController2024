@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.11.1
+// @version         1.11.2
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -3755,24 +3755,68 @@ bool LooksLikeVolumePopup(HWND hwnd) {
         return false;
     }
 
-    const LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    if (!(exStyle & WS_EX_TOPMOST)) {
-        return false;
-    }
-
-    // The flyout is a small strip. Quick Settings and the notification centre
-    // are far taller, which is what this bound is for.
+    // Deliberately no WS_EX_TOPMOST test: a XAML island's top-level host does
+    // not reliably carry it, and requiring it was likely why the flyout was
+    // being missed.
+    //
+    // The bounds are generous because a XAML popup's window is usually larger
+    // than the rounded rectangle you see — the visual sits inset within a
+    // transparent surface. They exist only to rule out full-screen windows and
+    // the notification centre.
     RECT rect = {};
     if (!GetWindowRect(hwnd, &rect)) {
         return false;
     }
     const long width = rect.right - rect.left;
     const long height = rect.bottom - rect.top;
-    if (width < 100 || width > 900 || height < 30 || height > 200) {
+    if (width < 60 || width > 1200 || height < 20 || height > 400) {
         return false;
     }
 
+    // Owned by the shell is the strong signal. Combined with only looking in
+    // the moment after a volume change, it is specific enough.
     return IsShellOwnedWindow(hwnd);
+}
+
+// When nothing matched, dump what was on screen instead. One burst per volume
+// change, so it says what the flyout actually looks like rather than leaving
+// the next attempt to guesswork.
+BOOL CALLBACK LogVolumeCandidateProc(HWND hwnd, LPARAM) {
+    if (!IsWindowVisible(hwnd) || hwnd == g_hwnd) {
+        return TRUE;
+    }
+    RECT rect = {};
+    GetWindowRect(hwnd, &rect);
+    const long width = rect.right - rect.left;
+    const long height = rect.bottom - rect.top;
+    if (width <= 1 || height <= 1) {
+        return TRUE;
+    }
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    std::wstring image;
+    ProcessImageNameForPid(pid, &image);
+    const std::wstring base = image.empty() ? L"(unknown)" : BaseNameFromPath(image);
+
+    // Only the shell's own windows are plausible, and this keeps the burst to
+    // a readable size.
+    const std::wstring lower = ToLowerCopy(base);
+    if (lower.find(L"explorer") == std::wstring::npos &&
+        lower.find(L"shell") == std::wstring::npos &&
+        lower.find(L"host") == std::wstring::npos) {
+        return TRUE;
+    }
+
+    wchar_t className[128] = {};
+    GetClassNameW(hwnd, className, ARRAYSIZE(className));
+    wchar_t title[128] = {};
+    GetWindowTextW(hwnd, title, ARRAYSIZE(title));
+
+    Wh_Log(L"  candidate: class=%s title=\"%s\" %ldx%ld at (%ld,%ld) ex=0x%08llX proc=%s",
+           className, title, width, height, rect.left, rect.top,
+           static_cast<unsigned long long>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE)), base.c_str());
+    return TRUE;
 }
 
 BOOL CALLBACK FindVolumePopupProc(HWND hwnd, LPARAM lParam) {
@@ -3810,6 +3854,14 @@ void HideSystemVolumeOsd(int volumePercent, bool muted) {
         }
         s_nextScan = now + 0.2;
         EnumWindows(FindVolumePopupProc, reinterpret_cast<LPARAM>(&s_osd));
+
+        // Nothing matched this time round: say what was there instead.
+        static double s_loggedAt = -100.0;
+        if (!s_osd && s_loggedAt != s_changedAt) {
+            s_loggedAt = s_changedAt;
+            Wh_Log(L"No volume popup matched; shell windows visible right now:");
+            EnumWindows(LogVolumeCandidateProc, 0);
+        }
 
         if (s_osd) {
             // Log it once: if this ever matches the wrong window, this line
