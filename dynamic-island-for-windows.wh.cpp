@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.12.0
+// @version         1.12.1
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -3778,6 +3778,14 @@ bool LooksLikeVolumePopup(HWND hwnd) {
     // Owned by the shell is the strong signal. Combined with only looking in
     // the moment after a volume change, it is specific enough.
     return IsShellOwnedWindow(hwnd);
+}
+
+BOOL CALLBACK FindVolumePopupProc(HWND hwnd, LPARAM lParam) {
+    if (!LooksLikeVolumePopup(hwnd)) {
+        return TRUE;
+    }
+    *reinterpret_cast<HWND*>(lParam) = hwnd;
+    return FALSE;
 }
 
 void HideSystemVolumeOsd(int volumePercent, bool muted) {
