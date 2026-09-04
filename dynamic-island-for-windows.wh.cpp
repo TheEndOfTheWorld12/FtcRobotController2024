@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.11.2
+// @version         1.12.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -32,8 +32,9 @@ media, downloads, clipboard, battery, and more.
   battery alerts.
 - Privacy dots stacked at the right edge: green for the camera, orange for the
   microphone, blue for location.
-- Optionally suppresses the Windows volume popup, so volume changes show only
-  in the pill.
+- Optionally suppresses the Windows volume popup: the volume keys are handled
+  by the mod itself and swallowed, so the shell never raises its flyout and
+  the change shows only in the pill.
 - Resting pill shows the weather at a glance — icon and temperature, then
   place and condition, feels-like, humidity and wind. No clock: the date and
   time live on the calendar page one hover away.
@@ -164,7 +165,7 @@ shown; that is a platform limitation, not a mod bug.
     $description: Toggles the game overlay from anywhere. Examples - Ctrl+Alt+G, Ctrl+Shift+F9, Win+End. Set to none to disable.
   - HideSystemVolumeOsd: true
     $name: Hide the Windows volume popup
-    $description: Suppresses the system volume on-screen display, so volume changes only appear in the pill. Turning this off brings it straight back.
+    $description: Handles the volume keys itself so the system flyout never appears, and shows the change in the pill instead. Only covers the keyboard volume keys - the flyout has no window to hide on current Windows.
   - ShowMetricText: true
     $name: Show metric labels
   - WeatherCity: ""
@@ -680,6 +681,7 @@ std::atomic<double> g_lastNudgeTime = 0.0;
 // registering thread's message queue).
 constexpr UINT WM_APP_HOTKEY_CHANGED = WM_APP + 0x445;
 constexpr UINT WM_APP_TOGGLE_OVERLAY = WM_APP + 0x446;
+constexpr UINT WM_APP_VOLUME_KEY = WM_APP + 0x447;
 constexpr int kGameOverlayHotkeyId = 1;
 std::atomic<UINT> g_overlayHotkeyModifiers = 0;
 std::atomic<UINT> g_overlayHotkeyVk = 0;
@@ -3778,55 +3780,6 @@ bool LooksLikeVolumePopup(HWND hwnd) {
     return IsShellOwnedWindow(hwnd);
 }
 
-// When nothing matched, dump what was on screen instead. One burst per volume
-// change, so it says what the flyout actually looks like rather than leaving
-// the next attempt to guesswork.
-BOOL CALLBACK LogVolumeCandidateProc(HWND hwnd, LPARAM) {
-    if (!IsWindowVisible(hwnd) || hwnd == g_hwnd) {
-        return TRUE;
-    }
-    RECT rect = {};
-    GetWindowRect(hwnd, &rect);
-    const long width = rect.right - rect.left;
-    const long height = rect.bottom - rect.top;
-    if (width <= 1 || height <= 1) {
-        return TRUE;
-    }
-
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
-    std::wstring image;
-    ProcessImageNameForPid(pid, &image);
-    const std::wstring base = image.empty() ? L"(unknown)" : BaseNameFromPath(image);
-
-    // Only the shell's own windows are plausible, and this keeps the burst to
-    // a readable size.
-    const std::wstring lower = ToLowerCopy(base);
-    if (lower.find(L"explorer") == std::wstring::npos &&
-        lower.find(L"shell") == std::wstring::npos &&
-        lower.find(L"host") == std::wstring::npos) {
-        return TRUE;
-    }
-
-    wchar_t className[128] = {};
-    GetClassNameW(hwnd, className, ARRAYSIZE(className));
-    wchar_t title[128] = {};
-    GetWindowTextW(hwnd, title, ARRAYSIZE(title));
-
-    Wh_Log(L"  candidate: class=%s title=\"%s\" %ldx%ld at (%ld,%ld) ex=0x%08llX proc=%s",
-           className, title, width, height, rect.left, rect.top,
-           static_cast<unsigned long long>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE)), base.c_str());
-    return TRUE;
-}
-
-BOOL CALLBACK FindVolumePopupProc(HWND hwnd, LPARAM lParam) {
-    if (!LooksLikeVolumePopup(hwnd)) {
-        return TRUE;
-    }
-    *reinterpret_cast<HWND*>(lParam) = hwnd;
-    return FALSE;
-}
-
 void HideSystemVolumeOsd(int volumePercent, bool muted) {
     static HWND s_osd = nullptr;
     static double s_nextScan = 0.0;
@@ -3854,14 +3807,6 @@ void HideSystemVolumeOsd(int volumePercent, bool muted) {
         }
         s_nextScan = now + 0.2;
         EnumWindows(FindVolumePopupProc, reinterpret_cast<LPARAM>(&s_osd));
-
-        // Nothing matched this time round: say what was there instead.
-        static double s_loggedAt = -100.0;
-        if (!s_osd && s_loggedAt != s_changedAt) {
-            s_loggedAt = s_changedAt;
-            Wh_Log(L"No volume popup matched; shell windows visible right now:");
-            EnumWindows(LogVolumeCandidateProc, 0);
-        }
 
         if (s_osd) {
             // Log it once: if this ever matches the wrong window, this line
@@ -4205,6 +4150,70 @@ void ToggleEndpointMute();
 void HandleStatusClickAtPoint(HWND hwnd, LPARAM lParam) {
     // Disabled click handlers for status chips as requested by the user
     return;
+}
+
+// Applies what a volume key would have done, so the key itself can be
+// swallowed before the shell ever sees it — which is what stops the flyout
+// appearing, since there is no window to hide.
+void ApplyVolumeKey(UINT vk) {
+    ComPtr<IMMDeviceEnumerator> enumerator;
+    ComPtr<IMMDevice> device;
+    ComPtr<IAudioEndpointVolume> volume;
+
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
+                                  CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
+    if (SUCCEEDED(hr)) {
+        hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+    }
+    if (SUCCEEDED(hr)) {
+        hr = device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr,
+                              reinterpret_cast<void**>(volume.GetAddressOf()));
+    }
+    if (FAILED(hr) || !volume) {
+        return;
+    }
+
+    switch (vk) {
+        case VK_VOLUME_UP:
+            // The endpoint's own step, so this lands on the same values the
+            // shell would have produced.
+            volume->VolumeStepUp(nullptr);
+            break;
+        case VK_VOLUME_DOWN:
+            volume->VolumeStepDown(nullptr);
+            break;
+        case VK_VOLUME_MUTE: {
+            BOOL muted = FALSE;
+            volume->GetMute(&muted);
+            volume->SetMute(!muted, nullptr);
+            break;
+        }
+        default:
+            break;
+    }
+
+    // Publish the new level immediately. The system snapshot only polls once
+    // a second, and waiting for it would make the pill feel slower than the
+    // flyout it replaces.
+    float level = 0.0f;
+    BOOL muted = FALSE;
+    if (FAILED(volume->GetMasterVolumeLevelScalar(&level)) ||
+        FAILED(volume->GetMute(&muted))) {
+        return;
+    }
+
+    {
+        std::lock_guard lock(g_stateMutex);
+        g_state.system.volumePercent = ClampInt(static_cast<int>(level * 100.0f + 0.5f), 0, 100);
+        g_state.system.volumeMuted = muted != FALSE;
+        g_state.muted = g_state.system.volumeMuted;
+        g_state.volume.active = true;
+        g_state.volume.percent = g_state.system.volumePercent;
+        g_state.volume.muted = g_state.system.volumeMuted;
+        g_state.volume.deviceName = L"System audio";
+        g_state.volume.expiresAt = NowSeconds() + 1.8;
+    }
+    TriggerNudge();
 }
 
 void ToggleEndpointMute() {
@@ -7312,6 +7321,22 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             }
         }
 
+        // Volume keys: apply the change ourselves and swallow the key, so the
+        // shell never learns of it and never raises its flyout. Hiding that
+        // flyout is not possible — on current Windows it has no top-level
+        // window of its own to hide.
+        if (g_settings.hideSystemVolumeOsd &&
+            (kbd->vkCode == VK_VOLUME_UP || kbd->vkCode == VK_VOLUME_DOWN ||
+             kbd->vkCode == VK_VOLUME_MUTE)) {
+            if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
+                // A low-level hook has a few milliseconds before Windows drops
+                // it, so the COM work happens on the thread's message loop.
+                PostThreadMessageW(GetCurrentThreadId(), WM_APP_VOLUME_KEY,
+                                   kbd->vkCode, 0);
+            }
+            return 1;  // swallowed
+        }
+
         // Second path for the game overlay hotkey. RegisterHotKey is refused
         // outright when another app already owns the combo, and even when it
         // succeeds some full-screen games swallow the key, so the chord is
@@ -7347,6 +7372,9 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 }
 
 DWORD WINAPI KeyboardThreadProc(void*) {
+    // Volume keys are applied on this thread, which means COM.
+    const HRESULT hrCo = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
     g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, nullptr, 0);
 
     auto registerOverlayHotkey = []() {
@@ -7389,6 +7417,10 @@ DWORD WINAPI KeyboardThreadProc(void*) {
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
+        if (msg.message == WM_APP_VOLUME_KEY) {
+            ApplyVolumeKey(static_cast<UINT>(msg.wParam));
+            continue;
+        }
         if (msg.message == WM_HOTKEY && msg.wParam == kGameOverlayHotkeyId) {
             toggleGameOverlay();
             continue;
@@ -7409,6 +7441,9 @@ DWORD WINAPI KeyboardThreadProc(void*) {
     if (g_keyboardHook) {
         UnhookWindowsHookEx(g_keyboardHook);
         g_keyboardHook = nullptr;
+    }
+    if (SUCCEEDED(hrCo)) {
+        CoUninitialize();
     }
     return 0;
 }
