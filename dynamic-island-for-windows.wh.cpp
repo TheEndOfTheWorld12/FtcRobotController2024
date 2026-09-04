@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.11.0
+// @version         1.11.1
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -3708,43 +3708,124 @@ void UpdateProgressSnapshot() {
     g_state.progress.percent = ClampInt(progress, 0, 100);
 }
 
-// Windows' volume on-screen display is a plain Win32 window: class
-// NativeHWNDHost owning a DirectUIHWND child. That pair is what identifies it
-// — no XAML, no shell internals — so hiding it is just ShowWindow.
+// Suppressing the volume popup.
 //
-// It is re-shown by the shell on every volume change, so this runs each frame
-// and hides it again. Stop calling it and the next volume change brings the
+// There are two of these. Windows 10's is a plain NativeHWNDHost owning a
+// DirectUIHWND. Windows 11's is a XAML island whose class name has changed
+// between releases, so matching it by class is a guess with a shelf life —
+// it is identified by behaviour instead: a small, visible, topmost window
+// belonging to a shell process, which is what the flyout is and what the
+// taskbar, desktop and tooltips are not.
+//
+// Whatever is found is re-shown by the shell on every volume change, so it is
+// hidden again each frame. Stop hiding and the next volume change brings the
 // popup straight back; nothing needs undoing.
-BOOL CALLBACK FindVolumeOsdProc(HWND hwnd, LPARAM lParam) {
-    wchar_t className[64] = {};
-    GetClassNameW(hwnd, className, ARRAYSIZE(className));
-    if (wcscmp(className, L"NativeHWNDHost") != 0) {
-        return TRUE;
+bool IsShellOwnedWindow(HWND hwnd) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    std::wstring image;
+    if (!ProcessImageNameForPid(pid, &image)) {
+        return false;
     }
-    // Other shell windows use NativeHWNDHost too; the DirectUIHWND child is
-    // what distinguishes the volume display.
-    if (!FindWindowExW(hwnd, nullptr, L"DirectUIHWND", nullptr)) {
+    const std::wstring base = ToLowerCopy(BaseNameFromPath(image));
+    return base == L"explorer.exe" || base == L"shellexperiencehost.exe" ||
+           base == L"shellhost.exe" || base == L"startmenuexperiencehost.exe";
+}
+
+bool LooksLikeVolumePopup(HWND hwnd) {
+    if (!hwnd || hwnd == g_hwnd || !IsWindowVisible(hwnd)) {
+        return false;
+    }
+
+    wchar_t className[128] = {};
+    GetClassNameW(hwnd, className, ARRAYSIZE(className));
+
+    // Windows 10's OSD, matched exactly.
+    if (wcscmp(className, L"NativeHWNDHost") == 0 &&
+        FindWindowExW(hwnd, nullptr, L"DirectUIHWND", nullptr)) {
+        return true;
+    }
+
+    // Never touch the shell's own furniture.
+    if (wcscmp(className, L"Shell_TrayWnd") == 0 ||
+        wcscmp(className, L"Shell_SecondaryTrayWnd") == 0 ||
+        wcscmp(className, L"Progman") == 0 ||
+        wcscmp(className, L"WorkerW") == 0 ||
+        wcsstr(className, L"tooltips_class") != nullptr) {
+        return false;
+    }
+
+    const LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    if (!(exStyle & WS_EX_TOPMOST)) {
+        return false;
+    }
+
+    // The flyout is a small strip. Quick Settings and the notification centre
+    // are far taller, which is what this bound is for.
+    RECT rect = {};
+    if (!GetWindowRect(hwnd, &rect)) {
+        return false;
+    }
+    const long width = rect.right - rect.left;
+    const long height = rect.bottom - rect.top;
+    if (width < 100 || width > 900 || height < 30 || height > 200) {
+        return false;
+    }
+
+    return IsShellOwnedWindow(hwnd);
+}
+
+BOOL CALLBACK FindVolumePopupProc(HWND hwnd, LPARAM lParam) {
+    if (!LooksLikeVolumePopup(hwnd)) {
         return TRUE;
     }
     *reinterpret_cast<HWND*>(lParam) = hwnd;
     return FALSE;
 }
 
-void HideSystemVolumeOsd() {
+void HideSystemVolumeOsd(int volumePercent, bool muted) {
     static HWND s_osd = nullptr;
     static double s_nextScan = 0.0;
+    static int s_lastVolume = -1;
+    static bool s_lastMuted = false;
+    static double s_changedAt = -100.0;
+
+    const double now = NowSeconds();
+    if (volumePercent != s_lastVolume || muted != s_lastMuted) {
+        s_lastVolume = volumePercent;
+        s_lastMuted = muted;
+        s_changedAt = now;
+    }
 
     if (s_osd && !IsWindow(s_osd)) {
         s_osd = nullptr;
     }
+
     if (!s_osd) {
-        // Enumerating every top-level window is not something to do per frame,
-        // so only look again once a second until it is found.
-        if (NowSeconds() < s_nextScan) {
+        // Only hunt in the couple of seconds after a volume change. Outside
+        // that window a taskbar thumbnail preview would fit the same
+        // description — small, topmost, shell-owned — and get hidden with it.
+        if (now - s_changedAt > 2.5 || now < s_nextScan) {
             return;
         }
-        s_nextScan = NowSeconds() + 1.0;
-        EnumWindows(FindVolumeOsdProc, reinterpret_cast<LPARAM>(&s_osd));
+        s_nextScan = now + 0.2;
+        EnumWindows(FindVolumePopupProc, reinterpret_cast<LPARAM>(&s_osd));
+
+        if (s_osd) {
+            // Log it once: if this ever matches the wrong window, this line
+            // says exactly which.
+            wchar_t className[128] = {};
+            GetClassNameW(s_osd, className, ARRAYSIZE(className));
+            RECT rect = {};
+            GetWindowRect(s_osd, &rect);
+            DWORD pid = 0;
+            GetWindowThreadProcessId(s_osd, &pid);
+            std::wstring image;
+            ProcessImageNameForPid(pid, &image);
+            Wh_Log(L"Hiding the volume popup: class=%s, %ldx%ld, process=%s",
+                   className, rect.right - rect.left, rect.bottom - rect.top,
+                   image.empty() ? L"(unknown)" : BaseNameFromPath(image).c_str());
+        }
     }
 
     if (s_osd && IsWindowVisible(s_osd)) {
@@ -8125,7 +8206,7 @@ DWORD WINAPI RenderThreadProc(void*) {
         // Keep the system volume popup down, so a volume change shows only in
         // the pill. Checked every frame: the shell re-shows it each time.
         if (g_settings.hideSystemVolumeOsd) {
-            HideSystemVolumeOsd();
+            HideSystemVolumeOsd(snapshot.system.volumePercent, snapshot.system.volumeMuted);
         }
 
             // Glide the pill onto its anchor. While a drag is in progress the
