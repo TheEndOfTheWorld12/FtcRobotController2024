@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.14.0
+// @version         1.15.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -35,7 +35,9 @@ media, downloads, clipboard, battery, and more.
   holding that capability open.
 - Optionally suppresses the Windows volume popup: the volume keys are handled
   by the mod itself and swallowed, so the shell never raises its flyout and
-  the change shows only in the pill. The pill's own bar is draggable — click
+  the change shows only in the pill. The Caps Lock and Num Lock card your
+  laptop maker's utility draws is hidden the same way, so those show only in
+  the pill too. The pill's own bar is draggable — click
   or slide along it to set the level, and pointing at it holds the pill up
   for as long as you need.
 - Resting pill shows the weather at a glance — icon and temperature, then
@@ -169,6 +171,9 @@ shown; that is a platform limitation, not a mod bug.
   - HideSystemVolumeOsd: true
     $name: Hide the Windows volume popup
     $description: Handles the volume keys itself so the system flyout never appears, and shows the change in the pill instead. Only covers the keyboard volume keys - the flyout has no window to hide on current Windows.
+  - HideSystemCapsLockOsd: true
+    $name: Hide the Caps Lock popup
+    $description: Hides the card your laptop maker's utility puts on screen when Caps Lock or Num Lock is pressed, so the change shows only in the pill. Windows has no such popup of its own, so this looks for one that appears the moment the key goes down, and only then - a brightness or airplane-mode popup from the same utility is left alone.
   - ShowMetricText: true
     $name: Show metric labels
   - WeatherCity: ""
@@ -339,6 +344,7 @@ struct Settings {
     float animationSpeed = 1.0f;
     bool media = true;
     bool hideSystemVolumeOsd = true;
+    bool hideSystemCapsLockOsd = true;
     bool clipboard = true;
     bool battery = true;
     bool progress = true;
@@ -1028,6 +1034,7 @@ void LoadSettings() {
 
     next.media = Wh_GetIntSetting(L"Modules.Media") != 0;
     next.hideSystemVolumeOsd = Wh_GetIntSetting(L"Modules.HideSystemVolumeOsd") != 0;
+    next.hideSystemCapsLockOsd = Wh_GetIntSetting(L"Modules.HideSystemCapsLockOsd") != 0;
     next.clipboard = Wh_GetIntSetting(L"Modules.Clipboard") != 0;
     next.battery = Wh_GetIntSetting(L"Modules.Battery") != 0;
     next.progress = Wh_GetIntSetting(L"Modules.Progress") != 0;
@@ -4072,6 +4079,205 @@ void HideSystemVolumeOsd(int volumePercent, bool muted) {
     }
 
     if (s_osd && IsWindowVisible(s_osd)) {
+        ShowWindow(s_osd, SW_HIDE);
+    }
+}
+
+// Suppressing the Caps Lock card.
+//
+// Windows has no Caps Lock indicator of its own — the card with "AA" over
+// "Caps Lock On" is drawn by the laptop maker's own utility, and Dell, HP,
+// Lenovo, ASUS and Logitech each ship a different one, so there is no class
+// name worth matching. It is identified by behaviour instead: in the moment
+// after the key goes down, a bare, small, unfocusable window that was not on
+// screen a second ago is that card and nothing else.
+//
+// It is only hidden inside that moment. These utilities usually draw every
+// popup they have — brightness, volume, airplane mode — with the same window,
+// and hiding it whenever it appeared would take all of them with it. Nothing
+// needs undoing either: the window is hidden, not destroyed, and the utility
+// shows it again the next time it has something to say.
+
+std::atomic<uint64_t> g_lockKeyOsdWatchUntil = 0;  // GetTickCount64 deadline
+
+// What was already on screen, in two generations. The older one is the one
+// consulted: the newer may have been taken after the card appeared, and a
+// baseline that already contains the card cannot reveal it.
+std::vector<HWND> g_lockKeyWindowsPrev;
+std::vector<HWND> g_lockKeyWindowsCur;
+// False until two sweeps have been taken, which is when the older generation
+// first means anything. Before that an empty record would call every window on
+// screen new, and the first press after startup would hide the wrong one.
+bool g_lockKeyBaselineReady = false;
+
+BOOL CALLBACK CollectVisibleWindowsProc(HWND hwnd, LPARAM lParam) {
+    if (IsWindowVisible(hwnd)) {
+        reinterpret_cast<std::vector<HWND>*>(lParam)->push_back(hwnd);
+    }
+    return TRUE;
+}
+
+BOOL CALLBACK FindLockKeyTextProc(HWND child, LPARAM lParam) {
+    wchar_t text[160] = {};
+    GetWindowTextW(child, text, ARRAYSIZE(text));
+    const std::wstring lower = ToLowerCopy(text);
+    if (lower.find(L"caps") != std::wstring::npos ||
+        lower.find(L"num lock") != std::wstring::npos ||
+        lower.find(L"numlock") != std::wstring::npos) {
+        *reinterpret_cast<bool*>(lParam) = true;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+// Whether the window says out loud what it is for. Most of these cards are
+// custom-drawn and say nothing, so this only ever promotes a candidate — it
+// never rules one out.
+bool MentionsLockKey(HWND hwnd) {
+    bool found = false;
+    FindLockKeyTextProc(hwnd, reinterpret_cast<LPARAM>(&found));
+    if (!found) {
+        EnumChildWindows(hwnd, FindLockKeyTextProc, reinterpret_cast<LPARAM>(&found));
+    }
+    return found;
+}
+
+bool LooksLikeLockKeyPopup(HWND hwnd) {
+    if (!hwnd || hwnd == g_hwnd || !IsWindowVisible(hwnd)) {
+        return false;
+    }
+
+    // Never anything of this process's own.
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == GetCurrentProcessId()) {
+        return false;
+    }
+
+    wchar_t className[128] = {};
+    GetClassNameW(hwnd, className, ARRAYSIZE(className));
+    if (wcscmp(className, L"Shell_TrayWnd") == 0 ||
+        wcscmp(className, L"Shell_SecondaryTrayWnd") == 0 ||
+        wcscmp(className, L"Progman") == 0 ||
+        wcscmp(className, L"WorkerW") == 0 ||
+        wcscmp(className, L"Windows.UI.Core.CoreWindow") == 0 ||
+        wcsstr(className, L"tooltips_class") != nullptr) {
+        return false;
+    }
+
+    // An OSD is a bare panel: no title bar, no resizing frame, and it does not
+    // become the foreground window when it appears.
+    const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    const LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    if ((style & WS_CHILD) || (style & WS_CAPTION) || (style & WS_THICKFRAME)) {
+        return false;
+    }
+    if (!(exStyle & (WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED))) {
+        return false;
+    }
+    if (hwnd == GetForegroundWindow()) {
+        return false;
+    }
+
+    RECT rect = {};
+    if (!GetWindowRect(hwnd, &rect)) {
+        return false;
+    }
+    const long width = rect.right - rect.left;
+    const long height = rect.bottom - rect.top;
+    // Generous, because a XAML or WPF card usually sits inset within a larger
+    // transparent surface. This only has to rule out full-screen windows.
+    return width >= 50 && width <= 800 && height >= 30 && height <= 600;
+}
+
+struct LockKeyPopupSearch {
+    HWND named = nullptr;     // its text says "Caps Lock"
+    HWND unnamed = nullptr;   // right shape and newly on screen, but silent
+};
+
+BOOL CALLBACK FindLockKeyPopupProc(HWND hwnd, LPARAM lParam) {
+    if (!LooksLikeLockKeyPopup(hwnd)) {
+        return TRUE;
+    }
+
+    auto* search = reinterpret_cast<LockKeyPopupSearch*>(lParam);
+
+    // A window whose text says "Caps Lock" needs no further argument, and is
+    // taken even if it was already on screen: it may well be the same card
+    // still up from the press before this one.
+    if (MentionsLockKey(hwnd)) {
+        search->named = hwnd;
+        return FALSE;  // no better answer exists
+    }
+
+    // For a silent one the whole case rests on it not having been there
+    // before, so anything already up when the key was pressed is out — and
+    // until there is a record to check against, nothing silent is taken.
+    if (!g_lockKeyBaselineReady ||
+        std::binary_search(g_lockKeyWindowsPrev.begin(), g_lockKeyWindowsPrev.end(), hwnd)) {
+        return TRUE;
+    }
+    if (!search->unnamed) {
+        search->unnamed = hwnd;
+    }
+    return TRUE;
+}
+
+void HideSystemLockKeyOsd() {
+    static uint64_t s_nextBaseline = 0;
+    static uint64_t s_nextScan = 0;
+    static HWND s_osd = nullptr;
+
+    const uint64_t nowTicks = GetTickCount64();
+    if (nowTicks >= g_lockKeyOsdWatchUntil.load()) {
+        // Between presses, keep the record of what is already on screen fresh.
+        if (nowTicks >= s_nextBaseline) {
+            s_nextBaseline = nowTicks + 700;
+            g_lockKeyWindowsPrev.swap(g_lockKeyWindowsCur);
+            g_lockKeyWindowsCur.clear();
+            EnumWindows(CollectVisibleWindowsProc, reinterpret_cast<LPARAM>(&g_lockKeyWindowsCur));
+            std::sort(g_lockKeyWindowsCur.begin(), g_lockKeyWindowsCur.end());
+            if (!g_lockKeyWindowsPrev.empty()) {
+                g_lockKeyBaselineReady = true;
+            }
+        }
+        return;
+    }
+
+    if (s_osd && !IsWindow(s_osd)) {
+        s_osd = nullptr;
+    }
+
+    if (!s_osd && nowTicks >= s_nextScan) {
+        s_nextScan = nowTicks + 40;
+        LockKeyPopupSearch search;
+        EnumWindows(FindLockKeyPopupProc, reinterpret_cast<LPARAM>(&search));
+        s_osd = search.named ? search.named : search.unnamed;
+
+        if (s_osd) {
+            // Logged once, so that if this ever picks the wrong window there
+            // is a line saying exactly which one it was.
+            wchar_t className[128] = {};
+            GetClassNameW(s_osd, className, ARRAYSIZE(className));
+            wchar_t title[160] = {};
+            GetWindowTextW(s_osd, title, ARRAYSIZE(title));
+            RECT rect = {};
+            GetWindowRect(s_osd, &rect);
+            DWORD pid = 0;
+            GetWindowThreadProcessId(s_osd, &pid);
+            std::wstring image;
+            ProcessImageNameForPid(pid, &image);
+            Wh_Log(L"Hiding the lock-key popup: class=%s, title=\"%s\", %ldx%ld, process=%s, %s",
+                   className, title, rect.right - rect.left, rect.bottom - rect.top,
+                   image.empty() ? L"(unknown)" : BaseNameFromPath(image).c_str(),
+                   search.named ? L"matched by its text" : L"matched by shape");
+        }
+    }
+
+    // The foreground test is checked again here and not only at the match:
+    // whatever this window turns out to be, a window the user is working in is
+    // never hidden out from under them.
+    if (s_osd && IsWindowVisible(s_osd) && s_osd != GetForegroundWindow()) {
         ShowWindow(s_osd, SW_HIDE);
     }
 }
@@ -7815,8 +8021,17 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION) {
         auto* kbd = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
 
-        if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
-            if (kbd->vkCode == VK_CAPITAL || kbd->vkCode == VK_NUMLOCK) {
+        if (kbd->vkCode == VK_CAPITAL || kbd->vkCode == VK_NUMLOCK) {
+            // Arm the sweep that hides the laptop maker's own lock-key card.
+            // Armed on the way down, before the key reaches the utility that
+            // draws it, so the record of what was already on screen is frozen
+            // while it still predates the card. Only an atomic store: a
+            // low-level hook has a few milliseconds before Windows drops it.
+            if (g_settings.hideSystemCapsLockOsd) {
+                g_lockKeyOsdWatchUntil = GetTickCount64() + 2500;
+            }
+
+            if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
                 // The window is briefly absent while the overlay restarts.
                 if (HWND target = g_hwnd) {
                     PostMessageW(target, WM_APP_CAPSLOCK, kbd->vkCode, 0);
@@ -8859,11 +9074,19 @@ DWORD WINAPI RenderThreadProc(void*) {
 
             SetClickThrough(hwnd, primary.kind == IslandKind::Idle && !hover && !pinned);
 
-        // Keep the system volume popup down, so a volume change shows only in
-        // the pill. Checked every frame: the shell re-shows it each time.
-        if (g_settings.hideSystemVolumeOsd) {
-            HideSystemVolumeOsd(snapshot.system.volumePercent, snapshot.system.volumeMuted);
-        }
+            // Keep the system volume popup down, so a volume change shows only
+            // in the pill. Checked every frame: the shell re-shows it each time.
+            if (g_settings.hideSystemVolumeOsd) {
+                HideSystemVolumeOsd(snapshot.system.volumePercent,
+                                    snapshot.system.volumeMuted);
+            }
+
+            // The same for the lock-key card. This one also keeps its record of
+            // what was already on screen up to date between presses, so it runs
+            // every frame rather than only while a key is being watched.
+            if (g_settings.hideSystemCapsLockOsd) {
+                HideSystemLockKeyOsd();
+            }
 
             // Glide the pill onto its anchor. While a drag is in progress the
             // offset is written straight from the pointer and left alone here; the
