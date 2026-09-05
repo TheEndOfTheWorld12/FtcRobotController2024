@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.12.1
+// @version         1.13.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -34,7 +34,9 @@ media, downloads, clipboard, battery, and more.
   microphone, blue for location.
 - Optionally suppresses the Windows volume popup: the volume keys are handled
   by the mod itself and swallowed, so the shell never raises its flyout and
-  the change shows only in the pill.
+  the change shows only in the pill. The pill's own bar is draggable — click
+  or slide along it to set the level, and pointing at it holds the pill up
+  for as long as you need.
 - Resting pill shows the weather at a glance — icon and temperature, then
   place and condition, feels-like, humidity and wind. No clock: the date and
   time live on the calendar page one hover away.
@@ -623,6 +625,19 @@ std::atomic<float> g_scrubBarLeftPx = 0.0f;
 std::atomic<float> g_scrubBarRightPx = 0.0f;
 std::atomic<float> g_scrubBarCentreYPx = 0.0f;
 std::atomic<float> g_scrubBarSlackPx = 0.0f;   // grab margin around the bar
+
+// The volume pill's bar is dragged the same way the timeline is, so it is
+// published the same way too: the renderer records where it drew the bar and
+// the hit-test reads that back, rather than working the geometry out twice.
+std::atomic<bool> g_volumeHitValid = false;
+std::atomic<float> g_volumeBarLeftPx = 0.0f;
+std::atomic<float> g_volumeBarRightPx = 0.0f;
+std::atomic<float> g_volumeBarCentreYPx = 0.0f;
+std::atomic<float> g_volumeBarSlackPx = 0.0f;
+std::atomic<bool> g_volumeDragging = false;
+// How far the volume bar is into its hover look, 0 to 1: it thickens and grows
+// a knob at the level, as the timeline does at the playhead.
+std::atomic<float> g_volumeEmphasis = 0.0f;
 
 // A rectangle in client pixels, written by the renderer as it draws the
 // control and read by the hit-tests, so the two cannot disagree.
@@ -4224,6 +4239,70 @@ void ApplyVolumeKey(UINT vk) {
     TriggerNudge();
 }
 
+ComPtr<IAudioEndpointVolume> AcquireEndpointVolume() {
+    ComPtr<IMMDeviceEnumerator> enumerator;
+    ComPtr<IMMDevice> device;
+    ComPtr<IAudioEndpointVolume> volume;
+
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
+                                  CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
+    if (SUCCEEDED(hr)) {
+        hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+    }
+    if (SUCCEEDED(hr)) {
+        hr = device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr,
+                              reinterpret_cast<void**>(volume.GetAddressOf()));
+    }
+    if (FAILED(hr)) {
+        volume.Reset();
+    }
+    return volume;
+}
+
+// Held for the length of a bar drag, and only touched on the window thread.
+// Reacquiring the endpoint would be a COM round trip per mouse move.
+ComPtr<IAudioEndpointVolume> g_dragEndpointVolume;
+
+// Sets the endpoint straight to a position along the volume bar, for the
+// drag. Dragging away from silence is a clear request to hear something, so
+// it lifts the mute on the way.
+void ApplyVolumeFraction(float fraction) {
+    ComPtr<IAudioEndpointVolume> volume = g_dragEndpointVolume;
+    if (!volume) {
+        volume = AcquireEndpointVolume();
+    }
+    if (!volume) {
+        return;
+    }
+
+    const float level = Clamp(fraction, 0.0f, 1.0f);
+    volume->SetMasterVolumeLevelScalar(level, nullptr);
+
+    BOOL muted = FALSE;
+    if (SUCCEEDED(volume->GetMute(&muted)) && muted && level > 0.0f) {
+        volume->SetMute(FALSE, nullptr);
+        muted = FALSE;
+    }
+
+    float applied = level;
+    volume->GetMasterVolumeLevelScalar(&applied);
+
+    {
+        std::lock_guard lock(g_stateMutex);
+        g_state.system.volumePercent = ClampInt(static_cast<int>(applied * 100.0f + 0.5f), 0, 100);
+        g_state.system.volumeMuted = muted != FALSE;
+        g_state.muted = g_state.system.volumeMuted;
+        g_state.volume.active = true;
+        g_state.volume.percent = g_state.system.volumePercent;
+        g_state.volume.muted = g_state.system.volumeMuted;
+        g_state.volume.deviceName = L"System audio";
+        // Well past the pill's usual dwell, so it cannot expire mid-drag.
+        g_state.volume.expiresAt = NowSeconds() + 2.5;
+    }
+    // No nudge here: the spring would restart on every mouse move.
+    g_layoutDirty = true;
+}
+
 void ToggleEndpointMute() {
     ComPtr<IMMDeviceEnumerator> enumerator;
     ComPtr<IMMDevice> device;
@@ -4578,6 +4657,7 @@ class Renderer {
         // Cleared every frame and set again only if the media page draws its
         // controls, so a stale rectangle can never take a click.
         g_mediaHitValid = false;
+        g_volumeHitValid = false;
 
         const float hoverScale = hover || pinned ? 1.025f : 1.0f;
         const float scale = hoverScale;
@@ -6879,16 +6959,58 @@ class Renderer {
                            valueRect, textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
         textBrush_->SetOpacity(0.90f);
 
-        D2D1_RECT_F track = D2D1::RectF(tx, cy + 2, rect.right - 14, cy + 6);
+        // The bar can be dragged, so it gets the timeline's treatment:
+        // hovering thickens it and grows a knob at the level.
+        const float barLeft = tx;
+        const float barRight = rect.right - 14;
+        const float barY = cy + 4.0f;
+        const float emphasis = Clamp(g_volumeEmphasis.load(), 0.0f, 1.0f);
+        const float barHalf = 2.0f + 1.5f * emphasis;
+
+        // Publish where the bar really landed, in client pixels, for the
+        // hit-test. Same relation the timeline uses — the drawing transform
+        // scales about the pill's centre — so the hover inflation and the
+        // nudge offset are carried along instead of being guessed at.
+        {
+            const float pcx = (rect.left + rect.right) * 0.5f;
+            const float pcy = (rect.top + rect.bottom) * 0.5f;
+            g_volumeBarLeftPx = pcx + (barLeft - pcx) * sizeScale_;
+            g_volumeBarRightPx = pcx + (barRight - pcx) * sizeScale_;
+            g_volumeBarCentreYPx = pcy + (barY - pcy) * sizeScale_;
+            g_volumeBarSlackPx = 10.0f * sizeScale_;
+            g_volumeHitValid = true;
+        }
+
+        D2D1_RECT_F track = D2D1::RectF(barLeft, barY - barHalf, barRight, barY + barHalf);
         ComPtr<ID2D1SolidColorBrush> trackBrush;
-        target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.08f), &trackBrush);
-        target_->FillRoundedRectangle(D2D1::RoundedRect(track, 2, 2), trackBrush.Get());
+        target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.08f + 0.10f * emphasis),
+                                       &trackBrush);
+        target_->FillRoundedRectangle(D2D1::RoundedRect(track, barHalf, barHalf),
+                                      trackBrush.Get());
+
         const float pct = Clamp(state.volume.percent / 100.0f, 0.0f, 1.0f);
-        D2D1_RECT_F fill = D2D1::RectF(track.left, track.top,
-                                       track.left + (track.right - track.left) * pct,
-                                       track.bottom);
+        const float fillW = (barRight - barLeft) * pct;
+        D2D1_RECT_F fill = D2D1::RectF(barLeft, track.top, barLeft + fillW, track.bottom);
         accentBrush_->SetOpacity(muted ? 0.24f : 0.85f);
-        target_->FillRoundedRectangle(D2D1::RoundedRect(fill, 2, 2), accentBrush_.Get());
+        target_->FillRoundedRectangle(D2D1::RoundedRect(fill, barHalf, barHalf),
+                                      accentBrush_.Get());
+
+        if (emphasis > 0.01f) {
+            const float knobX = barLeft + fillW;
+            const float knobR = 5.0f * emphasis;
+            ComPtr<ID2D1SolidColorBrush> knobRim;
+            target_->CreateSolidColorBrush(
+                D2D1::ColorF(0, 0, 0, 0.35f * emphasis * settingsOpacity_), &knobRim);
+            if (knobRim) {
+                target_->FillEllipse(
+                    D2D1::Ellipse(D2D1::Point2F(knobX, barY), knobR + 1.2f, knobR + 1.2f),
+                    knobRim.Get());
+            }
+            accentBrush_->SetOpacity(muted ? 0.55f : 1.0f);
+            target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(knobX, barY), knobR, knobR),
+                                 accentBrush_.Get());
+        }
+
         accentBrush_->SetOpacity(1.0f);
         mutedBrush_->SetOpacity(0.58f);
     }
@@ -7489,6 +7611,31 @@ static ScrubberHit HitTestScrubber(HWND hwnd, int xPos, int yPos) {
     return hit;
 }
 
+// The volume pill's bar, hit-tested exactly like the timeline and reporting
+// the same three things: whether the bar is on screen, whether the pointer is
+// on it, and how far along it sits.
+static ScrubberHit HitTestVolumeBar(int xPos, int yPos) {
+    ScrubberHit hit;
+
+    if (!g_volumeHitValid.load()) {
+        return hit;
+    }
+    const float left = g_volumeBarLeftPx.load();
+    const float right = g_volumeBarRightPx.load();
+    const float centreY = g_volumeBarCentreYPx.load();
+    const float slack = g_volumeBarSlackPx.load();
+    if (right <= left || slack <= 0.0f) {
+        return hit;
+    }
+
+    hit.valid = true;
+    hit.fraction = Clamp((static_cast<float>(xPos) - left) / (right - left), 0.0f, 1.0f);
+    hit.onBar = std::fabs(static_cast<float>(yPos) - centreY) <= slack &&
+                static_cast<float>(xPos) >= left - slack &&
+                static_cast<float>(xPos) <= right + slack;
+    return hit;
+}
+
 // Which control on the media page a point falls on, tested against the
 // rectangles the renderer published as it drew them.
 static MediaControl HitTestMediaControl(int xPos, int yPos) {
@@ -7700,6 +7847,21 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     }
                 }
 
+                // The volume pill's bar works like the timeline: pressing
+                // anywhere along it sets the level there, and the level then
+                // follows the pointer until the button comes back up.
+                {
+                    const ScrubberHit vol = HitTestVolumeBar(xPos, yPos);
+                    if (vol.valid && vol.onBar) {
+                        g_volumeDragging = true;
+                        g_dragEndpointVolume = AcquireEndpointVolume();
+                        ApplyVolumeFraction(vol.fraction);
+                        SetCapture(hwnd);
+                        g_layoutDirty = true;
+                        return 0;
+                    }
+                }
+
                 // Nothing else claimed the press, so it may be the start of a
                 // drag that moves the pill between the top and bottom of the
                 // screen. Capture so the move is followed even once the
@@ -7766,6 +7928,16 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 }
                 return 0;
             }
+            if (g_volumeDragging.load()) {
+                // Applied as it moves rather than on release, so the level is
+                // audible while the bar is being dragged.
+                const ScrubberHit vol =
+                    HitTestVolumeBar(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+                if (vol.valid) {
+                    ApplyVolumeFraction(vol.fraction);
+                }
+                return 0;
+            }
             break;
 
         case WM_LBUTTONUP:
@@ -7817,6 +7989,17 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     } else {
                         g_scrubFraction = -1.0f;
                     }
+                    g_layoutDirty = true;
+                    return 0;
+                }
+
+                if (g_volumeDragging.exchange(false)) {
+                    ReleaseCapture();
+                    const ScrubberHit vol = HitTestVolumeBar(xPos, yPos);
+                    if (vol.valid) {
+                        ApplyVolumeFraction(vol.fraction);
+                    }
+                    g_dragEndpointVolume.Reset();
                     g_layoutDirty = true;
                     return 0;
                 }
@@ -7954,6 +8137,10 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 g_scrubFraction = -1.0f;
                 g_layoutDirty = true;
             }
+            if (g_volumeDragging.exchange(false)) {
+                g_layoutDirty = true;
+            }
+            g_dragEndpointVolume.Reset();
             return 0;
 
         case WM_MBUTTONUP:
@@ -8124,7 +8311,8 @@ DWORD WINAPI RenderThreadProc(void*) {
                     g_state.notification.active = false;
                     snapshot.notification.active = false;
                 }
-                if (g_state.volume.active && now >= g_state.volume.expiresAt) {
+                if (g_state.volume.active && now >= g_state.volume.expiresAt &&
+                    !g_volumeDragging.load()) {
                     g_state.volume.active = false;
                     snapshot.volume.active = false;
                 }
@@ -8357,6 +8545,41 @@ DWORD WINAPI RenderThreadProc(void*) {
                     needsRender = true;
                 } else if (current != target) {
                     g_scrubEmphasis = target;
+                    needsRender = true;
+                }
+            }
+
+            // The volume bar's hover look, eased the same way. Whether the bar
+            // is on screen at all is settled by the published rectangle, so
+            // there is no page or activity to test here.
+            {
+                bool overVolume = g_volumeDragging.load();
+                if (!overVolume && hover) {
+                    POINT local = cursor;
+                    if (ScreenToClient(hwnd, &local)) {
+                        const ScrubberHit vol = HitTestVolumeBar(local.x, local.y);
+                        overVolume = vol.valid && vol.onBar;
+                    }
+                }
+
+                // Pointing at the bar holds the pill up. It is only draggable
+                // while it is showing, and the 1.8 seconds a volume change
+                // buys is not long enough to reach for it.
+                if (overVolume) {
+                    std::lock_guard lock(g_stateMutex);
+                    const double keepUntil = now + 1.0;
+                    if (g_state.volume.active && g_state.volume.expiresAt < keepUntil) {
+                        g_state.volume.expiresAt = keepUntil;
+                    }
+                }
+
+                const float target = overVolume ? 1.0f : 0.0f;
+                const float current = g_volumeEmphasis.load();
+                if (std::fabs(target - current) > 0.002f) {
+                    g_volumeEmphasis = current + (target - current) * std::min(1.0f, dt * 16.0f);
+                    needsRender = true;
+                } else if (current != target) {
+                    g_volumeEmphasis = target;
                     needsRender = true;
                 }
             }
