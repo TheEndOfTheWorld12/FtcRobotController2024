@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.13.0
+// @version         1.14.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -31,7 +31,8 @@ media, downloads, clipboard, battery, and more.
 - Clipboard, notification, volume, Caps/Num lock, device connect/disconnect and
   battery alerts.
 - Privacy dots stacked at the right edge: green for the camera, orange for the
-  microphone, blue for location.
+  microphone, blue for location. Hovering one opens a card naming every app
+  holding that capability open.
 - Optionally suppresses the Windows volume popup: the volume keys are handled
   by the mod itself and swallowed, so the shell never raises its flyout and
   the change shows only in the pill. The pill's own bar is draggable — click
@@ -466,6 +467,11 @@ struct SystemSnapshot {
     bool micActive = false;       // orange dot: microphone in use
     bool cameraActive = false;    // green dot: camera in use
     bool locationActive = false;  // blue dot: location in use
+    // Who is holding each of those open, for the popup a dot shows on hover.
+    // Sorted and de-duplicated, so the list does not reshuffle between polls.
+    std::vector<std::wstring> cameraApps;
+    std::vector<std::wstring> micApps;
+    std::vector<std::wstring> locationApps;
     std::wstring foregroundTitle;
     // Network / disk transfer rates, in bytes per second (system-wide).
     double netUpBps = 0.0;
@@ -658,6 +664,80 @@ struct AtomicRect {
         return x >= left.load() && x <= right.load() && y >= top.load() && y <= bottom.load();
     }
 };
+
+// The privacy dots, and the popup naming what is using that capability.
+// Indices are 0 camera, 1 microphone, 2 location — the order they are drawn
+// in — and -1 means the pointer is on none of them.
+std::atomic<int> g_hoveredPrivacyDot = -1;
+std::atomic<bool> g_privacyHitValid = false;
+AtomicRect g_privacyDotRectPx[3];
+AtomicRect g_privacyPopupRectPx;
+
+// The popup's size, in the unscaled units the pill is drawn in.
+constexpr float kPrivacyPopupWidth = 208.0f;
+constexpr float kPrivacyPopupGap = 8.0f;
+constexpr float kPrivacyPopupPadY = 8.0f;
+constexpr float kPrivacyPopupTitleH = 16.0f;
+constexpr float kPrivacyPopupRowH = 15.0f;
+constexpr int kPrivacyPopupMaxRows = 4;
+
+struct PrivacyPopupInfo {
+    bool valid = false;
+    std::wstring title;
+    D2D1_COLOR_F color = D2D1::ColorF(1, 1, 1, 1);
+    std::vector<std::wstring> rows;
+    float height = 0.0f;
+};
+
+// What the popup for a given dot says, and how tall it therefore is. The
+// window has to be sized before anything is drawn, so this is worked out up
+// front rather than discovered while drawing.
+PrivacyPopupInfo BuildPrivacyPopup(const SharedState& state, int dot) {
+    PrivacyPopupInfo info;
+
+    const std::vector<std::wstring>* apps = nullptr;
+    switch (dot) {
+        case 0:
+            if (!state.system.cameraActive) return info;
+            info.title = L"Camera";
+            info.color = D2D1::ColorF(0.133f, 0.776f, 0.239f, 1.0f);
+            apps = &state.system.cameraApps;
+            break;
+        case 1:
+            if (!state.system.micActive) return info;
+            info.title = L"Microphone";
+            info.color = D2D1::ColorF(1.000f, 0.584f, 0.000f, 1.0f);
+            apps = &state.system.micApps;
+            break;
+        case 2:
+            if (!state.system.locationActive) return info;
+            info.title = L"Location";
+            info.color = D2D1::ColorF(0.000f, 0.478f, 1.000f, 1.0f);
+            apps = &state.system.locationApps;
+            break;
+        default:
+            return info;
+    }
+
+    if (apps->empty()) {
+        // The capability reads as in use but nothing owned up to it — usually
+        // a driver or a service rather than an app with a name.
+        info.rows.push_back(L"In use");
+    } else if (static_cast<int>(apps->size()) <= kPrivacyPopupMaxRows) {
+        info.rows = *apps;
+    } else {
+        info.rows.assign(apps->begin(), apps->begin() + (kPrivacyPopupMaxRows - 1));
+        wchar_t more[32];
+        swprintf_s(more, L"and %d more",
+                   static_cast<int>(apps->size()) - (kPrivacyPopupMaxRows - 1));
+        info.rows.push_back(more);
+    }
+
+    info.valid = true;
+    info.height = kPrivacyPopupPadY * 2.0f + kPrivacyPopupTitleH +
+                  kPrivacyPopupRowH * static_cast<float>(info.rows.size());
+    return info;
+}
 
 AtomicRect g_goToMediaRectPx;
 AtomicRect g_prevSourceRectPx;
@@ -3639,83 +3719,226 @@ void UpdateSystemSnapshot() {
 }
 
 // ---- Privacy indicator helpers ----
-bool IsDeviceActiveViaRegistry(const wchar_t* capability) {
-    bool isActive = false;
-    std::wstring basePath = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\";
-    basePath += capability;
+//
+// Windows records every use of the camera, the microphone and location under
+// CapabilityAccessManager\ConsentStore. Each app gets a subkey, and while it
+// still holds the capability its LastUsedTimeStop is zero. Packaged apps are
+// keyed by package family name; desktop apps hang under NonPackaged, keyed by
+// their full path with the separators written as '#'.
 
-    auto CheckSubkeys = [](HKEY hKeyParent) -> bool {
-        DWORD index = 0;
-        wchar_t subKeyName[256];
-        DWORD nameLen = ARRAYSIZE(subKeyName);
-        while (RegEnumKeyExW(hKeyParent, index, subKeyName, &nameLen, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
-            HKEY hSub;
-            if (RegOpenKeyExW(hKeyParent, subKeyName, 0, KEY_READ, &hSub) == ERROR_SUCCESS) {
-                if (_wcsicmp(subKeyName, L"NonPackaged") == 0) {
-                    DWORD npIndex = 0;
-                    wchar_t npSubKeyName[256];
-                    DWORD npNameLen = ARRAYSIZE(npSubKeyName);
-                    while (RegEnumKeyExW(hSub, npIndex, npSubKeyName, &npNameLen, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
-                        HKEY hNpSub;
-                        if (RegOpenKeyExW(hSub, npSubKeyName, 0, KEY_READ, &hNpSub) == ERROR_SUCCESS) {
-                            uint64_t stopTime = 1;
-                            DWORD dataSize = sizeof(stopTime);
-                            if (RegQueryValueExW(hNpSub, L"LastUsedTimeStop", nullptr, nullptr, reinterpret_cast<LPBYTE>(&stopTime), &dataSize) == ERROR_SUCCESS) {
-                                if (stopTime == 0) {
-                                    RegCloseKey(hNpSub);
-                                    RegCloseKey(hSub);
-                                    return true;
-                                }
-                            }
-                            RegCloseKey(hNpSub);
-                        }
-                        npIndex++;
-                        npNameLen = ARRAYSIZE(npSubKeyName);
-                    }
-                } else {
-                    uint64_t stopTime = 1;
-                    DWORD dataSize = sizeof(stopTime);
-                    if (RegQueryValueExW(hSub, L"LastUsedTimeStop", nullptr, nullptr, reinterpret_cast<LPBYTE>(&stopTime), &dataSize) == ERROR_SUCCESS) {
-                        if (stopTime == 0) {
-                            RegCloseKey(hSub);
-                            return true;
-                        }
-                    }
-                }
-                RegCloseKey(hSub);
-            }
-            index++;
-            nameLen = ARRAYSIZE(subKeyName);
+// A desktop app's own name for itself, from the version resource. Loaded
+// dynamically so the mod does not have to link version.dll for a name that is
+// only ever nice to have.
+std::wstring ExecutableFileDescription(const std::wstring& path) {
+    using GetFileVersionInfoSizeW_t = DWORD(WINAPI*)(LPCWSTR, LPDWORD);
+    using GetFileVersionInfoW_t = BOOL(WINAPI*)(LPCWSTR, DWORD, DWORD, LPVOID);
+    using VerQueryValueW_t = BOOL(WINAPI*)(LPCVOID, LPCWSTR, LPVOID*, PUINT);
+
+    static HMODULE s_versionDll = LoadLibraryW(L"version.dll");
+    static auto s_getSize = reinterpret_cast<GetFileVersionInfoSizeW_t>(
+        s_versionDll ? GetProcAddress(s_versionDll, "GetFileVersionInfoSizeW") : nullptr);
+    static auto s_getInfo = reinterpret_cast<GetFileVersionInfoW_t>(
+        s_versionDll ? GetProcAddress(s_versionDll, "GetFileVersionInfoW") : nullptr);
+    static auto s_query = reinterpret_cast<VerQueryValueW_t>(
+        s_versionDll ? GetProcAddress(s_versionDll, "VerQueryValueW") : nullptr);
+
+    if (!s_getSize || !s_getInfo || !s_query) {
+        return std::wstring();
+    }
+
+    DWORD ignored = 0;
+    const DWORD size = s_getSize(path.c_str(), &ignored);
+    if (size == 0) {
+        return std::wstring();
+    }
+
+    std::vector<BYTE> buffer(size);
+    if (!s_getInfo(path.c_str(), ignored, size, buffer.data())) {
+        return std::wstring();
+    }
+
+    struct LangCodePage {
+        WORD language;
+        WORD codePage;
+    };
+    LangCodePage* translation = nullptr;
+    UINT translationBytes = 0;
+    if (!s_query(buffer.data(), L"\\VarFileInfo\\Translation",
+                 reinterpret_cast<void**>(&translation), &translationBytes) ||
+        !translation || translationBytes < sizeof(LangCodePage)) {
+        return std::wstring();
+    }
+
+    wchar_t subBlock[64];
+    swprintf_s(subBlock, L"\\StringFileInfo\\%04x%04x\\FileDescription",
+               translation->language, translation->codePage);
+
+    wchar_t* description = nullptr;
+    UINT descriptionChars = 0;
+    if (!s_query(buffer.data(), subBlock, reinterpret_cast<void**>(&description),
+                 &descriptionChars) ||
+        !description) {
+        return std::wstring();
+    }
+
+    size_t length = 0;
+    while (length < descriptionChars && description[length] != L'\0') {
+        ++length;
+    }
+    std::wstring name(description, length);
+    while (!name.empty() && (name.back() == L' ' || name.back() == L'\t')) {
+        name.pop_back();
+    }
+    return name;
+}
+
+// "WindowsCamera" reads better as "Windows Camera".
+std::wstring SplitCamelCase(const std::wstring& text) {
+    std::wstring out;
+    out.reserve(text.size() + 4);
+    for (size_t i = 0; i < text.size(); ++i) {
+        const wchar_t c = text[i];
+        const wchar_t prev = i > 0 ? text[i - 1] : L'\0';
+        const bool upper = c >= L'A' && c <= L'Z';
+        const bool prevLower = (prev >= L'a' && prev <= L'z') || (prev >= L'0' && prev <= L'9');
+        if (upper && prevLower) {
+            out.push_back(L' ');
         }
-        return false;
+        out.push_back(c);
+    }
+    return out;
+}
+
+// Turns a ConsentStore subkey into the name the user knows the app by. The
+// lookup reads the executable's version resource, so the answers are cached:
+// this runs on the render thread every couple of seconds.
+std::wstring FriendlyCapabilityAppName(const std::wstring& keyName, bool nonPackaged) {
+    static std::unordered_map<std::wstring, std::wstring> s_cache;
+    auto cached = s_cache.find(keyName);
+    if (cached != s_cache.end()) {
+        return cached->second;
+    }
+
+    std::wstring name;
+    if (nonPackaged) {
+        std::wstring path = keyName;
+        for (wchar_t& c : path) {
+            if (c == L'#') {
+                c = L'\\';
+            }
+        }
+
+        name = ExecutableFileDescription(path);
+        if (name.empty()) {
+            // No version resource, so fall back to the file name: "chrome.exe"
+            // at least tells the user which program it was.
+            const size_t slash = path.find_last_of(L'\\');
+            std::wstring leaf = slash == std::wstring::npos ? path : path.substr(slash + 1);
+            const size_t dot = leaf.find_last_of(L'.');
+            if (dot != std::wstring::npos && dot > 0) {
+                leaf = leaf.substr(0, dot);
+            }
+            if (!leaf.empty() && leaf[0] >= L'a' && leaf[0] <= L'z') {
+                leaf[0] = static_cast<wchar_t>(leaf[0] - L'a' + L'A');
+            }
+            name = leaf;
+        }
+    } else {
+        // A package family name: "Microsoft.WindowsCamera_8wekyb3d8bbwe". The
+        // publisher hash and the reverse-DNS prefix are noise; what is left is
+        // close enough to the display name without dragging in the packaging
+        // APIs for it.
+        std::wstring identifier = keyName;
+        const size_t underscore = identifier.find_last_of(L'_');
+        if (underscore != std::wstring::npos && underscore > 0) {
+            identifier = identifier.substr(0, underscore);
+        }
+        const size_t dot = identifier.find_last_of(L'.');
+        if (dot != std::wstring::npos && dot + 1 < identifier.size()) {
+            identifier = identifier.substr(dot + 1);
+        }
+        name = SplitCamelCase(identifier);
+    }
+
+    if (name.empty()) {
+        name = keyName;
+    }
+    if (name.size() > 30) {
+        name = name.substr(0, 29) + L"…";
+    }
+
+    s_cache[keyName] = name;
+    return name;
+}
+
+// Every app currently holding the capability open, named. An empty list means
+// nothing is using it.
+std::vector<std::wstring> AppsUsingCapability(const wchar_t* capability) {
+    std::vector<std::wstring> apps;
+
+    auto stillInUse = [](HKEY key) {
+        uint64_t stopTime = 1;
+        DWORD dataSize = sizeof(stopTime);
+        return RegQueryValueExW(key, L"LastUsedTimeStop", nullptr, nullptr,
+                                reinterpret_cast<LPBYTE>(&stopTime), &dataSize) == ERROR_SUCCESS &&
+               stopTime == 0;
     };
 
-    HKEY hKey;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, basePath.c_str(), 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        isActive = CheckSubkeys(hKey);
-        RegCloseKey(hKey);
-    }
-
-    if (!isActive) {
-        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, basePath.c_str(), 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-            isActive = CheckSubkeys(hKey);
-            RegCloseKey(hKey);
+    auto collect = [&](HKEY parent) {
+        DWORD index = 0;
+        wchar_t subKeyName[512];
+        DWORD nameLen = ARRAYSIZE(subKeyName);
+        while (RegEnumKeyExW(parent, index, subKeyName, &nameLen, nullptr, nullptr, nullptr,
+                             nullptr) == ERROR_SUCCESS) {
+            HKEY sub = nullptr;
+            if (RegOpenKeyExW(parent, subKeyName, 0, KEY_READ, &sub) == ERROR_SUCCESS) {
+                if (_wcsicmp(subKeyName, L"NonPackaged") == 0) {
+                    DWORD npIndex = 0;
+                    wchar_t npName[512];
+                    DWORD npNameLen = ARRAYSIZE(npName);
+                    while (RegEnumKeyExW(sub, npIndex, npName, &npNameLen, nullptr, nullptr,
+                                         nullptr, nullptr) == ERROR_SUCCESS) {
+                        HKEY npSub = nullptr;
+                        if (RegOpenKeyExW(sub, npName, 0, KEY_READ, &npSub) == ERROR_SUCCESS) {
+                            if (stillInUse(npSub)) {
+                                apps.push_back(FriendlyCapabilityAppName(npName, true));
+                            }
+                            RegCloseKey(npSub);
+                        }
+                        ++npIndex;
+                        npNameLen = ARRAYSIZE(npName);
+                    }
+                } else if (stillInUse(sub)) {
+                    apps.push_back(FriendlyCapabilityAppName(subKeyName, false));
+                }
+                RegCloseKey(sub);
+            }
+            ++index;
+            nameLen = ARRAYSIZE(subKeyName);
         }
+    };
+
+    std::wstring path =
+        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\";
+    path += capability;
+
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, path.c_str(), 0, KEY_READ, &key) == ERROR_SUCCESS) {
+        collect(key);
+        RegCloseKey(key);
+    }
+    // Both hives are read: a service using the camera is recorded per-machine
+    // rather than under the signed-in user.
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, path.c_str(), 0, KEY_READ, &key) == ERROR_SUCCESS) {
+        collect(key);
+        RegCloseKey(key);
     }
 
-    return isActive;
-}
-
-bool IsMicrophoneActive() {
-    return IsDeviceActiveViaRegistry(L"microphone");
-}
-
-bool IsCameraActive() {
-    return IsDeviceActiveViaRegistry(L"webcam");
-}
-
-bool IsLocationActive() {
-    return IsDeviceActiveViaRegistry(L"location");
+    // The same app can appear in both hives, and sorting keeps the popup from
+    // reshuffling its rows between polls.
+    std::sort(apps.begin(), apps.end());
+    apps.erase(std::unique(apps.begin(), apps.end()), apps.end());
+    return apps;
 }
 
 void UpdateProgressSnapshot() {
@@ -3854,13 +4077,17 @@ void HideSystemVolumeOsd(int volumePercent, bool muted) {
 }
 
 void UpdatePrivacyIndicators() {
-    const bool mic = IsMicrophoneActive();
-    const bool cam = IsCameraActive();
-    const bool location = IsLocationActive();
+    std::vector<std::wstring> mic = AppsUsingCapability(L"microphone");
+    std::vector<std::wstring> cam = AppsUsingCapability(L"webcam");
+    std::vector<std::wstring> location = AppsUsingCapability(L"location");
+
     std::lock_guard lock(g_stateMutex);
-    g_state.system.micActive = mic;
-    g_state.system.cameraActive = cam;
-    g_state.system.locationActive = location;
+    g_state.system.micActive = !mic.empty();
+    g_state.system.cameraActive = !cam.empty();
+    g_state.system.locationActive = !location.empty();
+    g_state.system.micApps = std::move(mic);
+    g_state.system.cameraApps = std::move(cam);
+    g_state.system.locationApps = std::move(location);
 }
 
 std::wstring ReadClipboardText(HWND hwnd) {
@@ -4630,8 +4857,24 @@ class Renderer {
                 const std::optional<Activity>& secondary, float width, float height,
                 float nudge, bool hover, bool pinned, double now) {
         EnsureTextFormats(settings.sizeScale);
+
+        // A hovered privacy dot opens a popup that hangs off the pill, so the
+        // window has to be tall enough to hold it. The extra room is added on
+        // the far side from whichever edge the pill is anchored to, and the
+        // pill is then drawn that much further in, so it does not shift when
+        // the popup appears. The few spare pixels cover the 2.5% hover
+        // inflation and the nudge spring.
+        const float scaleForPopup = std::max(settings.sizeScale, 0.01f);
+        privacyPopup_ = BuildPrivacyPopup(state, g_hoveredPrivacyDot.load());
+        privacyPopupBelow_ = EffectivePosition() != Position::BottomCenter;
+        const float popupExtra =
+            privacyPopup_.valid
+                ? (privacyPopup_.height + kPrivacyPopupGap) * scaleForPopup + 6.0f
+                : 0.0f;
+
         const int pixelWidth = std::max(1, static_cast<int>(std::ceil(width + kRenderPadX * 2.0f)));
-        const int pixelHeight = std::max(1, static_cast<int>(std::ceil(height + kRenderPadY * 2.0f)));
+        const int pixelHeight =
+            std::max(1, static_cast<int>(std::ceil(height + popupExtra + kRenderPadY * 2.0f)));
 
         if (pixelWidth != bitmapWidth_ || pixelHeight != bitmapHeight_) {
             if (!CreateBackingBitmap(pixelWidth, pixelHeight)) {
@@ -4658,11 +4901,12 @@ class Renderer {
         // controls, so a stale rectangle can never take a click.
         g_mediaHitValid = false;
         g_volumeHitValid = false;
+        g_privacyHitValid = false;
 
         const float hoverScale = hover || pinned ? 1.025f : 1.0f;
         const float scale = hoverScale;
 
-        const float top = kRenderPadY + nudge;
+        const float top = kRenderPadY + nudge + (privacyPopupBelow_ ? 0.0f : popupExtra);
         const float left = kRenderPadX;
 
         if (width >= 2.0f && height >= 2.0f) {
@@ -5021,10 +5265,43 @@ class Renderer {
         const float centreY = (rect.top + rect.bottom) * 0.5f;
         float y = centreY - ((count - 1) * step) * 0.5f;
 
-        for (const Indicator& indicator : indicators) {
+        // Only one pill owns the dots' hit-testing and the popup. Two pills
+        // can be on screen at once and both draw their own dots, but a popup
+        // from each would be nonsense, so the first one drawn takes it.
+        const bool ownsPopup = !g_privacyHitValid.exchange(true);
+        const float pcx = (rect.left + rect.right) * 0.5f;
+        const float pcy = (rect.top + rect.bottom) * 0.5f;
+        auto publish = [&](AtomicRect& target, float l, float t, float r, float b) {
+            target.Set(pcx + (l - pcx) * sizeScale_, pcy + (t - pcy) * sizeScale_,
+                       pcx + (r - pcx) * sizeScale_, pcy + (b - pcy) * sizeScale_);
+        };
+        if (ownsPopup) {
+            // An empty rectangle rather than a zeroed one: a zeroed rectangle
+            // would swallow a click at the very corner of the window.
+            for (AtomicRect& dotRect : g_privacyDotRectPx) {
+                dotRect.Set(0.0f, 0.0f, -1.0f, -1.0f);
+            }
+            g_privacyPopupRectPx.Set(0.0f, 0.0f, -1.0f, -1.0f);
+        }
+
+        int drawn = 0;
+        for (int index = 0; index < static_cast<int>(ARRAYSIZE(indicators)); ++index) {
+            const Indicator& indicator = indicators[index];
             if (!indicator.active) {
                 continue;
             }
+
+            // A 7-unit dot is nothing to aim at, so each one owns a band: the
+            // full width from just left of the column to the pill's edge, and
+            // vertically the half-step to each neighbour, with the outermost
+            // dots keeping whatever overshoots the column.
+            if (ownsPopup) {
+                const float topEdge = y - (drawn == 0 ? 9.0f : step * 0.5f);
+                const float bottomEdge = y + (drawn == count - 1 ? 9.0f : step * 0.5f);
+                publish(g_privacyDotRectPx[index], dotX - dotR - 16.0f, topEdge,
+                        rect.right - 2.0f, bottomEdge);
+            }
+            ++drawn;
 
             D2D1_COLOR_F color = indicator.color;
             color.a = pulse * settingsOpacity_;
@@ -5045,6 +5322,98 @@ class Renderer {
             }
             y += step;
         }
+
+        if (ownsPopup && privacyPopup_.valid) {
+            DrawPrivacyPopup(rect);
+        }
+    }
+
+    // The card a dot opens: which capability, and everything holding it open.
+    // It hangs off the pill on the side away from the screen edge the pill is
+    // anchored to, right-aligned under the dots it belongs to.
+    void DrawPrivacyPopup(D2D1_RECT_F rect) {
+        const float pcx = (rect.left + rect.right) * 0.5f;
+        const float pcy = (rect.top + rect.bottom) * 0.5f;
+
+        // It may reach past the pill's left edge into the window's padding,
+        // which is the only spare room there is — the window is not widened
+        // for it, since that would slide a centred pill sideways.
+        const float room = (rect.right - rect.left) - 2.0f + kRenderPadX / sizeScale_;
+        const float cardW = std::min(kPrivacyPopupWidth, room);
+        if (cardW < 90.0f) {
+            return;
+        }
+
+        const float cardRight = rect.right - 2.0f;
+        const float cardLeft = cardRight - cardW;
+        const float cardTop = privacyPopupBelow_
+                                  ? rect.bottom + kPrivacyPopupGap
+                                  : rect.top - kPrivacyPopupGap - privacyPopup_.height;
+        const float cardBottom = cardTop + privacyPopup_.height;
+        const D2D1_RECT_F card = D2D1::RectF(cardLeft, cardTop, cardRight, cardBottom);
+
+        // Published so that resting the pointer on the card keeps it open —
+        // it sits outside the pill, where no dot would hold it. The area
+        // reaches back over the gap to the pill's edge, so the pointer never
+        // crosses a strip belonging to neither and shuts the card on its way.
+        const float hitTop = privacyPopupBelow_ ? rect.bottom - 2.0f : cardTop - 4.0f;
+        const float hitBottom = privacyPopupBelow_ ? cardBottom + 4.0f : rect.top + 2.0f;
+        g_privacyPopupRectPx.Set(pcx + (cardLeft - 3.0f - pcx) * sizeScale_,
+                                 pcy + (hitTop - pcy) * sizeScale_,
+                                 pcx + (cardRight + 3.0f - pcx) * sizeScale_,
+                                 pcy + (hitBottom - pcy) * sizeScale_);
+
+        D2D1_COLOR_F bg = pillBgColor_;
+        bg.a = 0.97f * settingsOpacity_;
+        ComPtr<ID2D1SolidColorBrush> cardBrush;
+        target_->CreateSolidColorBrush(bg, &cardBrush);
+        if (!cardBrush) {
+            return;
+        }
+        target_->FillRoundedRectangle(D2D1::RoundedRect(card, 9.0f, 9.0f), cardBrush.Get());
+
+        D2D1_COLOR_F edge = privacyPopup_.color;
+        edge.a = 0.45f * settingsOpacity_;
+        ComPtr<ID2D1SolidColorBrush> edgeBrush;
+        target_->CreateSolidColorBrush(edge, &edgeBrush);
+        if (edgeBrush) {
+            target_->DrawRoundedRectangle(D2D1::RoundedRect(card, 9.0f, 9.0f), edgeBrush.Get(),
+                                          1.0f);
+        }
+
+        const float padX = 10.0f;
+        const float titleY = cardTop + kPrivacyPopupPadY;
+        // Every page restores this before it returns, but the card is drawn
+        // after all of them and a stray alignment would be hard to spot.
+        smallTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+
+        D2D1_COLOR_F dotColor = privacyPopup_.color;
+        dotColor.a = settingsOpacity_;
+        ComPtr<ID2D1SolidColorBrush> dotBrush;
+        target_->CreateSolidColorBrush(dotColor, &dotBrush);
+        if (dotBrush) {
+            target_->FillEllipse(
+                D2D1::Ellipse(D2D1::Point2F(cardLeft + padX + 3.0f, titleY + 7.0f), 3.0f, 3.0f),
+                dotBrush.Get());
+            target_->DrawTextW(privacyPopup_.title.c_str(),
+                               static_cast<UINT32>(privacyPopup_.title.size()),
+                               smallTextFormat_.Get(),
+                               D2D1::RectF(cardLeft + padX + 12.0f, titleY, cardRight - padX,
+                                           titleY + kPrivacyPopupTitleH + 3.0f),
+                               dotBrush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+
+        float rowY = titleY + kPrivacyPopupTitleH;
+        textBrush_->SetOpacity(0.92f);
+        for (const std::wstring& row : privacyPopup_.rows) {
+            target_->DrawTextW(row.c_str(), static_cast<UINT32>(row.size()),
+                               smallTextFormat_.Get(),
+                               D2D1::RectF(cardLeft + padX, rowY, cardRight - padX,
+                                           rowY + kPrivacyPopupRowH + 3.0f),
+                               textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            rowY += kPrivacyPopupRowH;
+        }
+        textBrush_->SetOpacity(0.90f);
     }
 
     void DrawPillSurface(D2D1_RECT_F rect, float radius, IslandKind kind, bool w11Style) {
@@ -7341,6 +7710,10 @@ class Renderer {
     float settingsOpacity_ = 0.96f;
     float sizeScale_ = 1.0f;
     D2D1_COLOR_F pillBgColor_ = D2D1::ColorF(0.051f, 0.051f, 0.059f, 1.0f);
+    // Settled at the top of the frame, because the window has to be sized for
+    // the popup before anything is drawn into it.
+    PrivacyPopupInfo privacyPopup_;
+    bool privacyPopupBelow_ = true;
 };
 
 Activity ActivityForKind(IslandKind kind, const Settings& settings, const SharedState& state) {
@@ -8580,6 +8953,33 @@ DWORD WINAPI RenderThreadProc(void*) {
                     needsRender = true;
                 } else if (current != target) {
                     g_volumeEmphasis = target;
+                    needsRender = true;
+                }
+            }
+
+            // Which privacy dot the pointer is resting on. Staying on the card
+            // it opened counts as staying on the dot: the card hangs outside
+            // the pill, so it would otherwise close the moment it was aimed at.
+            {
+                int hoveredDot = -1;
+                if (hover && g_privacyHitValid.load()) {
+                    POINT local = cursor;
+                    if (ScreenToClient(hwnd, &local)) {
+                        const float x = static_cast<float>(local.x);
+                        const float y = static_cast<float>(local.y);
+                        for (int i = 0; i < 3; ++i) {
+                            if (g_privacyDotRectPx[i].Contains(x, y)) {
+                                hoveredDot = i;
+                                break;
+                            }
+                        }
+                        if (hoveredDot < 0 && g_privacyPopupRectPx.Contains(x, y)) {
+                            hoveredDot = g_hoveredPrivacyDot.load();
+                        }
+                    }
+                }
+                if (g_hoveredPrivacyDot.exchange(hoveredDot) != hoveredDot) {
+                    g_layoutDirty = true;
                     needsRender = true;
                 }
             }
