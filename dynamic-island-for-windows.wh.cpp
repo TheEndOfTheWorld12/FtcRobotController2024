@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.15.0
+// @version         1.16.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -43,7 +43,10 @@ media, downloads, clipboard, battery, and more.
 - Resting pill shows the weather at a glance — icon and temperature, then
   place and condition, feels-like, humidity and wind. No clock: the date and
   time live on the calendar page one hover away.
-- Idle dashboard with calendar and live weather.
+- Idle dashboard with calendar and live weather. The weather page carries
+  feels-like, humidity, dew point, wind, chance of precipitation, UV index,
+  air quality, visibility and pressure; the resting pill keeps its short
+  summary.
 - **System stats pages** (scroll on the pill, or click its left/right half,
   to flip between pages):
   - **CPU & Memory** — CPU usage, average ACPI CPU temperature (shown in both
@@ -531,6 +534,15 @@ struct WeatherSnapshot {
     std::wstring windDir;
     std::wstring humidity;
     std::wstring feelsLike;
+    // The extra readings the expanded page carries, already formatted with
+    // their units. Empty means the service did not return one, and that row is
+    // then left out rather than shown as a blank.
+    std::wstring precipChance;
+    std::wstring uvIndex;
+    std::wstring airQuality;
+    std::wstring visibility;
+    std::wstring dewPoint;
+    std::wstring pressure;
     double lastUpdated = 0.0;
 };
 
@@ -2479,6 +2491,43 @@ static bool ParseJsonNumber(const char* object, const char* key, double* out) {
     return true;
 }
 
+// Pulls one element out of a JSON array of numbers, e.g. "uv_index":[0,0,3.1].
+// Open-Meteo writes null where it has no value, which reads here as missing.
+static bool ParseJsonArrayNumber(const char* object, const char* key, int index, double* out) {
+    if (!object || !key || !out || index < 0) {
+        return false;
+    }
+    const char* found = strstr(object, key);
+    if (!found) {
+        return false;
+    }
+    found = strchr(found + strlen(key), '[');
+    if (!found) {
+        return false;
+    }
+    ++found;
+
+    for (int i = 0; i < index; ++i) {
+        const char* comma = strchr(found, ',');
+        const char* close = strchr(found, ']');
+        if (!comma || (close && comma > close)) {
+            return false;  // the array ended before the wanted element
+        }
+        found = comma + 1;
+    }
+
+    while (*found == ' ') {
+        ++found;
+    }
+    char* stop = nullptr;
+    const double value = strtod(found, &stop);
+    if (stop == found) {
+        return false;  // null, or nothing left
+    }
+    *out = value;
+    return true;
+}
+
 // wttr.in's nearest_area block carries the coordinates it resolved to.
 static bool ParseWttrCoordinates(const char* response, double* latitude, double* longitude) {
     const char* area = strstr(response, "\"nearest_area\":");
@@ -2632,6 +2681,108 @@ static bool FetchOpenMeteo(double latitude, double longitude, bool isFahrenheit,
     return true;
 }
 
+// The readings the expanded weather page adds to the four the pill already
+// showed. They are fetched separately from the main call on purpose: that call
+// is what the pill lives on, and a mistake in one of these variable names
+// would make Open-Meteo reject the whole request and leave the pill with no
+// weather at all. Asked for on their own, a failure costs only these rows.
+struct OpenMeteoExtras {
+    std::wstring precipChance;
+    std::wstring uvIndex;
+    std::wstring visibility;
+    std::wstring dewPoint;
+    std::wstring pressure;
+};
+
+static bool FetchOpenMeteoExtras(double latitude, double longitude, bool isImperial,
+                                 OpenMeteoExtras* out) {
+    if (!out) {
+        return false;
+    }
+
+    // These five exist as hourly series rather than as current values, so a
+    // day of them is asked for and the current hour picked out. No timezone is
+    // requested, which means the series starts at 00:00 UTC and the index is
+    // simply the current UTC hour — no parsing of timestamps, and nothing to
+    // get wrong across a date line or a daylight-saving change.
+    wchar_t url[512] = {};
+    swprintf_s(url,
+               L"/v1/forecast?latitude=%.4f&longitude=%.4f&hourly=precipitation_probability,"
+               L"uv_index,visibility,dew_point_2m,pressure_msl&forecast_days=1%s",
+               latitude, longitude, isImperial ? L"&temperature_unit=fahrenheit" : L"");
+
+    const std::string response = HttpGet(L"api.open-meteo.com", url, true);
+    if (response.empty()) {
+        return false;
+    }
+    const char* hourly = strstr(response.c_str(), "\"hourly\":");
+    if (!hourly) {
+        return false;
+    }
+
+    SYSTEMTIME utc = {};
+    GetSystemTime(&utc);
+    const int hour = static_cast<int>(utc.wHour);
+
+    wchar_t buf[32] = {};
+    double value = 0.0;
+
+    if (ParseJsonArrayNumber(hourly, "\"precipitation_probability\"", hour, &value)) {
+        swprintf_s(buf, L"%.0f%%", value);
+        out->precipChance = buf;
+    }
+    if (ParseJsonArrayNumber(hourly, "\"uv_index\"", hour, &value)) {
+        swprintf_s(buf, L"%.0f", value);
+        out->uvIndex = buf;
+    }
+    if (ParseJsonArrayNumber(hourly, "\"visibility\"", hour, &value)) {
+        // Reported in metres whatever else was asked for.
+        if (isImperial) {
+            swprintf_s(buf, L"%.1f mi", value / 1609.344);
+        } else {
+            swprintf_s(buf, L"%.1f km", value / 1000.0);
+        }
+        out->visibility = buf;
+    }
+    if (ParseJsonArrayNumber(hourly, "\"dew_point_2m\"", hour, &value)) {
+        swprintf_s(buf, L"%.0f\x00B0", value);
+        out->dewPoint = buf;
+    }
+    if (ParseJsonArrayNumber(hourly, "\"pressure_msl\"", hour, &value)) {
+        if (isImperial) {
+            swprintf_s(buf, L"%.2f in", value * 0.02953);
+        } else {
+            swprintf_s(buf, L"%.0f hPa", value);
+        }
+        out->pressure = buf;
+    }
+    return true;
+}
+
+// Air quality is a different Open-Meteo service, so it is a request of its own
+// and its own kind of failure.
+static std::wstring FetchAirQualityIndex(double latitude, double longitude) {
+    wchar_t url[256] = {};
+    swprintf_s(url, L"/v1/air-quality?latitude=%.4f&longitude=%.4f&current=us_aqi", latitude,
+               longitude);
+
+    const std::string response = HttpGet(L"air-quality-api.open-meteo.com", url, true);
+    if (response.empty()) {
+        return std::wstring();
+    }
+    const char* current = strstr(response.c_str(), "\"current\":");
+    if (!current) {
+        return std::wstring();
+    }
+    double value = 0.0;
+    if (!ParseJsonNumber(current, "\"us_aqi\"", &value)) {
+        return std::wstring();
+    }
+    wchar_t buf[32] = {};
+    swprintf_s(buf, L"%.0f", value);
+    return buf;
+}
+
 DWORD WINAPI WeatherThreadProc(void*) {
     // Initial delay to avoid slowing down startup
     WaitForSingleObject(g_stopEvent, 3000);
@@ -2759,6 +2910,8 @@ DWORD WINAPI WeatherThreadProc(void*) {
             }
 
             // wttr.in named the place; Open-Meteo supplies the readings.
+            OpenMeteoExtras extras;
+            std::wstring airQuality;
             double latitude = 0.0;
             double longitude = 0.0;
             if (ParseWttrCoordinates(wRes.c_str(), &latitude, &longitude)) {
@@ -2778,6 +2931,13 @@ DWORD WINAPI WeatherThreadProc(void*) {
                            latitude, longitude, temp, feelsLike.c_str(), humidity.c_str(),
                            windSpeed.c_str(), windDir.c_str(), desc.c_str());
                 }
+
+                // Only the expanded page shows these, and neither failure
+                // costs anything the pill was already showing.
+                if (!FetchOpenMeteoExtras(latitude, longitude, isFahrenheit, &extras)) {
+                    Wh_Log(L"Weather: the extra readings could not be fetched.");
+                }
+                airQuality = FetchAirQualityIndex(latitude, longitude);
             } else {
                 Wh_Log(L"Weather: no coordinates in the wttr.in response; "
                        L"showing its own readings.");
@@ -2795,6 +2955,12 @@ DWORD WINAPI WeatherThreadProc(void*) {
                 g_state.weather.windDir = windDir;
                 g_state.weather.humidity = humidity;
                 g_state.weather.feelsLike = feelsLike;
+                g_state.weather.precipChance = extras.precipChance;
+                g_state.weather.uvIndex = extras.uvIndex;
+                g_state.weather.visibility = extras.visibility;
+                g_state.weather.dewPoint = extras.dewPoint;
+                g_state.weather.pressure = extras.pressure;
+                g_state.weather.airQuality = airQuality;
                 g_state.weather.lastUpdated = NowSeconds();
             }
         } else {
@@ -5841,23 +6007,70 @@ class Renderer {
                                            rect.left + 191.5f * scale, rect.bottom - 38.0f * scale),
                               0.5f * scale, 0.5f * scale), divider.Get());
 
-        std::wstring line3 = hasWeather ? L"Wind: " + state.weather.windSpeed + (settings.weatherFahrenheit ? L" mph " : L" km/h ") + state.weather.windDir : L"Updated recently";
-        std::wstring line4 = hasWeather ? L"Feels Like: " + state.weather.feelsLike + L"\x00B0" : L"";
-        std::wstring line5 = hasWeather ? L"Humidity: " + state.weather.humidity + L"%" : L"";
+        // The readings run down the right-hand side, label muted on the left
+        // and value bright and right-aligned, in the same shape the system
+        // pages use. Anything a service did not return is left out rather than
+        // shown blank, so the list closes up instead of leaving gaps.
+        const float rowLeft = rect.left + 200.0f * scale;
+        const float rowRight = rect.right - 34.0f * scale;  // clear of the page dots
+        const float rowWidth = rowRight - rowLeft;
+        const float rowHeight = 18.0f * scale;
+        const float rowStep = 15.0f * scale;
+        float rowY = rect.top + 32.0f * scale;
+        // "Precipitation" is wider than its half of the row, and wrapped onto a
+        // second line it would be clipped mid-word.
+        smallTextFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
 
-        mutedBrush_->SetOpacity(0.70f);
+        auto row = [&](const wchar_t* label, const std::wstring& value) {
+            if (value.empty()) {
+                return;
+            }
+            // The two rects overlap in the middle, so a long label and a long
+            // value meet rather than one pushing the other off the page.
+            mutedBrush_->SetOpacity(0.55f);
+            target_->DrawTextW(label, static_cast<UINT32>(wcslen(label)), smallTextFormat_.Get(),
+                               D2D1::RectF(rowLeft, rowY, rowLeft + rowWidth * 0.66f,
+                                           rowY + rowHeight),
+                               mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
-        D2D1_RECT_F rightLine3 = D2D1::RectF(rect.left + 215.0f * scale, rect.top + 55.0f * scale, rect.right, rect.bottom);
-        target_->DrawTextW(line3.c_str(), static_cast<UINT32>(line3.length()), textFormat_.Get(),
-                           rightLine3, mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+            smallTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+            textBrush_->SetOpacity(0.95f);
+            target_->DrawTextW(value.c_str(), static_cast<UINT32>(value.size()),
+                               smallTextFormat_.Get(),
+                               D2D1::RectF(rowLeft + rowWidth * 0.48f, rowY, rowRight,
+                                           rowY + rowHeight),
+                               textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            smallTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            rowY += rowStep;
+        };
 
-        D2D1_RECT_F rightLine4 = D2D1::RectF(rect.left + 215.0f * scale, rect.top + 85.0f * scale, rect.right, rect.bottom);
-        target_->DrawTextW(line4.c_str(), static_cast<UINT32>(line4.length()), textFormat_.Get(),
-                           rightLine4, mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+        if (hasWeather) {
+            const WeatherSnapshot& w = state.weather;
 
-        D2D1_RECT_F rightLine5 = D2D1::RectF(rect.left + 215.0f * scale, rect.top + 115.0f * scale, rect.right, rect.bottom);
-        target_->DrawTextW(line5.c_str(), static_cast<UINT32>(line5.length()), textFormat_.Get(),
-                           rightLine5, mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+            std::wstring wind;
+            if (!w.windSpeed.empty()) {
+                wind = w.windSpeed + (settings.weatherFahrenheit ? L" mph" : L" km/h");
+                if (!w.windDir.empty()) {
+                    wind += L" " + w.windDir;
+                }
+            }
+
+            row(L"Feels like", w.feelsLike.empty() ? std::wstring() : w.feelsLike + L"\x00B0");
+            row(L"Humidity", w.humidity.empty() ? std::wstring() : w.humidity + L"%");
+            row(L"Dew point", w.dewPoint);
+            row(L"Wind", wind);
+            row(L"Precipitation", w.precipChance);
+            row(L"UV index", w.uvIndex);
+            row(L"Air quality", w.airQuality);
+            row(L"Visibility", w.visibility);
+            row(L"Pressure", w.pressure);
+        } else {
+            row(L"Weather", L"Updating\u2026");
+        }
+
+        smallTextFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+        textBrush_->SetOpacity(0.90f);
+        mutedBrush_->SetOpacity(0.58f);
     }
 
     // ── System stats dashboards ──────────────────────────────────────────
