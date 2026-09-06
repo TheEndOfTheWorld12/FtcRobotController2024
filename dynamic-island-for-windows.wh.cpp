@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.17.0
+// @version         1.17.1
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -44,8 +44,9 @@ media, downloads, clipboard, battery, and more.
   place and condition, feels-like, humidity and wind. No clock: the date and
   time live on the calendar page one hover away.
 - Timer page: set a length a minute at a time, start, pause and reset it, and
-  a button to open the Windows Clock app beside it. The pill beeps and takes
-  over when the countdown ends.
+  a button to open the Windows Clock app beside it. A counting timer takes the
+  resting pill, ahead of the media readout and the weather, and the pill beeps
+  and pulses when it ends. Hovering still opens the whole dashboard.
 - Idle dashboard with calendar and live weather. The weather page carries
   feels-like, humidity, dew point, wind, chance of precipitation, UV index,
   air quality, visibility and pressure; the resting pill keeps its short
@@ -5709,7 +5710,7 @@ class Renderer {
                 DrawProgress(state, unscaledRect);
                 break;
             case IslandKind::Timer:
-                DrawTimerAlert(state, unscaledRect);
+                DrawTimerPill(state, unscaledRect, now);
                 break;
             case IslandKind::Idle:
             default:
@@ -6356,9 +6357,18 @@ class Renderer {
         g_timerHitValid = true;
     }
 
-    // The pill a finished timer takes over, alongside the beep.
-    void DrawTimerAlert(const SharedState& state, D2D1_RECT_F rect) {
+    // The collapsed pill a timer owns for as long as it is counting: the time
+    // left, what it is doing, and how much of it has gone. When it rings the
+    // whole thing pulses.
+    void DrawTimerPill(const SharedState& state, D2D1_RECT_F rect, double now) {
         if (rect.bottom - rect.top < 24.0f || rect.right - rect.left < 140.0f) return;
+
+        const TimerSnapshot& timer = state.timer;
+        const double remaining = TimerRemainingSeconds(timer, now);
+        const float pulse =
+            timer.finished
+                ? 0.62f + 0.38f * std::abs(static_cast<float>(std::sin(now * 3.2)))
+                : 1.0f;
 
         const float cy = (rect.top + rect.bottom) * 0.5f;
         const float badgeSz = (rect.bottom - rect.top) - 16.0f;
@@ -6367,7 +6377,7 @@ class Renderer {
         const float br = badgeSz * 0.35f;
 
         ComPtr<ID2D1SolidColorBrush> badgeBg;
-        target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.12f), &badgeBg);
+        target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.12f * pulse), &badgeBg);
         if (badgeBg) {
             target_->FillRoundedRectangle(D2D1::RoundedRect(badge, br, br), badgeBg.Get());
         }
@@ -6375,7 +6385,7 @@ class Renderer {
         if (iconFormat_) {
             iconFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
             iconFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-            accentBrush_->SetOpacity(0.95f);
+            accentBrush_->SetOpacity(0.95f * pulse);
             target_->DrawTextW(L"\uE916", 1, iconFormat_.Get(), badge, accentBrush_.Get(),
                                D2D1_DRAW_TEXT_OPTIONS_CLIP);
             accentBrush_->SetOpacity(1.0f);
@@ -6384,18 +6394,40 @@ class Renderer {
         }
 
         const float tx = badge.right + 14;
-        textBrush_->SetOpacity(0.96f);
-        target_->DrawTextW(L"Timer finished", 14, textFormat_.Get(),
-                           D2D1::RectF(tx, cy - 20, rect.right - 14, cy),
+        const float textRight = rect.right - 14;
+
+        const std::wstring clock = FormatTimerClock(remaining);
+        textBrush_->SetOpacity(0.96f * pulse);
+        target_->DrawTextW(clock.c_str(), static_cast<UINT32>(clock.size()), textFormat_.Get(),
+                           D2D1::RectF(tx, cy - 22, textRight, cy - 2),
                            textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
-        const std::wstring length = FormatTimerClock(state.timer.durationSeconds);
-        const std::wstring subtitle = length + L" timer";
-        mutedBrush_->SetOpacity(0.62f);
-        target_->DrawTextW(subtitle.c_str(), static_cast<UINT32>(subtitle.size()),
-                           smallTextFormat_.Get(),
-                           D2D1::RectF(tx, cy + 1, rect.right - 14, cy + 18),
+        const wchar_t* caption = timer.finished ? L"Timer finished"
+                                                : (timer.running ? L"Timer" : L"Paused");
+        mutedBrush_->SetOpacity(0.62f * pulse);
+        target_->DrawTextW(caption, static_cast<UINT32>(wcslen(caption)), smallTextFormat_.Get(),
+                           D2D1::RectF(tx, cy - 3, textRight, cy + 14),
                            mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+
+        // How much of it has gone, along the bottom of the text block.
+        const D2D1_RECT_F track = D2D1::RectF(tx, cy + 15, textRight, cy + 18);
+        ComPtr<ID2D1SolidColorBrush> trackBrush;
+        target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.10f * settingsOpacity_),
+                                       &trackBrush);
+        if (trackBrush) {
+            target_->FillRoundedRectangle(D2D1::RoundedRect(track, 1.5f, 1.5f), trackBrush.Get());
+        }
+
+        const float total = static_cast<float>(std::max(1, timer.durationSeconds));
+        const float gone = Clamp(1.0f - static_cast<float>(remaining) / total, 0.0f, 1.0f);
+        accentBrush_->SetOpacity(0.85f * pulse);
+        target_->FillRoundedRectangle(
+            D2D1::RoundedRect(D2D1::RectF(tx, track.top, tx + (textRight - tx) * gone,
+                                          track.bottom),
+                              1.5f, 1.5f),
+            accentBrush_.Get());
+
+        accentBrush_->SetOpacity(1.0f);
         textBrush_->SetOpacity(0.90f);
         mutedBrush_->SetOpacity(0.58f);
     }
@@ -8527,9 +8559,18 @@ Activity ActivityForKind(IslandKind kind, const Settings& settings, const Shared
     return activity;
 }
 
+// The order these are pushed in is the order they are shown in: the first is
+// the pill, the second sits beside it, and the rest wait. A timer that is
+// counting, or one that has just rung, outranks everything — audio comes next,
+// and the resting weather readout is what is left when nothing else is going
+// on. Everything in between is a brief interruption, and with the timer ahead
+// of them they now appear alongside it rather than in place of it.
 std::vector<IslandKind> ChooseActivities(const SharedState& state, const Settings& settings, double now) {
     std::vector<IslandKind> activities;
 
+    if (state.timer.running || state.timer.finished) {
+        activities.push_back(IslandKind::Timer);
+    }
     if (state.clipboard.active && now < state.clipboard.expiresAt) {
         activities.push_back(IslandKind::Clipboard);
     }
@@ -8538,9 +8579,6 @@ std::vector<IslandKind> ChooseActivities(const SharedState& state, const Setting
     }
     if (state.device.active && now < state.device.expiresAt) {
         activities.push_back(IslandKind::Device);
-    }
-    if (state.timer.finished) {
-        activities.push_back(IslandKind::Timer);
     }
     if (state.volume.active && now < state.volume.expiresAt) {
         activities.push_back(IslandKind::Volume);
@@ -9609,6 +9647,16 @@ DWORD WINAPI RenderThreadProc(void*) {
             }
 
             bool privacyActive = snapshot.system.micActive || snapshot.system.cameraActive;
+
+            // A timer owns the collapsed pill, but expanding it has to give the
+            // whole dashboard — the timer page, with the buttons that stop it,
+            // included — rather than a larger version of the chip. Handing the
+            // kind back to Idle here is what makes the pages reachable while a
+            // timer is counting.
+            if (primary.kind == IslandKind::Timer && (pinned || isHoverExpanded)) {
+                primary.kind = IslandKind::Idle;
+            }
+
             if (primary.kind == IslandKind::Idle) {
                 if (pinned || isHoverExpanded) {
                     primary.width = 380.0f * g_settings.sizeScale;
@@ -9628,7 +9676,8 @@ DWORD WINAPI RenderThreadProc(void*) {
             const bool overlayMode =
                 g_settings.gameOverlay || Wh_GetIntValue(L"GameOverlayPinned", 0) != 0;
             if (overlayMode && !pinned && !isHoverExpanded &&
-                (primary.kind == IslandKind::Idle || primary.kind == IslandKind::Media)) {
+                (primary.kind == IslandKind::Idle || primary.kind == IslandKind::Media ||
+                 primary.kind == IslandKind::Timer)) {
                 primary.kind = IslandKind::Idle;
                 primary.width = 372.0f * g_settings.sizeScale;
                 primary.height = 64.0f * g_settings.sizeScale;
@@ -9703,7 +9752,11 @@ DWORD WINAPI RenderThreadProc(void*) {
                 g_state.system.renderFps = ClampInt(static_cast<int>(1.0f / std::max(dt, 0.001f) + 0.5f), 0, 240);
             }
 
-            SetClickThrough(hwnd, primary.kind == IslandKind::Idle && !hover && !pinned);
+            // A timer counting down is as passive as the resting pill: the
+            // pointer has to be on it before any of it is clickable anyway.
+            const bool passiveKind =
+                primary.kind == IslandKind::Idle || primary.kind == IslandKind::Timer;
+            SetClickThrough(hwnd, passiveKind && !hover && !pinned);
 
             // Keep the system volume popup down, so a volume change shows only
             // in the pill. Checked every frame: the shell re-shows it each time.
@@ -9905,7 +9958,7 @@ DWORD WINAPI RenderThreadProc(void*) {
             // Animated activities that require continuous rendering
             if (primary.kind == IslandKind::Media || primary.kind == IslandKind::BatteryLow ||
                 primary.kind == IslandKind::Clipboard || primary.kind == IslandKind::Notification ||
-                primary.kind == IslandKind::Timer) {
+                (primary.kind == IslandKind::Timer && snapshot.timer.finished)) {
                 needsRender = true;
             }
 
