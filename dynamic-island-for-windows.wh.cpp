@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.23.0
+// @version         1.23.1
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -4318,10 +4318,15 @@ std::wstring g_timerNameCache[kTimerMaxCount];
 std::wstring TimerStoredName(int index) {
     wchar_t key[32] = {};
     swprintf_s(key, L"TimerName%d", index);
-    PCWSTR value = Wh_GetStringValue(key, L"");
-    std::wstring result = value ? value : L"";
-    Wh_FreeStringValue(value);
-    return result;
+
+    // Unlike the settings reader beside it, this one fills a buffer the caller
+    // owns rather than handing back an allocation, so there is nothing to
+    // free. The buffer starts zeroed, which is also the answer when there is
+    // no name stored, and it only has to hold what the field lets you type.
+    wchar_t buffer[kTimerNameMaxChars + 1] = {};
+    Wh_GetStringValue(key, buffer, ARRAYSIZE(buffer));
+    buffer[ARRAYSIZE(buffer) - 1] = L'\0';
+    return buffer;
 }
 
 void LoadTimerNames() {
