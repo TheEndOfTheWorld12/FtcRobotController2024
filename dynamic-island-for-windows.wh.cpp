@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.17.1
+// @version         1.18.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -296,8 +296,6 @@ constexpr float kPageNavStripHeight = 20.0f;
 constexpr float kPageNavStripInset = 10.0f;   // from the pill's left/right edge
 constexpr float kPageNavStripMargin = 2.0f;   // from the pill's top/bottom edge
 constexpr float kPageDotsRightInset = 10.0f;
-// The pill only shows the buttons once it has expanded past this height.
-constexpr float kExpandedPillHeight = 100.0f;
 // Height of the expanded pill, sized so page content clears both bars.
 constexpr float kExpandedPillContentHeight = 200.0f;
 // Clearance kept between page content and the bars.
@@ -309,11 +307,6 @@ constexpr float kPageContentBottom =
     kExpandedPillContentHeight - kPageNavStripMargin - kPageNavStripHeight - kPageNavContentGap;
 static_assert(kPageContentTop + 100.0f < kPageContentBottom,
               "expanded pill is too short to hold a page between the nav bars");
-
-// Vertical centre of a page control, measured from the pill's centre.
-float PageNavStripOffset(float halfHeight) {
-    return std::max(halfHeight - kPageNavStripMargin - kPageNavStripHeight * 0.5f, 0.0f);
-}
 
 enum class IslandKind {
     Idle,
@@ -702,6 +695,18 @@ struct AtomicRect {
     }
 };
 
+// Every control in the pill lights up under the pointer — a brighter plate
+// behind it and its label at full strength. The pattern is the same one
+// throughout: the renderer publishes the rectangle it drew the control at, a
+// hit-test in the render loop turns the pointer position into "which control",
+// and the draw reads that back on the next frame. Anything clickable added
+// here is expected to do the same.
+
+// The page arrows hugging the pill's top and bottom edge. 0 is the top arrow,
+// 1 the bottom, -1 neither.
+std::atomic<bool> g_pageNavHitValid = false;
+std::atomic<int> g_hoveredPageNav = -1;
+
 // The timer page's five buttons, in the order they are drawn.
 enum class TimerButton {
     None = -1,
@@ -723,6 +728,8 @@ std::atomic<bool> g_privacyHitValid = false;
 AtomicRect g_privacyDotRectPx[3];
 AtomicRect g_privacyPopupRectPx;
 AtomicRect g_timerButtonRectPx[kTimerButtonCount];
+AtomicRect g_pageNavUpRectPx;
+AtomicRect g_pageNavDownRectPx;
 
 // The popup's size, in the unscaled units the pill is drawn in.
 constexpr float kPrivacyPopupWidth = 208.0f;
@@ -5406,6 +5413,7 @@ class Renderer {
         g_volumeHitValid = false;
         g_privacyHitValid = false;
         g_timerHitValid = false;
+        g_pageNavHitValid = false;
 
         const float hoverScale = hover || pinned ? 1.025f : 1.0f;
         const float scale = hoverScale;
@@ -6634,9 +6642,16 @@ class Renderer {
         D2D1_RECT_F strip = D2D1::RectF(rect.left + kPageNavStripInset, cy - halfStrip,
                                         rect.right - kPageNavStripInset, cy + halfStrip);
 
+        // Lit under the pointer like every other control. An arrow with nowhere
+        // to go — up on the first page, down on the last — stays dark whatever
+        // the pointer is doing, since pressing it would do nothing.
+        const bool hovered = enabled && g_hoveredPageNav.load() == (up ? 0 : 1);
+
         ComPtr<ID2D1SolidColorBrush> bg;
         target_->CreateSolidColorBrush(
-            D2D1::ColorF(1, 1, 1, (enabled ? 0.07f : 0.025f) * settingsOpacity_), &bg);
+            D2D1::ColorF(1, 1, 1,
+                         (enabled ? (hovered ? 0.16f : 0.07f) : 0.025f) * settingsOpacity_),
+            &bg);
         if (bg) {
             target_->FillRoundedRectangle(D2D1::RoundedRect(strip, halfStrip, halfStrip),
                                           bg.Get());
@@ -6647,12 +6662,23 @@ class Renderer {
         const float h = 2.8f;
         const float tipY = cy + (up ? -h : h);
         const float baseY = cy + (up ? h : -h);
-        textBrush_->SetOpacity(enabled ? 0.92f : 0.26f);
+        textBrush_->SetOpacity(enabled ? (hovered ? 1.0f : 0.92f) : 0.26f);
         target_->DrawLine(D2D1::Point2F(cx - w, baseY), D2D1::Point2F(cx, tipY),
                           textBrush_.Get(), 1.8f);
         target_->DrawLine(D2D1::Point2F(cx, tipY), D2D1::Point2F(cx + w, baseY),
                           textBrush_.Get(), 1.8f);
         textBrush_->SetOpacity(0.90f);
+
+        // Published for the hover and the click, so neither can drift from the
+        // strip that was actually painted.
+        const float pcx = (rect.left + rect.right) * 0.5f;
+        const float pcy = (rect.top + rect.bottom) * 0.5f;
+        AtomicRect& published = up ? g_pageNavUpRectPx : g_pageNavDownRectPx;
+        published.Set(pcx + (strip.left - pcx) * sizeScale_,
+                      pcy + (strip.top - pcy) * sizeScale_,
+                      pcx + (strip.right - pcx) * sizeScale_,
+                      pcy + (strip.bottom - pcy) * sizeScale_);
+        g_pageNavHitValid = true;
     }
 
     // Page controls along the top and bottom edges, with the position dots
@@ -8814,6 +8840,20 @@ static ScrubberHit HitTestVolumeBar(int xPos, int yPos) {
     return hit;
 }
 
+// Which page arrow a point falls on: 0 the top one, 1 the bottom one, -1
+// neither. They are only live while the pill is expanded far enough to have
+// drawn them.
+static int HitTestPageNav(int xPos, int yPos) {
+    if (!g_pageNavHitValid.load()) {
+        return -1;
+    }
+    const float x = static_cast<float>(xPos);
+    const float y = static_cast<float>(yPos);
+    if (g_pageNavUpRectPx.Contains(x, y)) return 0;
+    if (g_pageNavDownRectPx.Contains(x, y)) return 1;
+    return -1;
+}
+
 // Which of the timer page's buttons a point falls on, or -1. The page has to
 // have drawn this frame for any of them to count.
 static int HitTestTimerButton(int xPos, int yPos) {
@@ -9226,7 +9266,6 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 RECT clientRect;
                 GetClientRect(hwnd, &clientRect);
                 const float height = static_cast<float>(clientRect.bottom - clientRect.top);
-                const float width = static_cast<float>(clientRect.right - clientRect.left);
 
                 if (mediaActive && height > 60.0f && (g_idleTab % kMediaTabCount) == 0) {
                     {
@@ -9300,34 +9339,20 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     }
                 }
 
-                // Page up/down buttons at the top and bottom centre of the
-                // expanded pill. Coordinates are converted into the same
-                // unscaled space the renderer draws in, relative to the
-                // pill's centre.
-                const float sizeScale = std::max(g_settings.sizeScale, 0.01f);
-                const float pillHeight = (height - kRenderPadY * 2.0f) / sizeScale;
-                if (pillHeight > kExpandedPillHeight) {
-                    const float pillHalfWidth =
-                        (width - kRenderPadX * 2.0f) / sizeScale * 0.5f;
-                    const float unX = (xPos - width * 0.5f) / sizeScale;
-                    const float unY = (yPos - height * 0.5f) / sizeScale;
-                    const float offset = PageNavStripOffset(pillHeight * 0.5f);
-                    const float halfStrip = kPageNavStripHeight * 0.5f;
-
-                    auto hitButton = [&](float stripY) {
-                        return std::fabs(unX) <= pillHalfWidth - kPageNavStripInset &&
-                               std::fabs(unY - stripY) <= halfStrip;
-                    };
-
+                // The page arrows at the top and bottom edges, tested against
+                // the strips the renderer published as it drew them rather than
+                // against a second calculation of where they ought to be.
+                {
                     const int tabCount = mediaActive ? kMediaTabCount : kIdleTabCount;
-                    if (hitButton(-offset)) {
+                    const int arrow = HitTestPageNav(xPos, yPos);
+                    if (arrow == 0) {
                         if (g_idleTab > 0) {
                             g_idleTab--;
                             g_layoutDirty = true;
                         }
                         return 0;
                     }
-                    if (hitButton(offset)) {
+                    if (arrow == 1) {
                         if (g_idleTab < tabCount - 1) {
                             g_idleTab++;
                             g_layoutDirty = true;
@@ -9910,6 +9935,17 @@ DWORD WINAPI RenderThreadProc(void*) {
                     }
                 }
                 if (g_hoveredTimerButton.exchange(hoveredButton) != hoveredButton) {
+                    needsRender = true;
+                }
+
+                int hoveredArrow = -1;
+                if (hover) {
+                    POINT local = cursor;
+                    if (ScreenToClient(hwnd, &local)) {
+                        hoveredArrow = HitTestPageNav(local.x, local.y);
+                    }
+                }
+                if (g_hoveredPageNav.exchange(hoveredArrow) != hoveredArrow) {
                     needsRender = true;
                 }
 
