@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.19.0
+// @version         1.20.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -43,10 +43,14 @@ media, downloads, clipboard, battery, and more.
 - Resting pill shows the weather at a glance — icon and temperature, then
   place and condition, feels-like, humidity and wind. No clock: the date and
   time live on the calendar page one hover away.
-- Timer page: set a length a minute at a time, start, pause and reset it, and
-  a button to open the Windows Clock app beside it. A counting timer takes the
-  pill to itself, ahead of the media readout and the weather, and the pill
-  beeps and pulses when it ends. Hovering still opens the whole dashboard.
+- Timer page: keep up to eight countdowns and step between them with the
+  arrows either side of the controls, the way the media page steps between
+  audio sources. Set a length a minute at a time, start, pause and reset,
+  add and delete, with a button to open the Windows Clock app beside them.
+  The resting pill shows whichever will ring first and takes the pill to
+  itself, ahead of the media readout and the weather; it beeps and pulses
+  when one ends. Hovering still opens the whole dashboard, the media page
+  included.
 - Idle dashboard with calendar and live weather. The weather page carries
   feels-like, humidity, dew point, wind, chance of precipitation, UV index,
   air quality, visibility and pressure; the resting pill keeps its short
@@ -545,16 +549,24 @@ struct WeatherSnapshot {
     double lastUpdated = 0.0;
 };
 
-// The pill's own countdown. The end is kept as an absolute moment rather than
-// a number that gets decremented every frame, so it neither drifts nor loses
-// time while the overlay is rebuilt for a display change.
-struct TimerSnapshot {
+// One of the pill's countdowns. The end is kept as an absolute moment rather
+// than a number that gets decremented every frame, so it neither drifts nor
+// loses time while the overlay is rebuilt for a display change.
+struct TimerEntry {
     bool running = false;
     bool finished = false;      // rang, and not yet acknowledged
     int durationSeconds = 300;  // what Reset goes back to, and the bar's total
     double remaining = 300.0;   // seconds left; authoritative while stopped
     double endsAt = 0.0;        // NowSeconds() it ends at; only while running
     double finishedAt = 0.0;
+};
+
+// Several at once. The page steps through them with its own arrows, the way
+// the media page steps through audio sources; the pill shows whichever will
+// ring first, because that is the one worth interrupting for.
+struct TimerSnapshot {
+    std::vector<TimerEntry> timers{TimerEntry{}};
+    int selected = 0;  // the one the page is showing
 };
 
 struct SharedState {
@@ -718,16 +730,22 @@ std::atomic<int> g_hoveredPageNav = -1;
 // down arrow, correctly, refused to go anywhere.
 std::atomic<int> g_pageCount = kIdleTabCount;
 
-// The timer page's five buttons, in the order they are drawn.
+// The timer page's buttons, in the order they are drawn: the first row drives
+// the countdown being shown, the second manages the list of them.
 enum class TimerButton {
     None = -1,
-    Minus = 0,
+    Prev = 0,
+    Minus,
     Start,
     Plus,
+    Next,
     Reset,
+    New,
+    Delete,
     Clock,
 };
-constexpr int kTimerButtonCount = 5;
+constexpr int kTimerButtonCount = 9;
+constexpr int kTimerFirstRowCount = 5;
 std::atomic<bool> g_timerHitValid = false;
 std::atomic<int> g_hoveredTimerButton = -1;
 
@@ -4176,27 +4194,129 @@ std::vector<std::wstring> AppsUsingCapability(const wchar_t* capability) {
 constexpr int kTimerStepSeconds = 60;
 constexpr int kTimerMinSeconds = 60;
 constexpr int kTimerMaxSeconds = 6 * 60 * 60;
+constexpr int kTimerMaxCount = 8;
 
-void LoadTimerDuration() {
-    const int stored = Wh_GetIntValue(L"TimerDurationSeconds", 300);
-    const int duration = ClampInt(stored, kTimerMinSeconds, kTimerMaxSeconds);
+// What was last written to Windhawk's store, so the render loop can tell that
+// nothing needs writing without reading the store back every second.
+uint64_t g_timerPersistDigest = 0;
+
+uint64_t TimerDigest(const TimerSnapshot& timers) {
+    uint64_t digest = timers.timers.size();
+    for (const TimerEntry& timer : timers.timers) {
+        digest = digest * 1000003ull + static_cast<uint64_t>(timer.durationSeconds);
+    }
+    return digest;
+}
+
+void PersistTimers(const TimerSnapshot& timers) {
+    const int count = static_cast<int>(timers.timers.size());
+    Wh_SetIntValue(L"TimerCount", count);
+    for (int i = 0; i < count; ++i) {
+        wchar_t key[32] = {};
+        swprintf_s(key, L"TimerDuration%d", i);
+        Wh_SetIntValue(key, timers.timers[i].durationSeconds);
+    }
+    g_timerPersistDigest = TimerDigest(timers);
+}
+
+void LoadTimers() {
+    // The first timer's length used to live under its own key, from when there
+    // was only ever one. It is still read so an existing setup comes back as
+    // it was rather than reset to five minutes.
+    const int legacy = Wh_GetIntValue(L"TimerDurationSeconds", 300);
+    const int count = ClampInt(Wh_GetIntValue(L"TimerCount", 1), 1, kTimerMaxCount);
+
+    TimerSnapshot loaded;
+    loaded.timers.clear();
+    for (int i = 0; i < count; ++i) {
+        wchar_t key[32] = {};
+        swprintf_s(key, L"TimerDuration%d", i);
+        const int fallback = i == 0 ? legacy : 300;
+        TimerEntry timer;
+        timer.durationSeconds =
+            ClampInt(Wh_GetIntValue(key, fallback), kTimerMinSeconds, kTimerMaxSeconds);
+        timer.remaining = timer.durationSeconds;
+        loaded.timers.push_back(timer);
+    }
+
+    g_timerPersistDigest = TimerDigest(loaded);
     std::lock_guard lock(g_stateMutex);
-    g_state.timer.durationSeconds = duration;
-    g_state.timer.remaining = duration;
+    g_state.timer = std::move(loaded);
 }
 
 // Seconds left right now, whether the clock is running or stopped.
-double TimerRemainingSeconds(const TimerSnapshot& timer, double now) {
+double TimerRemainingSeconds(const TimerEntry& timer, double now) {
     if (!timer.running) {
         return std::max(0.0, timer.remaining);
     }
     return std::max(0.0, timer.endsAt - now);
 }
 
+int TimerSelectedIndex(const TimerSnapshot& timers) {
+    if (timers.timers.empty()) {
+        return 0;
+    }
+    return ClampInt(timers.selected, 0, static_cast<int>(timers.timers.size()) - 1);
+}
+
+// Which countdown the pill shows. A ringing one takes it; otherwise the one
+// with the least time left, since that is the next thing to happen; and with
+// none running, whichever the page is sitting on.
+int TimerToShow(const TimerSnapshot& timers, double now) {
+    int soonest = -1;
+    double least = 0.0;
+    for (size_t i = 0; i < timers.timers.size(); ++i) {
+        const TimerEntry& timer = timers.timers[i];
+        if (timer.finished) {
+            return static_cast<int>(i);
+        }
+        if (!timer.running) {
+            continue;
+        }
+        const double left = TimerRemainingSeconds(timer, now);
+        if (soonest < 0 || left < least) {
+            soonest = static_cast<int>(i);
+            least = left;
+        }
+    }
+    return soonest >= 0 ? soonest : TimerSelectedIndex(timers);
+}
+
+// The list is never empty — it starts with one and Delete refuses to take the
+// last — but every reader indexes into it, so the two that matter say what
+// happens if it ever were rather than leaving it to chance.
+const TimerEntry& TimerShownEntry(const TimerSnapshot& timers, double now) {
+    static const TimerEntry kNone;
+    if (timers.timers.empty()) {
+        return kNone;
+    }
+    return timers.timers[TimerToShow(timers, now)];
+}
+
+const TimerEntry& TimerSelectedEntry(const TimerSnapshot& timers) {
+    static const TimerEntry kNone;
+    if (timers.timers.empty()) {
+        return kNone;
+    }
+    return timers.timers[TimerSelectedIndex(timers)];
+}
+
+bool AnyTimerActive(const TimerSnapshot& timers) {
+    for (const TimerEntry& timer : timers.timers) {
+        if (timer.running || timer.finished) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void TimerStartOrPause() {
     const double now = NowSeconds();
     std::lock_guard lock(g_stateMutex);
-    TimerSnapshot& timer = g_state.timer;
+    if (g_state.timer.timers.empty()) {
+        return;
+    }
+    TimerEntry& timer = g_state.timer.timers[TimerSelectedIndex(g_state.timer)];
 
     if (timer.running) {
         timer.remaining = std::max(0.0, timer.endsAt - now);
@@ -4216,9 +4336,13 @@ void TimerStartOrPause() {
 
 void TimerReset() {
     std::lock_guard lock(g_stateMutex);
-    g_state.timer.running = false;
-    g_state.timer.finished = false;
-    g_state.timer.remaining = g_state.timer.durationSeconds;
+    if (g_state.timer.timers.empty()) {
+        return;
+    }
+    TimerEntry& timer = g_state.timer.timers[TimerSelectedIndex(g_state.timer)];
+    timer.running = false;
+    timer.finished = false;
+    timer.remaining = timer.durationSeconds;
 }
 
 // A minute on or off. While the clock is running this moves the end and the
@@ -4226,30 +4350,66 @@ void TimerReset() {
 // rather than jumping when the length changes underneath it.
 void TimerAdjust(int deltaSeconds) {
     const double now = NowSeconds();
-    {
-        std::lock_guard lock(g_stateMutex);
-        TimerSnapshot& timer = g_state.timer;
+    std::lock_guard lock(g_stateMutex);
+    if (g_state.timer.timers.empty()) {
+        return;
+    }
+    TimerEntry& timer = g_state.timer.timers[TimerSelectedIndex(g_state.timer)];
 
-        const int wanted = timer.durationSeconds + deltaSeconds;
-        const int duration = ClampInt(wanted, kTimerMinSeconds, kTimerMaxSeconds);
-        const int applied = duration - timer.durationSeconds;
-        if (applied == 0) {
-            return;
-        }
-        timer.durationSeconds = duration;
+    const int wanted = timer.durationSeconds + deltaSeconds;
+    const int duration = ClampInt(wanted, kTimerMinSeconds, kTimerMaxSeconds);
+    const int applied = duration - timer.durationSeconds;
+    if (applied == 0) {
+        return;
+    }
+    timer.durationSeconds = duration;
 
-        if (timer.running) {
-            timer.endsAt = std::max(now, timer.endsAt + applied);
-        } else {
-            timer.finished = false;
-            timer.remaining = duration;
-        }
+    if (timer.running) {
+        timer.endsAt = std::max(now, timer.endsAt + applied);
+    } else {
+        timer.finished = false;
+        timer.remaining = duration;
     }
     // The length is remembered, but not from here. Wh_SetIntValue goes to
     // Windhawk's store, and this runs on the thread that draws the pill:
     // pressing + ten times to reach ten minutes would be ten writes into ten
     // consecutive frames. The render loop persists it instead, once a second
     // and only when it has actually moved.
+}
+
+// Step to the next or previous countdown, wrapping, the way the media page
+// steps between the apps making sound.
+void TimerSelect(int delta) {
+    std::lock_guard lock(g_stateMutex);
+    const int count = static_cast<int>(g_state.timer.timers.size());
+    if (count < 2) {
+        return;
+    }
+    int chosen = (TimerSelectedIndex(g_state.timer) + delta) % count;
+    if (chosen < 0) {
+        chosen += count;
+    }
+    g_state.timer.selected = chosen;
+}
+
+void TimerAdd() {
+    std::lock_guard lock(g_stateMutex);
+    if (static_cast<int>(g_state.timer.timers.size()) >= kTimerMaxCount) {
+        return;
+    }
+    g_state.timer.timers.push_back(TimerEntry{});
+    g_state.timer.selected = static_cast<int>(g_state.timer.timers.size()) - 1;
+}
+
+void TimerRemove() {
+    std::lock_guard lock(g_stateMutex);
+    if (g_state.timer.timers.size() < 2) {
+        return;  // the list is never empty; there is nothing to fall back to
+    }
+    const int index = TimerSelectedIndex(g_state.timer);
+    g_state.timer.timers.erase(g_state.timer.timers.begin() + index);
+    g_state.timer.selected =
+        ClampInt(index, 0, static_cast<int>(g_state.timer.timers.size()) - 1);
 }
 
 void OpenWindowsClock() {
@@ -6254,15 +6414,29 @@ class Renderer {
     // Page: the countdown, how much of it has gone, and the buttons that drive
     // it. The buttons publish the rectangles they were drawn at, as every other
     // control in the pill does, so the hit-test cannot disagree with the paint.
+    // Page: the countdown the page is sitting on, how much of it has gone, and
+    // two rows of buttons — the first drives this countdown, the second manages
+    // the list. Every button publishes the rectangle it was drawn at, as every
+    // other control in the pill does, so the hit-test cannot disagree with the
+    // paint.
     void DrawTimerDashboard(const SharedState& state, D2D1_RECT_F rect, double now) {
-        const TimerSnapshot& timer = state.timer;
+        const int count = static_cast<int>(state.timer.timers.size());
+        const int index = TimerSelectedIndex(state.timer);
+        const TimerEntry& timer = TimerSelectedEntry(state.timer);
         const double remaining = TimerRemainingSeconds(timer, now);
 
         const float left = rect.left + 24.0f;
         const float right = rect.right - 34.0f;  // clear of the pagination dots
 
         mutedBrush_->SetOpacity(0.45f);
-        target_->DrawTextW(L"TIMER", 5, smallTextFormat_.Get(),
+        std::wstring heading = L"TIMER";
+        if (count > 1) {
+            wchar_t of[32] = {};
+            swprintf_s(of, L"   %d / %d", index + 1, count);
+            heading += of;
+        }
+        target_->DrawTextW(heading.c_str(), static_cast<UINT32>(heading.size()),
+                           smallTextFormat_.Get(),
                            D2D1::RectF(left, rect.top + 32.0f, right, rect.top + 50.0f),
                            mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
@@ -6295,8 +6469,8 @@ class Renderer {
             textBrush_->SetOpacity(alpha);
             target_->DrawTextW(clock.c_str(), static_cast<UINT32>(clock.size()),
                                hugeTextFormat_.Get(),
-                               D2D1::RectF(rect.left + 24.0f, rect.top + 52.0f,
-                                           rect.right - 24.0f, rect.top + 106.0f),
+                               D2D1::RectF(rect.left + 24.0f, rect.top + 50.0f,
+                                           rect.right - 24.0f, rect.top + 100.0f),
                                textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
             textBrush_->SetOpacity(0.90f);
         }
@@ -6304,8 +6478,8 @@ class Renderer {
         // How much of the timer has gone.
         const float barLeft = rect.left + 40.0f;
         const float barRight = rect.right - 40.0f;
-        const D2D1_RECT_F track = D2D1::RectF(barLeft, rect.top + 111.0f, barRight,
-                                              rect.top + 116.0f);
+        const D2D1_RECT_F track = D2D1::RectF(barLeft, rect.top + 103.0f, barRight,
+                                              rect.top + 108.0f);
         ComPtr<ID2D1SolidColorBrush> trackBrush;
         target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.10f * settingsOpacity_),
                                        &trackBrush);
@@ -6327,55 +6501,72 @@ class Renderer {
             const wchar_t* label;
             float width;
             bool primary;
+            bool enabled;
         };
+        const bool many = count > 1;
         const TimerButtonSpec buttons[kTimerButtonCount] = {
-            {L"− 1m", 52.0f, false},
-            {timer.running ? L"Pause" : L"Start", 74.0f, true},
-            {L"+ 1m", 52.0f, false},
-            {L"Reset", 60.0f, false},
-            {L"Clock", 60.0f, false},
+            {L"‹", 28.0f, false, many},
+            {L"− 1m", 50.0f, false, true},
+            {timer.running ? L"Pause" : L"Start", 74.0f, true, true},
+            {L"+ 1m", 50.0f, false, true},
+            {L"›", 28.0f, false, many},
+            {L"Reset", 58.0f, false, true},
+            {L"+ New", 54.0f, false, count < kTimerMaxCount},
+            {L"Delete", 62.0f, false, many},
+            {L"Clock", 56.0f, false, true},
         };
 
-        const float gap = 9.0f;
-        float rowWidth = gap * (kTimerButtonCount - 1);
-        for (const TimerButtonSpec& spec : buttons) {
-            rowWidth += spec.width;
-        }
-
+        const float gap = 8.0f;
         const float pcx = (rect.left + rect.right) * 0.5f;
         const float pcy = (rect.top + rect.bottom) * 0.5f;
-        const float boxTop = rect.top + 126.0f;
-        const float boxHeight = 25.0f;
+        const float rowTop[2] = {rect.top + 113.0f, rect.top + 141.0f};
+        const float boxHeight = 24.0f;
         const int hovered = g_hoveredTimerButton.load();
-        float x = pcx - rowWidth * 0.5f;
 
-        for (int i = 0; i < kTimerButtonCount; ++i) {
-            const TimerButtonSpec& spec = buttons[i];
-            const D2D1_RECT_F box = D2D1::RectF(x, boxTop, x + spec.width, boxTop + boxHeight);
-            const bool isHovered = hovered == i;
+        for (int row = 0; row < 2; ++row) {
+            const int first = row == 0 ? 0 : kTimerFirstRowCount;
+            const int last = row == 0 ? kTimerFirstRowCount : kTimerButtonCount;
 
-            ComPtr<ID2D1SolidColorBrush> bg;
-            target_->CreateSolidColorBrush(
-                D2D1::ColorF(1, 1, 1, (isHovered ? 0.16f : 0.075f) * settingsOpacity_), &bg);
-            if (bg) {
-                target_->FillRoundedRectangle(
-                    D2D1::RoundedRect(box, boxHeight * 0.5f, boxHeight * 0.5f), bg.Get());
+            float rowWidth = gap * (last - first - 1);
+            for (int i = first; i < last; ++i) {
+                rowWidth += buttons[i].width;
             }
 
-            ID2D1SolidColorBrush* label = spec.primary ? accentBrush_.Get() : textBrush_.Get();
-            label->SetOpacity(isHovered ? 1.0f : 0.86f);
-            smallTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-            target_->DrawTextW(spec.label, static_cast<UINT32>(wcslen(spec.label)),
-                               smallTextFormat_.Get(),
-                               D2D1::RectF(box.left, boxTop + 5.0f, box.right, box.bottom + 3.0f),
-                               label, D2D1_DRAW_TEXT_OPTIONS_CLIP);
-            smallTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            float x = pcx - rowWidth * 0.5f;
+            for (int i = first; i < last; ++i) {
+                const TimerButtonSpec& spec = buttons[i];
+                const D2D1_RECT_F box =
+                    D2D1::RectF(x, rowTop[row], x + spec.width, rowTop[row] + boxHeight);
+                const bool isHovered = spec.enabled && hovered == i;
 
-            g_timerButtonRectPx[i].Set(pcx + (box.left - pcx) * sizeScale_,
-                                       pcy + (box.top - pcy) * sizeScale_,
-                                       pcx + (box.right - pcx) * sizeScale_,
-                                       pcy + (box.bottom - pcy) * sizeScale_);
-            x += spec.width + gap;
+                ComPtr<ID2D1SolidColorBrush> bg;
+                target_->CreateSolidColorBrush(
+                    D2D1::ColorF(1, 1, 1,
+                                 (spec.enabled ? (isHovered ? 0.16f : 0.075f) : 0.03f) *
+                                     settingsOpacity_),
+                    &bg);
+                if (bg) {
+                    target_->FillRoundedRectangle(
+                        D2D1::RoundedRect(box, boxHeight * 0.5f, boxHeight * 0.5f), bg.Get());
+                }
+
+                ID2D1SolidColorBrush* label =
+                    spec.primary ? accentBrush_.Get() : textBrush_.Get();
+                label->SetOpacity(spec.enabled ? (isHovered ? 1.0f : 0.86f) : 0.28f);
+                smallTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                target_->DrawTextW(spec.label, static_cast<UINT32>(wcslen(spec.label)),
+                                   smallTextFormat_.Get(),
+                                   D2D1::RectF(box.left, box.top + 4.5f, box.right,
+                                               box.bottom + 3.0f),
+                                   label, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                smallTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+
+                g_timerButtonRectPx[i].Set(pcx + (box.left - pcx) * sizeScale_,
+                                           pcy + (box.top - pcy) * sizeScale_,
+                                           pcx + (box.right - pcx) * sizeScale_,
+                                           pcy + (box.bottom - pcy) * sizeScale_);
+                x += spec.width + gap;
+            }
         }
 
         accentBrush_->SetOpacity(1.0f);
@@ -6384,13 +6575,15 @@ class Renderer {
         g_timerHitValid = true;
     }
 
-    // The collapsed pill a timer owns for as long as it is counting: the time
-    // left, what it is doing, and how much of it has gone. When it rings the
-    // whole thing pulses.
+    // The collapsed pill a timer owns for as long as it is counting: whichever
+    // one rings first, the time left on it, and how much of it has gone. When
+    // it rings the whole thing pulses.
     void DrawTimerPill(const SharedState& state, D2D1_RECT_F rect, double now) {
         if (rect.bottom - rect.top < 24.0f || rect.right - rect.left < 140.0f) return;
 
-        const TimerSnapshot& timer = state.timer;
+        const int count = static_cast<int>(state.timer.timers.size());
+        const int index = TimerToShow(state.timer, now);
+        const TimerEntry& timer = TimerShownEntry(state.timer, now);
         const double remaining = TimerRemainingSeconds(timer, now);
         const float pulse =
             timer.finished
@@ -6429,10 +6622,18 @@ class Renderer {
                            D2D1::RectF(tx, cy - 22, textRight, cy - 2),
                            textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
-        const wchar_t* caption = timer.finished ? L"Timer finished"
-                                                : (timer.running ? L"Timer" : L"Paused");
+        // With more than one on the go, which of them this is matters as much
+        // as what it is doing.
+        std::wstring caption = timer.finished ? L"Timer finished"
+                                              : (timer.running ? L"Timer" : L"Paused");
+        if (count > 1) {
+            wchar_t of[32] = {};
+            swprintf_s(of, L"  ·  %d / %d", index + 1, count);
+            caption += of;
+        }
         mutedBrush_->SetOpacity(0.62f * pulse);
-        target_->DrawTextW(caption, static_cast<UINT32>(wcslen(caption)), smallTextFormat_.Get(),
+        target_->DrawTextW(caption.c_str(), static_cast<UINT32>(caption.size()),
+                           smallTextFormat_.Get(),
                            D2D1::RectF(tx, cy - 3, textRight, cy + 14),
                            mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
@@ -8635,7 +8836,7 @@ std::vector<IslandKind> ChooseActivities(const SharedState& state, const Setting
         activities.push_back(IslandKind::BatteryLow);
     }
 
-    const bool timerActive = state.timer.running || state.timer.finished;
+    const bool timerActive = AnyTimerActive(state.timer);
     if (timerActive) {
         activities.push_back(IslandKind::Timer);
     }
@@ -9265,8 +9466,14 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 // click acknowledges it and hands the pill back.
                 {
                     std::lock_guard lock(g_stateMutex);
-                    if (g_state.timer.finished) {
-                        g_state.timer.finished = false;
+                    bool anyRinging = false;
+                    for (TimerEntry& timer : g_state.timer.timers) {
+                        if (timer.finished) {
+                            timer.finished = false;
+                            anyRinging = true;
+                        }
+                    }
+                    if (anyRinging) {
                         g_layoutDirty = true;
                         return 0;
                     }
@@ -9349,6 +9556,9 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     const int button = HitTestTimerButton(xPos, yPos);
                     if (button >= 0) {
                         switch (static_cast<TimerButton>(button)) {
+                            case TimerButton::Prev:
+                                TimerSelect(-1);
+                                break;
                             case TimerButton::Minus:
                                 TimerAdjust(-kTimerStepSeconds);
                                 break;
@@ -9358,8 +9568,17 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                             case TimerButton::Plus:
                                 TimerAdjust(kTimerStepSeconds);
                                 break;
+                            case TimerButton::Next:
+                                TimerSelect(1);
+                                break;
                             case TimerButton::Reset:
                                 TimerReset();
+                                break;
+                            case TimerButton::New:
+                                TimerAdd();
+                                break;
+                            case TimerButton::Delete:
+                                TimerRemove();
                                 break;
                             case TimerButton::Clock:
                                 OpenWindowsClock();
@@ -9600,15 +9819,17 @@ DWORD WINAPI RenderThreadProc(void*) {
                 // The countdown reaching its end. Checked before the snapshot
                 // is taken, so the frame that shows zero is the frame that
                 // rings rather than the one after it.
-                if (g_state.timer.running && now >= g_state.timer.endsAt) {
-                    g_state.timer.running = false;
-                    g_state.timer.remaining = 0.0;
-                    g_state.timer.finished = true;
-                    g_state.timer.finishedAt = now;
-                    timerJustFinished = true;
-                }
-                if (g_state.timer.finished && now >= g_state.timer.finishedAt + 12.0) {
-                    g_state.timer.finished = false;
+                for (TimerEntry& timer : g_state.timer.timers) {
+                    if (timer.running && now >= timer.endsAt) {
+                        timer.running = false;
+                        timer.remaining = 0.0;
+                        timer.finished = true;
+                        timer.finishedAt = now;
+                        timerJustFinished = true;
+                    }
+                    if (timer.finished && now >= timer.finishedAt + 12.0) {
+                        timer.finished = false;
+                    }
                 }
 
                 snapshot = g_state;
@@ -9708,11 +9929,17 @@ DWORD WINAPI RenderThreadProc(void*) {
 
             // A timer owns the collapsed pill, but expanding it has to give the
             // whole dashboard — the timer page, with the buttons that stop it,
-            // included — rather than a larger version of the chip. Handing the
-            // kind back to Idle here is what makes the pages reachable while a
-            // timer is counting.
+            // included — rather than a larger version of the chip.
+            //
+            // Which set of pages that is matters: the media page only exists
+            // while the pill's kind is Media, so handing a counting timer back
+            // to Idle quietly took the media page and its controls away for as
+            // long as the timer ran. Expanding now goes to Media whenever there
+            // is something playing, and to Idle only when there is not.
             if (primary.kind == IslandKind::Timer && (pinned || isHoverExpanded)) {
-                primary.kind = IslandKind::Idle;
+                primary.kind = (g_settings.media && snapshot.media.available)
+                                   ? IslandKind::Media
+                                   : IslandKind::Idle;
             }
 
             if (primary.kind == IslandKind::Idle) {
@@ -9999,8 +10226,9 @@ DWORD WINAPI RenderThreadProc(void*) {
                 }
 
                 static int prevTimerSecond = -1;
-                const int timerSecond = static_cast<int>(
-                    std::ceil(TimerRemainingSeconds(snapshot.timer, now)));
+                const TimerEntry& shownTimer = TimerShownEntry(snapshot.timer, now);
+                const int timerSecond =
+                    static_cast<int>(std::ceil(TimerRemainingSeconds(shownTimer, now)));
                 if (timerSecond != prevTimerSecond) {
                     prevTimerSecond = timerSecond;
                     needsRender = true;
@@ -10011,13 +10239,11 @@ DWORD WINAPI RenderThreadProc(void*) {
                 // write into Windhawk's store from the frame that handled the
                 // click. Seeded from what is already stored, so a session that
                 // never touches the timer never writes at all.
-                static int persistedDuration = Wh_GetIntValue(L"TimerDurationSeconds", 300);
                 static double nextDurationWrite = 0.0;
                 if (now >= nextDurationWrite) {
                     nextDurationWrite = now + 1.0;
-                    if (snapshot.timer.durationSeconds != persistedDuration) {
-                        persistedDuration = snapshot.timer.durationSeconds;
-                        Wh_SetIntValue(L"TimerDurationSeconds", persistedDuration);
+                    if (TimerDigest(snapshot.timer) != g_timerPersistDigest) {
+                        PersistTimers(snapshot.timer);
                     }
                 }
             }
@@ -10058,7 +10284,8 @@ DWORD WINAPI RenderThreadProc(void*) {
             // Animated activities that require continuous rendering
             if (primary.kind == IslandKind::Media || primary.kind == IslandKind::BatteryLow ||
                 primary.kind == IslandKind::Clipboard || primary.kind == IslandKind::Notification ||
-                (primary.kind == IslandKind::Timer && snapshot.timer.finished)) {
+                (primary.kind == IslandKind::Timer &&
+                 TimerShownEntry(snapshot.timer, now).finished)) {
                 needsRender = true;
             }
 
@@ -10201,7 +10428,7 @@ DWORD WINAPI RenderThreadProc(void*) {
 
 
 bool StartThreads() {
-    LoadTimerDuration();
+    LoadTimers();
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_settingsChangedEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!g_stopEvent || !g_settingsChangedEvent) {
