@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.21.0
+// @version         1.22.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -46,8 +46,9 @@ media, downloads, clipboard, battery, and more.
 - Timer page: keep up to eight countdowns and step between them with the
   arrows down either edge of the pill. Name them in the settings and the name
   is what the page and the resting pill call them. Click the number and type a
-  time straight in, or step it a minute at a time; start, pause, reset, add
-  and delete, with a button to open the Windows Clock app beside them.
+  time straight in, or step it a minute at a time, and drag the bar to move a
+  countdown along without changing its length; start, pause, reset, add and
+  delete, with a button to open the Windows Clock app beside them.
   The resting pill shows whichever will ring first and takes the pill to
   itself, ahead of the media readout and the weather; it beeps and pulses
   when one ends. Hovering still opens the whole dashboard, the media page
@@ -774,6 +775,15 @@ AtomicRect g_privacyDotRectPx[3];
 AtomicRect g_privacyPopupRectPx;
 AtomicRect g_timerButtonRectPx[kTimerButtonCount];
 AtomicRect g_timerClockRectPx;
+
+// The timer page's bar, dragged the same way the timeline and the volume bar
+// are, and published the same way: the renderer records where it drew it.
+std::atomic<float> g_timerBarLeftPx = 0.0f;
+std::atomic<float> g_timerBarRightPx = 0.0f;
+std::atomic<float> g_timerBarCentreYPx = 0.0f;
+std::atomic<float> g_timerBarSlackPx = 0.0f;
+std::atomic<bool> g_timerBarDragging = false;
+std::atomic<float> g_timerBarEmphasis = 0.0f;
 AtomicRect g_pageNavUpRectPx;
 AtomicRect g_pageNavDownRectPx;
 
@@ -4424,6 +4434,26 @@ void TimerAdjust(int deltaSeconds) {
 
 // Step to the next or previous countdown, wrapping, the way the media page
 // steps between the apps making sound.
+// Dragging the bar moves the countdown along it: the bar measures how much of
+// the timer has gone, so a point on it names how much is left. The length is
+// untouched — this is scrubbing a position, not setting a duration, which is
+// what the buttons and typing into the number are for.
+void ApplyTimerFraction(float gone) {
+    const double now = NowSeconds();
+    std::lock_guard lock(g_stateMutex);
+    if (g_state.timer.timers.empty()) {
+        return;
+    }
+    TimerEntry& timer = g_state.timer.timers[TimerSelectedIndex(g_state.timer)];
+
+    timer.finished = false;
+    timer.remaining =
+        std::max(0.0, timer.durationSeconds * (1.0 - Clamp(gone, 0.0f, 1.0f)));
+    if (timer.running) {
+        timer.endsAt = now + timer.remaining;
+    }
+}
+
 void TimerSelect(int delta) {
     std::lock_guard lock(g_stateMutex);
     const int count = static_cast<int>(g_state.timer.timers.size());
@@ -6569,26 +6599,59 @@ class Renderer {
                                    ccy + (clockBox.bottom - ccy) * sizeScale_);
         }
 
-        // How much of the timer has gone.
+        // How much of the timer has gone — and a control in its own right:
+        // dragging it moves the countdown along, so it takes the timeline's
+        // treatment of thickening under the pointer and growing a knob.
         const float barLeft = rect.left + 40.0f;
         const float barRight = rect.right - 40.0f;
-        const D2D1_RECT_F track = D2D1::RectF(barLeft, rect.top + 103.0f, barRight,
-                                              rect.top + 108.0f);
+        const float barY = rect.top + 105.5f;
+        const float barEmphasis = Clamp(g_timerBarEmphasis.load(), 0.0f, 1.0f);
+        const float barHalf = 2.5f + 1.5f * barEmphasis;
+
+        {
+            const float bcx = (rect.left + rect.right) * 0.5f;
+            const float bcy = (rect.top + rect.bottom) * 0.5f;
+            g_timerBarLeftPx = bcx + (barLeft - bcx) * sizeScale_;
+            g_timerBarRightPx = bcx + (barRight - bcx) * sizeScale_;
+            g_timerBarCentreYPx = bcy + (barY - bcy) * sizeScale_;
+            g_timerBarSlackPx = 10.0f * sizeScale_;
+        }
+
+        const D2D1_RECT_F track =
+            D2D1::RectF(barLeft, barY - barHalf, barRight, barY + barHalf);
         ComPtr<ID2D1SolidColorBrush> trackBrush;
-        target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.10f * settingsOpacity_),
-                                       &trackBrush);
+        target_->CreateSolidColorBrush(
+            D2D1::ColorF(1, 1, 1, (0.10f + 0.08f * barEmphasis) * settingsOpacity_),
+            &trackBrush);
         if (trackBrush) {
-            target_->FillRoundedRectangle(D2D1::RoundedRect(track, 2.5f, 2.5f), trackBrush.Get());
+            target_->FillRoundedRectangle(D2D1::RoundedRect(track, barHalf, barHalf),
+                                          trackBrush.Get());
         }
 
         const float total = static_cast<float>(std::max(1, timer.durationSeconds));
         const float gone = Clamp(1.0f - static_cast<float>(remaining) / total, 0.0f, 1.0f);
+        const float goneWidth = (barRight - barLeft) * gone;
         accentBrush_->SetOpacity(timer.finished ? 1.0f : 0.85f);
         target_->FillRoundedRectangle(
-            D2D1::RoundedRect(D2D1::RectF(barLeft, track.top,
-                                          barLeft + (barRight - barLeft) * gone, track.bottom),
-                              2.5f, 2.5f),
+            D2D1::RoundedRect(D2D1::RectF(barLeft, track.top, barLeft + goneWidth, track.bottom),
+                              barHalf, barHalf),
             accentBrush_.Get());
+
+        if (barEmphasis > 0.01f) {
+            const float knobX = barLeft + goneWidth;
+            const float knobR = 5.0f * barEmphasis;
+            ComPtr<ID2D1SolidColorBrush> knobRim;
+            target_->CreateSolidColorBrush(
+                D2D1::ColorF(0, 0, 0, 0.35f * barEmphasis * settingsOpacity_), &knobRim);
+            if (knobRim) {
+                target_->FillEllipse(
+                    D2D1::Ellipse(D2D1::Point2F(knobX, barY), knobR + 1.2f, knobR + 1.2f),
+                    knobRim.Get());
+            }
+            accentBrush_->SetOpacity(1.0f);
+            target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(knobX, barY), knobR, knobR),
+                                 accentBrush_.Get());
+        }
         accentBrush_->SetOpacity(1.0f);
 
         struct TimerButtonSpec {
@@ -9263,6 +9326,30 @@ static int HitTestPageNav(int xPos, int yPos) {
     return -1;
 }
 
+// The timer page's bar, hit-tested exactly like the timeline and the volume
+// bar, and reporting the same three things.
+static ScrubberHit HitTestTimerBar(int xPos, int yPos) {
+    ScrubberHit hit;
+
+    if (!g_timerHitValid.load()) {
+        return hit;
+    }
+    const float left = g_timerBarLeftPx.load();
+    const float right = g_timerBarRightPx.load();
+    const float centreY = g_timerBarCentreYPx.load();
+    const float slack = g_timerBarSlackPx.load();
+    if (right <= left || slack <= 0.0f) {
+        return hit;
+    }
+
+    hit.valid = true;
+    hit.fraction = Clamp((static_cast<float>(xPos) - left) / (right - left), 0.0f, 1.0f);
+    hit.onBar = std::fabs(static_cast<float>(yPos) - centreY) <= slack &&
+                static_cast<float>(xPos) >= left - slack &&
+                static_cast<float>(xPos) <= right + slack;
+    return hit;
+}
+
 // Which of the timer page's buttons a point falls on, or -1. The page has to
 // have drawn this frame for any of them to count.
 static int HitTestTimerButton(int xPos, int yPos) {
@@ -9513,6 +9600,23 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     }
                 }
 
+                // The timer page's bar works like the timeline too: pressing
+                // anywhere along it moves the countdown to that point, and it
+                // follows the pointer until the button comes back up.
+                {
+                    const ScrubberHit bar = HitTestTimerBar(xPos, yPos);
+                    if (bar.valid && bar.onBar) {
+                        if (g_timerEditing.exchange(false)) {
+                            g_timerEditValue = 0;
+                        }
+                        g_timerBarDragging = true;
+                        ApplyTimerFraction(bar.fraction);
+                        SetCapture(hwnd);
+                        g_layoutDirty = true;
+                        return 0;
+                    }
+                }
+
                 // The volume pill's bar works like the timeline: pressing
                 // anywhere along it sets the level there, and the level then
                 // follows the pointer until the button comes back up.
@@ -9594,6 +9698,15 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 }
                 return 0;
             }
+            if (g_timerBarDragging.load()) {
+                const ScrubberHit bar =
+                    HitTestTimerBar(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+                if (bar.valid) {
+                    ApplyTimerFraction(bar.fraction);
+                    g_layoutDirty = true;
+                }
+                return 0;
+            }
             if (g_volumeDragging.load()) {
                 // Applied as it moves rather than on release, so the level is
                 // audible while the bar is being dragged.
@@ -9659,9 +9772,35 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     return 0;
                 }
 
+                if (g_timerBarDragging.exchange(false)) {
+                    ReleaseCapture();
+                    const ScrubberHit bar = HitTestTimerBar(xPos, yPos);
+                    if (bar.valid) {
+                        ApplyTimerFraction(bar.fraction);
+                    }
+                    g_layoutDirty = true;
+                    return 0;
+                }
+
+                if (g_volumeDragging.exchange(false)) {
+                    ReleaseCapture();
+                    const ScrubberHit vol = HitTestVolumeBar(xPos, yPos);
+                    if (vol.valid) {
+                        ApplyVolumeFraction(vol.fraction);
+                    }
+                    g_dragEndpointVolume.Reset();
+                    g_layoutDirty = true;
+                    return 0;
+                }
+
                 // A ringing timer takes the pill over, which would otherwise
                 // sit on top of the page holding the button to stop it. Any
                 // click acknowledges it and hands the pill back.
+                //
+                // Checked after the drags and not before them: a timer that
+                // rings mid-drag would otherwise swallow the release that ends
+                // it, leaving the pointer captured and the bar still following
+                // it with the button up.
                 {
                     std::lock_guard lock(g_stateMutex);
                     bool anyRinging = false;
@@ -9675,17 +9814,6 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                         g_layoutDirty = true;
                         return 0;
                     }
-                }
-
-                if (g_volumeDragging.exchange(false)) {
-                    ReleaseCapture();
-                    const ScrubberHit vol = HitTestVolumeBar(xPos, yPos);
-                    if (vol.valid) {
-                        ApplyVolumeFraction(vol.fraction);
-                    }
-                    g_dragEndpointVolume.Reset();
-                    g_layoutDirty = true;
-                    return 0;
                 }
 
                 bool expanded = Wh_GetIntValue(L"PinnedExpanded", 0) != 0 || g_clickExpanded.load();
@@ -9871,6 +9999,9 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 g_layoutDirty = true;
             }
             if (g_volumeDragging.exchange(false)) {
+                g_layoutDirty = true;
+            }
+            if (g_timerBarDragging.exchange(false)) {
                 g_layoutDirty = true;
             }
             g_dragEndpointVolume.Reset();
@@ -10416,6 +10547,26 @@ DWORD WINAPI RenderThreadProc(void*) {
                     }
                 }
                 if (g_hoveredTimerButton.exchange(hoveredButton) != hoveredButton) {
+                    needsRender = true;
+                }
+
+                // The timer bar's hover look, eased the way the timeline's is.
+                bool overTimerBar = g_timerBarDragging.load();
+                if (!overTimerBar && hover && g_timerHitValid.load()) {
+                    POINT local = cursor;
+                    if (ScreenToClient(hwnd, &local)) {
+                        const ScrubberHit bar = HitTestTimerBar(local.x, local.y);
+                        overTimerBar = bar.valid && bar.onBar;
+                    }
+                }
+                const float timerBarTarget = overTimerBar ? 1.0f : 0.0f;
+                const float timerBarNow = g_timerBarEmphasis.load();
+                if (std::fabs(timerBarTarget - timerBarNow) > 0.002f) {
+                    g_timerBarEmphasis =
+                        timerBarNow + (timerBarTarget - timerBarNow) * std::min(1.0f, dt * 16.0f);
+                    needsRender = true;
+                } else if (timerBarNow != timerBarTarget) {
+                    g_timerBarEmphasis = timerBarTarget;
                     needsRender = true;
                 }
 
