@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.20.0
+// @version         1.21.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -44,9 +44,10 @@ media, downloads, clipboard, battery, and more.
   place and condition, feels-like, humidity and wind. No clock: the date and
   time live on the calendar page one hover away.
 - Timer page: keep up to eight countdowns and step between them with the
-  arrows either side of the controls, the way the media page steps between
-  audio sources. Set a length a minute at a time, start, pause and reset,
-  add and delete, with a button to open the Windows Clock app beside them.
+  arrows down either edge of the pill. Name them in the settings and the name
+  is what the page and the resting pill call them. Click the number and type a
+  time straight in, or step it a minute at a time; start, pause, reset, add
+  and delete, with a button to open the Windows Clock app beside them.
   The resting pill shows whichever will ring first and takes the pill to
   itself, ahead of the media readout and the weather; it beeps and pulses
   when one ends. Hovering still opens the whole dashboard, the media page
@@ -182,6 +183,9 @@ shown; that is a platform limitation, not a mod bug.
   - HideSystemVolumeOsd: true
     $name: Hide the Windows volume popup
     $description: Handles the volume keys itself so the system flyout never appears, and shows the change in the pill instead. Only covers the keyboard volume keys - the flyout has no window to hide on current Windows.
+  - TimerNames: ""
+    $name: Timer names
+    $description: Names for the timer page's countdowns, in order, separated by commas - for example "Period 1, Period 2, Lunch". Any that are left out fall back to Timer 1, Timer 2 and so on.
   - HideSystemCapsLockOsd: true
     $name: Hide the Caps Lock popup
     $description: Hides the card your laptop maker's utility puts on screen when Caps Lock or Num Lock is pressed, so the change shows only in the pill. Windows has no such popup of its own, so this looks for one that appears the moment the key goes down, and only then - a brightness or airplane-mode popup from the same utility is left alone.
@@ -360,6 +364,9 @@ struct Settings {
     bool showMetricText = true;
     std::wstring gameOverlayHotkey;
     std::wstring weatherCity;
+    // What each countdown on the timer page is called, in order. Shorter than
+    // the list of timers is fine; the rest fall back to "Timer 3".
+    std::vector<std::wstring> timerNames;
     bool weatherFahrenheit = false;
     int autoHideIdleSeconds = 0;
     bool unhideOnHover = true;
@@ -745,7 +752,16 @@ enum class TimerButton {
     Clock,
 };
 constexpr int kTimerButtonCount = 9;
-constexpr int kTimerFirstRowCount = 5;
+
+// Typing a time into the countdown. Clicking the number opens it; digits fill
+// in from the right the way a phone's timer keypad does, and the keyboard hook
+// swallows those keys — and only those — while it is open. It closes the
+// moment the pointer leaves the pill, so the hook can never be left eating
+// digits meant for something else.
+constexpr UINT WM_APP_TIMER_EDIT = WM_APP + 0x448;  // wParam: 0 commit, 1 cancel
+std::atomic<bool> g_timerEditing = false;
+std::atomic<int> g_timerEditValue = 0;   // as typed: 1230 reads as 12:30
+std::atomic<uint64_t> g_timerEditIdleSince = 0;
 std::atomic<bool> g_timerHitValid = false;
 std::atomic<int> g_hoveredTimerButton = -1;
 
@@ -757,6 +773,7 @@ std::atomic<bool> g_privacyHitValid = false;
 AtomicRect g_privacyDotRectPx[3];
 AtomicRect g_privacyPopupRectPx;
 AtomicRect g_timerButtonRectPx[kTimerButtonCount];
+AtomicRect g_timerClockRectPx;
 AtomicRect g_pageNavUpRectPx;
 AtomicRect g_pageNavDownRectPx;
 
@@ -1128,6 +1145,24 @@ void LoadSettings() {
     next.showMetricText = Wh_GetIntSetting(L"Modules.ShowMetricText") != 0;
     next.gameOverlayHotkey = GetStringSettingCopy(L"Modules.GameOverlayHotkey");
     next.weatherCity = GetStringSettingCopy(L"Modules.WeatherCity");
+
+    {
+        const std::wstring names = GetStringSettingCopy(L"Modules.TimerNames");
+        size_t start = 0;
+        while (start <= names.size() && !names.empty()) {
+            const size_t comma = names.find(L',', start);
+            const size_t end = comma == std::wstring::npos ? names.size() : comma;
+            std::wstring name = names.substr(start, end - start);
+            const size_t first = name.find_first_not_of(L" \t");
+            const size_t last = name.find_last_not_of(L" \t");
+            next.timerNames.push_back(
+                first == std::wstring::npos ? std::wstring() : name.substr(first, last - first + 1));
+            if (comma == std::wstring::npos) {
+                break;
+            }
+            start = comma + 1;
+        }
+    }
     next.weatherFahrenheit = Wh_GetIntSetting(L"Modules.WeatherFahrenheit") != 0;
     const std::wstring hideSec = GetStringSettingCopy(L"Appearance.AutoHideIdleSeconds");
     next.autoHideIdleSeconds = hideSec.empty() ? 0 : _wtoi(hideSec.c_str());
@@ -4192,7 +4227,7 @@ std::vector<std::wstring> AppsUsingCapability(const wchar_t* capability) {
 // pill keeps its own time.
 
 constexpr int kTimerStepSeconds = 60;
-constexpr int kTimerMinSeconds = 60;
+constexpr int kTimerMinSeconds = 5;
 constexpr int kTimerMaxSeconds = 6 * 60 * 60;
 constexpr int kTimerMaxCount = 8;
 
@@ -4242,6 +4277,16 @@ void LoadTimers() {
     g_timerPersistDigest = TimerDigest(loaded);
     std::lock_guard lock(g_stateMutex);
     g_state.timer = std::move(loaded);
+}
+
+// What one countdown is called: whatever the settings list has at that
+// position, or a plain numbered name when the list does not reach it.
+std::wstring TimerNameFor(int index) {
+    if (index >= 0 && index < static_cast<int>(g_settings.timerNames.size()) &&
+        !g_settings.timerNames[index].empty()) {
+        return g_settings.timerNames[index];
+    }
+    return L"Timer " + std::to_wstring(index + 1);
 }
 
 // Seconds left right now, whether the clock is running or stopped.
@@ -6428,30 +6473,57 @@ class Renderer {
         const float left = rect.left + 24.0f;
         const float right = rect.right - 34.0f;  // clear of the pagination dots
 
-        mutedBrush_->SetOpacity(0.45f);
-        std::wstring heading = L"TIMER";
-        if (count > 1) {
-            wchar_t of[32] = {};
-            swprintf_s(of, L"   %d / %d", index + 1, count);
-            heading += of;
-        }
+        const bool editing = g_timerEditing.load();
+
+        // The name it goes by, as typed into the settings, rather than the
+        // page's own label — with eight of these, which one you are looking at
+        // is the useful thing to say here.
+        const std::wstring heading = TimerNameFor(index);
+        mutedBrush_->SetOpacity(0.55f);
         target_->DrawTextW(heading.c_str(), static_cast<UINT32>(heading.size()),
                            smallTextFormat_.Get(),
-                           D2D1::RectF(left, rect.top + 32.0f, right, rect.top + 50.0f),
+                           D2D1::RectF(left, rect.top + 32.0f, right - 60.0f, rect.top + 50.0f),
                            mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
-        const wchar_t* status =
-            timer.finished ? L"Finished"
-                           : timer.running ? L"Running"
-                                           : (remaining < timer.durationSeconds - 0.5 ? L"Paused"
-                                                                                      : L"Ready");
+        std::wstring status =
+            editing ? L"Type a time"
+                    : (timer.finished ? L"Finished"
+                                      : (timer.running
+                                             ? L"Running"
+                                             : (remaining < timer.durationSeconds - 0.5
+                                                    ? L"Paused"
+                                                    : L"Ready")));
+        if (count > 1) {
+            wchar_t of[32] = {};
+            swprintf_s(of, L"%d / %d  ·  ", index + 1, count);
+            status = of + status;
+        }
+        mutedBrush_->SetOpacity(editing ? 0.85f : 0.45f);
         smallTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-        target_->DrawTextW(status, static_cast<UINT32>(wcslen(status)), smallTextFormat_.Get(),
+        target_->DrawTextW(status.c_str(), static_cast<UINT32>(status.size()),
+                           smallTextFormat_.Get(),
                            D2D1::RectF(left, rect.top + 32.0f, right, rect.top + 50.0f),
                            mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
         smallTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
 
-        const std::wstring clock = FormatTimerClock(remaining);
+        // While it is being typed the number shows the digits as they land,
+        // filling from the right, rather than the countdown underneath them.
+        std::wstring clock;
+        if (editing) {
+            const int typed = g_timerEditValue.load();
+            wchar_t buf[32] = {};
+            const int hours = typed / 10000;
+            const int minutes = (typed / 100) % 100;
+            const int secs = typed % 100;
+            if (hours > 0) {
+                swprintf_s(buf, L"%d:%02d:%02d", hours, minutes, secs);
+            } else {
+                swprintf_s(buf, L"%d:%02d", minutes, secs);
+            }
+            clock = buf;
+        } else {
+            clock = FormatTimerClock(remaining);
+        }
         if (hugeTextFormat_) {
             // A finished timer pulses, so a glance at the pill says so even
             // with the sound off.
@@ -6466,13 +6538,35 @@ class Renderer {
             // to leading left it in a state it had never been in, and the
             // calendar's day number and the weather page's temperature — both
             // drawn with it — sat left in their boxes from then on.
-            textBrush_->SetOpacity(alpha);
+            const D2D1_RECT_F clockBox = D2D1::RectF(rect.left + 60.0f, rect.top + 50.0f,
+                                                     rect.right - 60.0f, rect.top + 100.0f);
+            if (editing) {
+                // Lit while it is taking digits, so it reads as a field rather
+                // than as the countdown it replaced.
+                ComPtr<ID2D1SolidColorBrush> field;
+                target_->CreateSolidColorBrush(
+                    D2D1::ColorF(1, 1, 1, 0.07f * settingsOpacity_), &field);
+                if (field) {
+                    target_->FillRoundedRectangle(D2D1::RoundedRect(clockBox, 10.0f, 10.0f),
+                                                  field.Get());
+                }
+            }
+
+            ID2D1SolidColorBrush* clockBrush =
+                editing ? accentBrush_.Get() : textBrush_.Get();
+            clockBrush->SetOpacity(alpha);
             target_->DrawTextW(clock.c_str(), static_cast<UINT32>(clock.size()),
-                               hugeTextFormat_.Get(),
-                               D2D1::RectF(rect.left + 24.0f, rect.top + 50.0f,
-                                           rect.right - 24.0f, rect.top + 100.0f),
-                               textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                               hugeTextFormat_.Get(), clockBox, clockBrush,
+                               D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            accentBrush_->SetOpacity(1.0f);
             textBrush_->SetOpacity(0.90f);
+
+            const float ccx = (rect.left + rect.right) * 0.5f;
+            const float ccy = (rect.top + rect.bottom) * 0.5f;
+            g_timerClockRectPx.Set(ccx + (clockBox.left - ccx) * sizeScale_,
+                                   ccy + (clockBox.top - ccy) * sizeScale_,
+                                   ccx + (clockBox.right - ccx) * sizeScale_,
+                                   ccy + (clockBox.bottom - ccy) * sizeScale_);
         }
 
         // How much of the timer has gone.
@@ -6505,11 +6599,11 @@ class Renderer {
         };
         const bool many = count > 1;
         const TimerButtonSpec buttons[kTimerButtonCount] = {
-            {L"‹", 28.0f, false, many},
-            {L"− 1m", 50.0f, false, true},
-            {timer.running ? L"Pause" : L"Start", 74.0f, true, true},
-            {L"+ 1m", 50.0f, false, true},
-            {L"›", 28.0f, false, many},
+            {L"", 0.0f, false, many},   // Prev — drawn as a side arrow, below
+            {L"− 1m", 52.0f, false, true},
+            {timer.running ? L"Pause" : L"Start", 78.0f, true, true},
+            {L"+ 1m", 52.0f, false, true},
+            {L"", 0.0f, false, many},   // Next
             {L"Reset", 58.0f, false, true},
             {L"+ New", 54.0f, false, count < kTimerMaxCount},
             {L"Delete", 62.0f, false, many},
@@ -6523,32 +6617,85 @@ class Renderer {
         const float boxHeight = 24.0f;
         const int hovered = g_hoveredTimerButton.load();
 
-        for (int row = 0; row < 2; ++row) {
-            const int first = row == 0 ? 0 : kTimerFirstRowCount;
-            const int last = row == 0 ? kTimerFirstRowCount : kTimerButtonCount;
+        auto publish = [&](int index, const D2D1_RECT_F& box) {
+            g_timerButtonRectPx[index].Set(pcx + (box.left - pcx) * sizeScale_,
+                                           pcy + (box.top - pcy) * sizeScale_,
+                                           pcx + (box.right - pcx) * sizeScale_,
+                                           pcy + (box.bottom - pcy) * sizeScale_);
+        };
 
-            float rowWidth = gap * (last - first - 1);
-            for (int i = first; i < last; ++i) {
-                rowWidth += buttons[i].width;
+        auto plate = [&](const D2D1_RECT_F& box, bool enabled, bool isHovered, float radius) {
+            ComPtr<ID2D1SolidColorBrush> bg;
+            target_->CreateSolidColorBrush(
+                D2D1::ColorF(1, 1, 1,
+                             (enabled ? (isHovered ? 0.16f : 0.075f) : 0.03f) * settingsOpacity_),
+                &bg);
+            if (bg) {
+                target_->FillRoundedRectangle(D2D1::RoundedRect(box, radius, radius), bg.Get());
             }
+        };
+
+        // The two arrows are pulled out of the row and set against the pill's
+        // edges, tall enough to hit without aiming. The right one stops short
+        // of the page dots rather than sitting under them.
+        const float arrowTop = rect.top + 113.0f;
+        const float arrowBottom = rect.top + 165.0f;
+        const D2D1_RECT_F arrows[2] = {
+            D2D1::RectF(rect.left + 12.0f, arrowTop, rect.left + 40.0f, arrowBottom),
+            D2D1::RectF(rect.right - 48.0f, arrowTop, rect.right - 20.0f, arrowBottom),
+        };
+
+        for (int side = 0; side < 2; ++side) {
+            const int index = side == 0 ? static_cast<int>(TimerButton::Prev)
+                                        : static_cast<int>(TimerButton::Next);
+            const D2D1_RECT_F box = arrows[side];
+            const bool isHovered = many && hovered == index;
+            plate(box, many, isHovered, 11.0f);
+
+            // Drawn rather than set: a chevron glyph at this size would be a
+            // speck in the middle of a tall plate.
+            const float cx = (box.left + box.right) * 0.5f;
+            const float cy = (box.top + box.bottom) * 0.5f;
+            const float reach = 4.6f;
+            const float rise = 7.4f;
+            const float tipX = cx + (side == 0 ? -reach : reach);
+            const float baseX = cx + (side == 0 ? reach : -reach);
+            textBrush_->SetOpacity(many ? (isHovered ? 1.0f : 0.88f) : 0.24f);
+            target_->DrawLine(D2D1::Point2F(baseX, cy - rise), D2D1::Point2F(tipX, cy),
+                              textBrush_.Get(), 2.0f);
+            target_->DrawLine(D2D1::Point2F(tipX, cy), D2D1::Point2F(baseX, cy + rise),
+                              textBrush_.Get(), 2.0f);
+            textBrush_->SetOpacity(0.90f);
+
+            publish(index, box);
+        }
+
+        // What is left runs in two centred rows between them: this countdown's
+        // own controls above, the ones that manage the list below.
+        const int rows[2][4] = {
+            {static_cast<int>(TimerButton::Minus), static_cast<int>(TimerButton::Start),
+             static_cast<int>(TimerButton::Plus), -1},
+            {static_cast<int>(TimerButton::Reset), static_cast<int>(TimerButton::New),
+             static_cast<int>(TimerButton::Delete), static_cast<int>(TimerButton::Clock)},
+        };
+
+        for (int row = 0; row < 2; ++row) {
+            float rowWidth = 0.0f;
+            int members = 0;
+            for (int slot = 0; slot < 4 && rows[row][slot] >= 0; ++slot) {
+                rowWidth += buttons[rows[row][slot]].width;
+                ++members;
+            }
+            rowWidth += gap * (members - 1);
 
             float x = pcx - rowWidth * 0.5f;
-            for (int i = first; i < last; ++i) {
-                const TimerButtonSpec& spec = buttons[i];
+            for (int slot = 0; slot < members; ++slot) {
+                const int index = rows[row][slot];
+                const TimerButtonSpec& spec = buttons[index];
                 const D2D1_RECT_F box =
                     D2D1::RectF(x, rowTop[row], x + spec.width, rowTop[row] + boxHeight);
-                const bool isHovered = spec.enabled && hovered == i;
-
-                ComPtr<ID2D1SolidColorBrush> bg;
-                target_->CreateSolidColorBrush(
-                    D2D1::ColorF(1, 1, 1,
-                                 (spec.enabled ? (isHovered ? 0.16f : 0.075f) : 0.03f) *
-                                     settingsOpacity_),
-                    &bg);
-                if (bg) {
-                    target_->FillRoundedRectangle(
-                        D2D1::RoundedRect(box, boxHeight * 0.5f, boxHeight * 0.5f), bg.Get());
-                }
+                const bool isHovered = spec.enabled && hovered == index;
+                plate(box, spec.enabled, isHovered, boxHeight * 0.5f);
 
                 ID2D1SolidColorBrush* label =
                     spec.primary ? accentBrush_.Get() : textBrush_.Get();
@@ -6561,10 +6708,7 @@ class Renderer {
                                    label, D2D1_DRAW_TEXT_OPTIONS_CLIP);
                 smallTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
 
-                g_timerButtonRectPx[i].Set(pcx + (box.left - pcx) * sizeScale_,
-                                           pcy + (box.top - pcy) * sizeScale_,
-                                           pcx + (box.right - pcx) * sizeScale_,
-                                           pcy + (box.bottom - pcy) * sizeScale_);
+                publish(index, box);
                 x += spec.width + gap;
             }
         }
@@ -6622,14 +6766,13 @@ class Renderer {
                            D2D1::RectF(tx, cy - 22, textRight, cy - 2),
                            textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
-        // With more than one on the go, which of them this is matters as much
-        // as what it is doing.
-        std::wstring caption = timer.finished ? L"Timer finished"
-                                              : (timer.running ? L"Timer" : L"Paused");
-        if (count > 1) {
-            wchar_t of[32] = {};
-            swprintf_s(of, L"  ·  %d / %d", index + 1, count);
-            caption += of;
+        // The name says which of them this is, so the caption only has to add
+        // what it is doing — and only when that is not simply counting down.
+        std::wstring caption = TimerNameFor(index);
+        if (timer.finished) {
+            caption += L"  ·  Finished";
+        } else if (!timer.running) {
+            caption += L"  ·  Paused";
         }
         mutedBrush_->SetOpacity(0.62f * pulse);
         target_->DrawTextW(caption.c_str(), static_cast<UINT32>(caption.size()),
@@ -8871,6 +9014,38 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION) {
         auto* kbd = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
 
+        // Typing a time into the timer page. Only the keys this uses are
+        // swallowed, and only while the number is open for editing.
+        if (g_timerEditing.load() && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
+            const DWORD vk = kbd->vkCode;
+            int digit = -1;
+            if (vk >= '0' && vk <= '9') {
+                digit = static_cast<int>(vk - '0');
+            } else if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) {
+                digit = static_cast<int>(vk - VK_NUMPAD0);
+            }
+
+            if (digit >= 0) {
+                const int value = g_timerEditValue.load();
+                if (value < 100000) {  // six digits is HHMMSS, and full
+                    g_timerEditValue = value * 10 + digit;
+                }
+                g_timerEditIdleSince = GetTickCount64();
+                return 1;
+            }
+            if (vk == VK_BACK) {
+                g_timerEditValue = g_timerEditValue.load() / 10;
+                g_timerEditIdleSince = GetTickCount64();
+                return 1;
+            }
+            if (vk == VK_RETURN || vk == VK_ESCAPE) {
+                if (HWND target = g_hwnd) {
+                    PostMessageW(target, WM_APP_TIMER_EDIT, vk == VK_RETURN ? 0 : 1, 0);
+                }
+                return 1;
+            }
+        }
+
         if (kbd->vkCode == VK_CAPITAL || kbd->vkCode == VK_NUMLOCK) {
             // Arm the sweep that hides the laptop maker's own lock-key card.
             // Armed on the way down, before the key reaches the utility that
@@ -9195,6 +9370,29 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             RemoveClipboardFormatListener(hwnd);
             DeregisterShellHookWindow(hwnd);
             return 0;
+
+        case WM_APP_TIMER_EDIT: {
+            const bool commit = wParam == 0;
+            const int typed = g_timerEditValue.exchange(0);
+            g_timerEditing = false;
+            if (commit && typed > 0) {
+                const int seconds = (typed / 10000) * 3600 +
+                                    ((typed / 100) % 100) * 60 +
+                                    typed % 100;
+                std::lock_guard lock(g_stateMutex);
+                if (!g_state.timer.timers.empty()) {
+                    TimerEntry& timer =
+                        g_state.timer.timers[TimerSelectedIndex(g_state.timer)];
+                    timer.durationSeconds =
+                        ClampInt(seconds, kTimerMinSeconds, kTimerMaxSeconds);
+                    timer.running = false;
+                    timer.finished = false;
+                    timer.remaining = timer.durationSeconds;
+                }
+            }
+            g_layoutDirty = true;
+            return 0;
+        }
 
         case WM_APP_CAPSLOCK: {
             bool isNum = (wParam == VK_NUMLOCK);
@@ -9547,6 +9745,29 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                             }).detach();
                             return 0;
                         }
+                    }
+                }
+
+                // Clicking the countdown opens it for typing; clicking it
+                // again puts the typed time in. Clicking anything else on the
+                // page closes it without changing anything.
+                if (g_timerHitValid.load()) {
+                    const float fx = static_cast<float>(xPos);
+                    const float fy = static_cast<float>(yPos);
+                    if (g_timerClockRectPx.Contains(fx, fy)) {
+                        if (g_timerEditing.load()) {
+                            PostMessageW(hwnd, WM_APP_TIMER_EDIT, 0, 0);
+                        } else {
+                            g_timerEditValue = 0;
+                            g_timerEditIdleSince = GetTickCount64();
+                            g_timerEditing = true;
+                        }
+                        g_layoutDirty = true;
+                        return 0;
+                    }
+                    if (g_timerEditing.exchange(false)) {
+                        g_timerEditValue = 0;
+                        g_layoutDirty = true;
                     }
                 }
 
@@ -10221,6 +10442,18 @@ DWORD WINAPI RenderThreadProc(void*) {
                     if (clamped != tab) {
                         g_idleTab = clamped;
                         g_layoutDirty = true;
+                        needsRender = true;
+                    }
+                }
+
+                // Typing a time ends when the pointer leaves the pill, or
+                // after a long enough pause that it has plainly been forgotten
+                // about. Either way the hook stops swallowing digits.
+                if (g_timerEditing.load()) {
+                    const uint64_t idleFor = GetTickCount64() - g_timerEditIdleSince.load();
+                    if (!hover || idleFor > 15000) {
+                        g_timerEditing = false;
+                        g_timerEditValue = 0;
                         needsRender = true;
                     }
                 }
