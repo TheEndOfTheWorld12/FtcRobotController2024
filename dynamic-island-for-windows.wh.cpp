@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.18.1
+// @version         1.18.2
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -4215,7 +4215,6 @@ void TimerReset() {
 // rather than jumping when the length changes underneath it.
 void TimerAdjust(int deltaSeconds) {
     const double now = NowSeconds();
-    int stored = 0;
     {
         std::lock_guard lock(g_stateMutex);
         TimerSnapshot& timer = g_state.timer;
@@ -4234,10 +4233,12 @@ void TimerAdjust(int deltaSeconds) {
             timer.finished = false;
             timer.remaining = duration;
         }
-        stored = duration;
     }
-    // Remembered, so the pill comes back set to whatever was last chosen.
-    Wh_SetIntValue(L"TimerDurationSeconds", stored);
+    // The length is remembered, but not from here. Wh_SetIntValue goes to
+    // Windhawk's store, and this runs on the thread that draws the pill:
+    // pressing + ten times to reach ten minutes would be ten writes into ten
+    // consecutive frames. The render loop persists it instead, once a second
+    // and only when it has actually moved.
 }
 
 void OpenWindowsClock() {
@@ -5376,11 +5377,15 @@ class Renderer {
         // inflation and the nudge spring.
         const float scaleForPopup = std::max(settings.sizeScale, 0.01f);
         privacyPopup_ = BuildPrivacyPopup(state, g_hoveredPrivacyDot.load());
-        privacyPopupBelow_ = EffectivePosition() != Position::BottomCenter;
-        const float popupExtra =
-            privacyPopup_.valid
-                ? (privacyPopup_.height + kPrivacyPopupGap) * scaleForPopup + 6.0f
-                : 0.0f;
+        privacyPopupBelow_ = true;
+        float popupExtra = 0.0f;
+        if (privacyPopup_.valid) {
+            // Only asked when there is a card to place. EffectivePosition
+            // reads a stored value, and this is the frame path — it runs
+            // sixty times a second whenever anything on the pill is moving.
+            privacyPopupBelow_ = EffectivePosition() != Position::BottomCenter;
+            popupExtra = (privacyPopup_.height + kPrivacyPopupGap) * scaleForPopup + 6.0f;
+        }
 
         const int pixelWidth = std::max(1, static_cast<int>(std::ceil(width + kRenderPadX * 2.0f)));
         const int pixelHeight =
@@ -6211,7 +6216,7 @@ class Renderer {
             row(L"Weather", L"Updating\u2026");
         }
 
-        smallTextFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+        smallTextFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         textBrush_->SetOpacity(0.90f);
         mutedBrush_->SetOpacity(0.58f);
     }
@@ -6271,14 +6276,17 @@ class Renderer {
             } else if (!timer.running) {
                 alpha = 0.72f;
             }
+            // Left alone deliberately: this format is created centred, which
+            // is what the countdown wants. Setting it and then "restoring" it
+            // to leading left it in a state it had never been in, and the
+            // calendar's day number and the weather page's temperature — both
+            // drawn with it — sat left in their boxes from then on.
             textBrush_->SetOpacity(alpha);
-            hugeTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
             target_->DrawTextW(clock.c_str(), static_cast<UINT32>(clock.size()),
                                hugeTextFormat_.Get(),
                                D2D1::RectF(rect.left + 24.0f, rect.top + 52.0f,
                                            rect.right - 24.0f, rect.top + 106.0f),
                                textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
-            hugeTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
             textBrush_->SetOpacity(0.90f);
         }
 
@@ -6805,7 +6813,7 @@ class Renderer {
                                D2D1::RectF(textLeft, rect.top + 18.0f * scale, right,
                                            rect.top + 32.0f * scale),
                                mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
-            smallTextFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+            smallTextFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
 
             mutedBrush_->SetOpacity(0.58f);
             textBrush_->SetOpacity(1.0f);
@@ -9968,6 +9976,21 @@ DWORD WINAPI RenderThreadProc(void*) {
                 if (timerSecond != prevTimerSecond) {
                     prevTimerSecond = timerSecond;
                     needsRender = true;
+                }
+
+                // Remembering the chosen length, coalesced: the ± buttons move
+                // it a minute at a time and each press would otherwise be a
+                // write into Windhawk's store from the frame that handled the
+                // click. Seeded from what is already stored, so a session that
+                // never touches the timer never writes at all.
+                static int persistedDuration = Wh_GetIntValue(L"TimerDurationSeconds", 300);
+                static double nextDurationWrite = 0.0;
+                if (now >= nextDurationWrite) {
+                    nextDurationWrite = now + 1.0;
+                    if (snapshot.timer.durationSeconds != persistedDuration) {
+                        persistedDuration = snapshot.timer.durationSeconds;
+                        Wh_SetIntValue(L"TimerDurationSeconds", persistedDuration);
+                    }
                 }
             }
 
