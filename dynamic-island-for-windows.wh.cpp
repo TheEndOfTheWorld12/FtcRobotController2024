@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.18.2
+// @version         1.19.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -706,6 +706,17 @@ struct AtomicRect {
 // 1 the bottom, -1 neither.
 std::atomic<bool> g_pageNavHitValid = false;
 std::atomic<int> g_hoveredPageNav = -1;
+
+// How many pages the renderer actually laid out — published, like everything
+// else here, rather than worked out a second time.
+//
+// The click handler used to derive this from whether a media session exists.
+// That was the same answer right up until a running timer began taking the
+// pill for itself: the session is still there, so the handler counted the
+// media page, while the renderer had stopped drawing it. The index then sat
+// one past the last page, where the view wrapped around to the first and the
+// down arrow, correctly, refused to go anywhere.
+std::atomic<int> g_pageCount = kIdleTabCount;
 
 // The timer page's five buttons, in the order they are drawn.
 enum class TimerButton {
@@ -6692,6 +6703,7 @@ class Renderer {
     // Page controls along the top and bottom edges, with the position dots
     // kept on the right edge (shifted clear of the privacy dots).
     void DrawPageNav(const SharedState& state, D2D1_RECT_F rect, int tab, int count) {
+        g_pageCount = count;
         DrawPageNavStrip(rect, true, tab > 0);
         DrawPageNavStrip(rect, false, tab < count - 1);
 
@@ -9364,7 +9376,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 // the strips the renderer published as it drew them rather than
                 // against a second calculation of where they ought to be.
                 {
-                    const int tabCount = mediaActive ? kMediaTabCount : kIdleTabCount;
+                    const int tabCount = std::max(1, g_pageCount.load());
                     const int arrow = HitTestPageNav(xPos, yPos);
                     if (arrow == 0) {
                         if (g_idleTab > 0) {
@@ -9968,6 +9980,22 @@ DWORD WINAPI RenderThreadProc(void*) {
                 }
                 if (g_hoveredPageNav.exchange(hoveredArrow) != hoveredArrow) {
                     needsRender = true;
+                }
+
+                // The number of pages moves under the index — a timer taking
+                // the pill takes the media page with it — and an index left
+                // past the end shows the first page while the down arrow says
+                // there is nowhere to go. Bring it back to the last page that
+                // exists, which is the one it was on before the count shrank.
+                if (g_pageNavHitValid.load()) {
+                    const int pageCount = std::max(1, g_pageCount.load());
+                    const int tab = g_idleTab.load();
+                    const int clamped = ClampInt(tab, 0, pageCount - 1);
+                    if (clamped != tab) {
+                        g_idleTab = clamped;
+                        g_layoutDirty = true;
+                        needsRender = true;
+                    }
                 }
 
                 static int prevTimerSecond = -1;
