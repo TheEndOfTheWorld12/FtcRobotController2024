@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.22.0
+// @version         1.23.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -44,8 +44,9 @@ media, downloads, clipboard, battery, and more.
   place and condition, feels-like, humidity and wind. No clock: the date and
   time live on the calendar page one hover away.
 - Timer page: keep up to eight countdowns and step between them with the
-  arrows down either edge of the pill. Name them in the settings and the name
-  is what the page and the resting pill call them. Click the number and type a
+  arrows down either edge of the pill. Click a name to type a new one, or set
+  them all at once in the settings; the name is what the page and the resting
+  pill call them. Click the number and type a
   time straight in, or step it a minute at a time, and drag the bar to move a
   countdown along without changing its length; start, pause, reset, add and
   delete, with a button to open the Windows Clock app beside them.
@@ -763,6 +764,18 @@ constexpr UINT WM_APP_TIMER_EDIT = WM_APP + 0x448;  // wParam: 0 commit, 1 cance
 std::atomic<bool> g_timerEditing = false;
 std::atomic<int> g_timerEditValue = 0;   // as typed: 1230 reads as 12:30
 std::atomic<uint64_t> g_timerEditIdleSince = 0;
+
+// Renaming one, the same way round: clicking the name opens it, the hook
+// forwards the keys it accepts and swallows them, and the same two exits
+// apply. wParam carries the character, with backspace, return and escape
+// arriving as their own control codes.
+constexpr UINT WM_APP_TIMER_NAME_KEY = WM_APP + 0x449;
+constexpr int kTimerNameMaxChars = 22;
+std::atomic<bool> g_timerNameEditing = false;
+std::atomic<uint64_t> g_timerNameIdleSince = 0;
+// Only ever touched on the thread that owns the overlay window, which is also
+// the thread that draws — the hook posts to it rather than writing here.
+std::wstring g_timerNameDraft;
 std::atomic<bool> g_timerHitValid = false;
 std::atomic<int> g_hoveredTimerButton = -1;
 
@@ -775,6 +788,7 @@ AtomicRect g_privacyDotRectPx[3];
 AtomicRect g_privacyPopupRectPx;
 AtomicRect g_timerButtonRectPx[kTimerButtonCount];
 AtomicRect g_timerClockRectPx;
+AtomicRect g_timerNameRectPx;
 
 // The timer page's bar, dragged the same way the timeline and the volume bar
 // are, and published the same way: the renderer records where it drew it.
@@ -4289,14 +4303,68 @@ void LoadTimers() {
     g_state.timer = std::move(loaded);
 }
 
-// What one countdown is called: whatever the settings list has at that
-// position, or a plain numbered name when the list does not reach it.
+int TimerSelectedIndex(const TimerSnapshot& timers) {
+    if (timers.timers.empty()) {
+        return 0;
+    }
+    return ClampInt(timers.selected, 0, static_cast<int>(timers.timers.size()) - 1);
+}
+
+// Names typed into the pill itself, which override the settings list for that
+// position. Kept in memory as well as in the store, because the name is read
+// on every frame that draws a timer and the store is not a per-frame thing.
+std::wstring g_timerNameCache[kTimerMaxCount];
+
+std::wstring TimerStoredName(int index) {
+    wchar_t key[32] = {};
+    swprintf_s(key, L"TimerName%d", index);
+    PCWSTR value = Wh_GetStringValue(key, L"");
+    std::wstring result = value ? value : L"";
+    Wh_FreeStringValue(value);
+    return result;
+}
+
+void LoadTimerNames() {
+    for (int i = 0; i < kTimerMaxCount; ++i) {
+        g_timerNameCache[i] = TimerStoredName(i);
+    }
+}
+
+// What one countdown is called: a name typed into the pill first, then the
+// settings list, then a plain numbered name when neither reaches it.
 std::wstring TimerNameFor(int index) {
+    if (index >= 0 && index < kTimerMaxCount && !g_timerNameCache[index].empty()) {
+        return g_timerNameCache[index];
+    }
     if (index >= 0 && index < static_cast<int>(g_settings.timerNames.size()) &&
         !g_settings.timerNames[index].empty()) {
         return g_settings.timerNames[index];
     }
     return L"Timer " + std::to_wstring(index + 1);
+}
+
+// Puts the draft away. An empty one clears the override, so the name falls
+// back to the settings list and then to the numbered name.
+void CommitTimerName() {
+    std::wstring name = g_timerNameDraft;
+    const size_t first = name.find_first_not_of(L" \t");
+    const size_t last = name.find_last_not_of(L" \t");
+    name = first == std::wstring::npos ? std::wstring() : name.substr(first, last - first + 1);
+
+    int index = 0;
+    {
+        std::lock_guard lock(g_stateMutex);
+        index = TimerSelectedIndex(g_state.timer);
+    }
+    if (index >= 0 && index < kTimerMaxCount) {
+        g_timerNameCache[index] = name;
+        wchar_t key[32] = {};
+        swprintf_s(key, L"TimerName%d", index);
+        Wh_SetStringValue(key, name.c_str());
+    }
+
+    g_timerNameEditing = false;
+    g_timerNameDraft.clear();
 }
 
 // Seconds left right now, whether the clock is running or stopped.
@@ -4305,13 +4373,6 @@ double TimerRemainingSeconds(const TimerEntry& timer, double now) {
         return std::max(0.0, timer.remaining);
     }
     return std::max(0.0, timer.endsAt - now);
-}
-
-int TimerSelectedIndex(const TimerSnapshot& timers) {
-    if (timers.timers.empty()) {
-        return 0;
-    }
-    return ClampInt(timers.selected, 0, static_cast<int>(timers.timers.size()) - 1);
 }
 
 // Which countdown the pill shows. A ringing one takes it; otherwise the one
@@ -6504,31 +6565,60 @@ class Renderer {
         const float right = rect.right - 34.0f;  // clear of the pagination dots
 
         const bool editing = g_timerEditing.load();
+        const bool naming = g_timerNameEditing.load();
 
-        // The name it goes by, as typed into the settings, rather than the
-        // page's own label — with eight of these, which one you are looking at
-        // is the useful thing to say here.
-        const std::wstring heading = TimerNameFor(index);
-        mutedBrush_->SetOpacity(0.55f);
+        // The name it goes by — and a field in its own right, since a name is
+        // no use if changing it means a trip to the settings.
+        const D2D1_RECT_F nameBox =
+            D2D1::RectF(left - 8.0f, rect.top + 28.0f, right - 66.0f, rect.top + 52.0f);
+        if (naming) {
+            ComPtr<ID2D1SolidColorBrush> field;
+            target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.07f * settingsOpacity_),
+                                           &field);
+            if (field) {
+                target_->FillRoundedRectangle(D2D1::RoundedRect(nameBox, 8.0f, 8.0f),
+                                              field.Get());
+            }
+        }
+
+        std::wstring heading = naming ? g_timerNameDraft : TimerNameFor(index);
+        if (naming && std::fmod(now, 1.0) < 0.5) {
+            heading += L"_";  // the name is left-aligned, so a caret can sit after it
+        }
+
+        ID2D1SolidColorBrush* nameBrush = naming ? accentBrush_.Get() : mutedBrush_.Get();
+        nameBrush->SetOpacity(naming ? 1.0f : 0.55f);
         target_->DrawTextW(heading.c_str(), static_cast<UINT32>(heading.size()),
                            smallTextFormat_.Get(),
-                           D2D1::RectF(left, rect.top + 32.0f, right - 60.0f, rect.top + 50.0f),
-                           mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                           D2D1::RectF(left, rect.top + 32.0f, right - 66.0f, rect.top + 50.0f),
+                           nameBrush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        accentBrush_->SetOpacity(1.0f);
+
+        {
+            const float ncx = (rect.left + rect.right) * 0.5f;
+            const float ncy = (rect.top + rect.bottom) * 0.5f;
+            g_timerNameRectPx.Set(ncx + (nameBox.left - ncx) * sizeScale_,
+                                  ncy + (nameBox.top - ncy) * sizeScale_,
+                                  ncx + (nameBox.right - ncx) * sizeScale_,
+                                  ncy + (nameBox.bottom - ncy) * sizeScale_);
+        }
 
         std::wstring status =
-            editing ? L"Type a time"
-                    : (timer.finished ? L"Finished"
-                                      : (timer.running
-                                             ? L"Running"
-                                             : (remaining < timer.durationSeconds - 0.5
-                                                    ? L"Paused"
-                                                    : L"Ready")));
+            naming ? L"Type a name"
+                   : (editing ? L"Type a time"
+                              : (timer.finished
+                                     ? L"Finished"
+                                     : (timer.running
+                                            ? L"Running"
+                                            : (remaining < timer.durationSeconds - 0.5
+                                                   ? L"Paused"
+                                                   : L"Ready"))));
         if (count > 1) {
             wchar_t of[32] = {};
             swprintf_s(of, L"%d / %d  ·  ", index + 1, count);
             status = of + status;
         }
-        mutedBrush_->SetOpacity(editing ? 0.85f : 0.45f);
+        mutedBrush_->SetOpacity(editing || naming ? 0.85f : 0.45f);
         smallTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
         target_->DrawTextW(status.c_str(), static_cast<UINT32>(status.size()),
                            smallTextFormat_.Get(),
@@ -9077,6 +9167,39 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION) {
         auto* kbd = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
 
+        // Typing a name into the timer page. The character is worked out here
+        // and posted; the window thread owns the draft, so the hook never
+        // touches a string or takes a lock. Anything this does not accept is
+        // left alone rather than swallowed.
+        if (g_timerNameEditing.load() && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
+            const DWORD vk = kbd->vkCode;
+            wchar_t ch = 0;
+            if (vk >= 'A' && vk <= 'Z') {
+                const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+                const bool caps = (GetKeyState(VK_CAPITAL) & 1) != 0;
+                ch = static_cast<wchar_t>(shift != caps ? vk : vk - 'A' + 'a');
+            } else if (vk >= '0' && vk <= '9') {
+                ch = static_cast<wchar_t>(vk);
+            } else if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) {
+                ch = static_cast<wchar_t>(L'0' + (vk - VK_NUMPAD0));
+            } else if (vk == VK_SPACE) {
+                ch = L' ';
+            } else if (vk == VK_OEM_MINUS || vk == VK_SUBTRACT) {
+                ch = L'-';
+            } else if (vk == VK_BACK || vk == VK_RETURN || vk == VK_ESCAPE) {
+                // These already are their own control codes.
+                ch = static_cast<wchar_t>(vk);
+            }
+
+            if (ch != 0) {
+                if (HWND target = g_hwnd) {
+                    PostMessageW(target, WM_APP_TIMER_NAME_KEY, ch, 0);
+                }
+                g_timerNameIdleSince = GetTickCount64();
+                return 1;
+            }
+        }
+
         // Typing a time into the timer page. Only the keys this uses are
         // swallowed, and only while the number is open for editing.
         if (g_timerEditing.load() && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
@@ -9457,6 +9580,25 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             RemoveClipboardFormatListener(hwnd);
             DeregisterShellHookWindow(hwnd);
             return 0;
+
+        case WM_APP_TIMER_NAME_KEY: {
+            const wchar_t ch = static_cast<wchar_t>(wParam);
+            if (ch == VK_ESCAPE) {
+                g_timerNameEditing = false;
+                g_timerNameDraft.clear();
+            } else if (ch == VK_RETURN) {
+                CommitTimerName();
+            } else if (ch == VK_BACK) {
+                if (!g_timerNameDraft.empty()) {
+                    g_timerNameDraft.pop_back();
+                }
+            } else if (ch >= L' ' &&
+                       static_cast<int>(g_timerNameDraft.size()) < kTimerNameMaxChars) {
+                g_timerNameDraft.push_back(ch);
+            }
+            g_layoutDirty = true;
+            return 0;
+        }
 
         case WM_APP_TIMER_EDIT: {
             const bool commit = wParam == 0;
@@ -9882,6 +10024,34 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 if (g_timerHitValid.load()) {
                     const float fx = static_cast<float>(xPos);
                     const float fy = static_cast<float>(yPos);
+
+                    // Clicking the name opens it for typing; clicking it again
+                    // puts the typed name in.
+                    if (g_timerNameRectPx.Contains(fx, fy)) {
+                        if (g_timerNameEditing.load()) {
+                            CommitTimerName();
+                        } else {
+                            g_timerEditing = false;
+                            g_timerEditValue = 0;
+                            int index = 0;
+                            {
+                                std::lock_guard lock(g_stateMutex);
+                                index = TimerSelectedIndex(g_state.timer);
+                            }
+                            // Seeded with the name it already has, so an edit
+                            // is an edit — but only a real one, not the
+                            // numbered stand-in, which would just be seven
+                            // keystrokes to delete.
+                            g_timerNameDraft = (index >= 0 && index < kTimerMaxCount)
+                                                   ? g_timerNameCache[index]
+                                                   : std::wstring();
+                            g_timerNameIdleSince = GetTickCount64();
+                            g_timerNameEditing = true;
+                        }
+                        g_layoutDirty = true;
+                        return 0;
+                    }
+
                     if (g_timerClockRectPx.Contains(fx, fy)) {
                         if (g_timerEditing.load()) {
                             PostMessageW(hwnd, WM_APP_TIMER_EDIT, 0, 0);
@@ -9895,6 +10065,10 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     }
                     if (g_timerEditing.exchange(false)) {
                         g_timerEditValue = 0;
+                        g_layoutDirty = true;
+                    }
+                    if (g_timerNameEditing.exchange(false)) {
+                        g_timerNameDraft.clear();
                         g_layoutDirty = true;
                     }
                 }
@@ -10608,6 +10782,14 @@ DWORD WINAPI RenderThreadProc(void*) {
                         needsRender = true;
                     }
                 }
+                if (g_timerNameEditing.load()) {
+                    const uint64_t idleFor = GetTickCount64() - g_timerNameIdleSince.load();
+                    if (!hover || idleFor > 15000) {
+                        g_timerNameEditing = false;
+                        g_timerNameDraft.clear();
+                        needsRender = true;
+                    }
+                }
 
                 static int prevTimerSecond = -1;
                 const TimerEntry& shownTimer = TimerShownEntry(snapshot.timer, now);
@@ -10813,6 +10995,7 @@ DWORD WINAPI RenderThreadProc(void*) {
 
 bool StartThreads() {
     LoadTimers();
+    LoadTimerNames();
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_settingsChangedEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!g_stopEvent || !g_settingsChangedEvent) {
