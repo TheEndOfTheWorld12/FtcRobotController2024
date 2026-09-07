@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.23.1
+// @version         1.24.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -29,7 +29,8 @@ media, downloads, clipboard, battery, and more.
   "Go to media" button beside the transport controls brings the player to
   the front — clicking elsewhere on the pill no longer does.
 - Clipboard, notification, volume, Caps/Num lock, device connect/disconnect and
-  battery alerts.
+  battery alerts. Bluetooth devices are watched too, by name: connect a pair of
+  headphones and the pill says which ones.
 - Privacy dots stacked at the right edge: green for the camera, orange for the
   microphone, blue for location. Hovering one opens a card naming every app
   holding that capability open.
@@ -215,6 +216,7 @@ shown; that is a platform limitation, not a mod bug.
 #include <dwmapi.h>
 #include <shellapi.h>
 #include <setupapi.h>
+#include <bluetoothapis.h>
 #include <dbt.h>
 #include <d2d1.h>
 #include <dwrite.h>
@@ -630,6 +632,7 @@ HANDLE g_renderThread = nullptr;
 HANDLE g_mediaThread = nullptr;
 HANDLE g_audioThread = nullptr;
 HANDLE g_weatherThread = nullptr;
+HANDLE g_bluetoothThread = nullptr;
 HANDLE g_notificationThread = nullptr;
 std::atomic<bool> g_running = false;
 std::atomic<int> g_idleTab = 0;
@@ -4563,6 +4566,154 @@ void OpenWindowsClock() {
         Wh_Log(L"Timer: could not open the Clock app (ms-clock: returned %lld).",
                static_cast<long long>(reinterpret_cast<INT_PTR>(result)));
     }
+}
+
+// ---- Bluetooth ----
+//
+// Windows broadcasts device arrival and removal to every top-level window for
+// volumes and ports only. Anything else needs a registration per interface
+// class, and a pair of headphones coming online is not one interface anyway —
+// which is why the existing handler's Bluetooth branch never fired. So the
+// radio's own list of connected devices is read instead, every couple of
+// seconds, and the difference between one reading and the next is the event.
+// It also carries the device's real name, which a broadcast would not.
+//
+// bthprops.cpl is loaded rather than linked, so the mod's compiler options
+// stay as they are.
+
+struct BluetoothConnection {
+    ULONGLONG address = 0;
+    std::wstring name;
+};
+
+bool PollConnectedBluetoothDevices(std::vector<BluetoothConnection>* out) {
+    using FindFirst_t = HBLUETOOTH_DEVICE_FIND(WINAPI*)(const BLUETOOTH_DEVICE_SEARCH_PARAMS*,
+                                                        BLUETOOTH_DEVICE_INFO*);
+    using FindNext_t = BOOL(WINAPI*)(HBLUETOOTH_DEVICE_FIND, BLUETOOTH_DEVICE_INFO*);
+    using FindClose_t = BOOL(WINAPI*)(HBLUETOOTH_DEVICE_FIND);
+
+    static HMODULE s_bthprops = LoadLibraryW(L"bthprops.cpl");
+    static auto s_findFirst = reinterpret_cast<FindFirst_t>(
+        s_bthprops ? GetProcAddress(s_bthprops, "BluetoothFindFirstDevice") : nullptr);
+    static auto s_findNext = reinterpret_cast<FindNext_t>(
+        s_bthprops ? GetProcAddress(s_bthprops, "BluetoothFindNextDevice") : nullptr);
+    static auto s_findClose = reinterpret_cast<FindClose_t>(
+        s_bthprops ? GetProcAddress(s_bthprops, "BluetoothFindDeviceClose") : nullptr);
+
+    if (!out || !s_findFirst || !s_findNext || !s_findClose) {
+        return false;
+    }
+
+    BLUETOOTH_DEVICE_SEARCH_PARAMS params = {};
+    params.dwSize = sizeof(params);
+    params.fReturnAuthenticated = TRUE;
+    params.fReturnRemembered = TRUE;
+    params.fReturnUnknown = FALSE;
+    params.fReturnConnected = TRUE;
+    // Emphatically not an inquiry: that is a live radio scan and takes about
+    // ten seconds. This reads what the driver already knows, which is quick.
+    params.fIssueInquiry = FALSE;
+    params.cTimeoutMultiplier = 0;
+    params.hRadio = nullptr;
+
+    BLUETOOTH_DEVICE_INFO info = {};
+    info.dwSize = sizeof(info);
+
+    HBLUETOOTH_DEVICE_FIND find = s_findFirst(&params, &info);
+    if (!find) {
+        // No radio, or nothing paired. An empty list, not a failure.
+        return true;
+    }
+
+    do {
+        if (info.fConnected) {
+            BluetoothConnection entry;
+            entry.address = info.Address.ullLong;
+            entry.name = info.szName;
+            if (entry.name.empty()) {
+                entry.name = L"Bluetooth device";
+            }
+            out->push_back(std::move(entry));
+        }
+        info = {};
+        info.dwSize = sizeof(info);
+    } while (s_findNext(find, &info));
+
+    s_findClose(find);
+    return true;
+}
+
+void AnnounceBluetoothDevice(const std::wstring& name, bool connected) {
+    {
+        std::lock_guard lock(g_stateMutex);
+        g_state.device.active = true;
+        g_state.device.eventType =
+            connected ? DeviceEventType::Connected : DeviceEventType::Disconnected;
+        g_state.device.deviceName = name;
+        g_state.device.isBluetoothLike = true;
+        g_state.device.expiresAt = NowSeconds() + 3.5;
+    }
+    TriggerNudge();
+}
+
+void RaiseBluetoothChanges(const std::vector<BluetoothConnection>& before,
+                           const std::vector<BluetoothConnection>& after) {
+    auto contains = [](const std::vector<BluetoothConnection>& list, ULONGLONG address) {
+        for (const BluetoothConnection& entry : list) {
+            if (entry.address == address) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // The pill shows one device at a time, and connecting a headset often
+    // drops something else in the same breath, so a connection is looked for
+    // first — it is the half worth seeing.
+    for (const BluetoothConnection& entry : after) {
+        if (!contains(before, entry.address)) {
+            AnnounceBluetoothDevice(entry.name, true);
+            return;
+        }
+    }
+    for (const BluetoothConnection& entry : before) {
+        if (!contains(after, entry.address)) {
+            AnnounceBluetoothDevice(entry.name, false);
+            return;
+        }
+    }
+}
+
+DWORD WINAPI BluetoothThreadProc(void*) {
+    // On its own thread rather than the render loop's polling section: reading
+    // the radio is usually quick but not guaranteed to be, and a stutter every
+    // two seconds would be worse than the feature is good.
+    std::vector<BluetoothConnection> previous;
+    bool seeded = false;
+
+    // Windows brings paired devices back a few seconds after sign-in, and
+    // announcing those is not news.
+    if (WaitForSingleObject(g_stopEvent, 5000) != WAIT_TIMEOUT) {
+        return 0;
+    }
+
+    while (WaitForSingleObject(g_stopEvent, 0) == WAIT_TIMEOUT) {
+        std::vector<BluetoothConnection> current;
+        if (PollConnectedBluetoothDevices(&current)) {
+            if (seeded) {
+                RaiseBluetoothChanges(previous, current);
+            }
+            previous = std::move(current);
+            seeded = true;
+        } else {
+            return 0;  // no Bluetooth stack on this machine; nothing to watch
+        }
+
+        if (WaitForSingleObject(g_stopEvent, 2000) != WAIT_TIMEOUT) {
+            break;
+        }
+    }
+    return 0;
 }
 
 void UpdateProgressSnapshot() {
@@ -8799,26 +8950,37 @@ class Renderer {
             : D2D1::ColorF(1.0f,  0.27f, 0.22f, 1.0f);  // red
         target_->CreateSolidColorBrush(dotColor, &dotBrush);
 
-        // Draw USB plug icon using simple rects
-        const float px = (badge.left + badge.right) * 0.5f;
-        const float py = (badge.top + badge.bottom) * 0.5f;
-        const float ps = badgeSz * 0.28f;
-
         ComPtr<ID2D1SolidColorBrush> iconBrush;
         target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.90f), &iconBrush);
 
-        // Plug body
-        D2D1_RECT_F plug = D2D1::RectF(px - ps * 0.4f, py - ps * 0.8f, px + ps * 0.4f, py + ps * 0.6f);
-        target_->FillRoundedRectangle(D2D1::RoundedRect(plug, 1.5f, 1.5f), iconBrush.Get());
-        // Plug prong left
-        D2D1_RECT_F pl = D2D1::RectF(px - ps * 0.35f, py - ps * 1.2f, px - ps * 0.12f, py - ps * 0.8f);
-        target_->FillRectangle(pl, iconBrush.Get());
-        // Plug prong right
-        D2D1_RECT_F pr = D2D1::RectF(px + ps * 0.12f, py - ps * 1.2f, px + ps * 0.35f, py - ps * 0.8f);
-        target_->FillRectangle(pr, iconBrush.Get());
-        // Plug cord
-        D2D1_RECT_F cord = D2D1::RectF(px - ps * 0.1f, py + ps * 0.6f, px + ps * 0.1f, py + ps * 1.0f);
-        target_->FillRoundedRectangle(D2D1::RoundedRect(cord, 1.0f, 1.0f), iconBrush.Get());
+        if (state.device.isBluetoothLike && iconFormat_) {
+            // A Bluetooth device is not a plug, and the icon font already has
+            // the rune for it.
+            iconFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+            iconFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            target_->DrawTextW(L"\uE702", 1, iconFormat_.Get(), badge, iconBrush.Get(),
+                               D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            iconFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            iconFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        } else {
+            // Drawn USB plug: body, two prongs and a cord.
+            const float px = (badge.left + badge.right) * 0.5f;
+            const float py = (badge.top + badge.bottom) * 0.5f;
+            const float ps = badgeSz * 0.28f;
+
+            D2D1_RECT_F plug =
+                D2D1::RectF(px - ps * 0.4f, py - ps * 0.8f, px + ps * 0.4f, py + ps * 0.6f);
+            target_->FillRoundedRectangle(D2D1::RoundedRect(plug, 1.5f, 1.5f), iconBrush.Get());
+            D2D1_RECT_F pl =
+                D2D1::RectF(px - ps * 0.35f, py - ps * 1.2f, px - ps * 0.12f, py - ps * 0.8f);
+            target_->FillRectangle(pl, iconBrush.Get());
+            D2D1_RECT_F pr =
+                D2D1::RectF(px + ps * 0.12f, py - ps * 1.2f, px + ps * 0.35f, py - ps * 0.8f);
+            target_->FillRectangle(pr, iconBrush.Get());
+            D2D1_RECT_F cord =
+                D2D1::RectF(px - ps * 0.1f, py + ps * 0.6f, px + ps * 0.1f, py + ps * 1.0f);
+            target_->FillRoundedRectangle(D2D1::RoundedRect(cord, 1.0f, 1.0f), iconBrush.Get());
+        }
 
         // Status dot (bottom-right of badge)
         D2D1_POINT_2F dotCenter = D2D1::Point2F(badge.right - 4.5f, badge.bottom - 4.5f);
@@ -8827,7 +8989,10 @@ class Renderer {
         // Text block
         const float tx = badge.right + 14;
         mutedBrush_->SetOpacity(0.50f);
-        std::wstring label = connected ? L"Device Connected" : L"Device Removed";
+        std::wstring label =
+            state.device.isBluetoothLike
+                ? (connected ? L"Bluetooth connected" : L"Bluetooth disconnected")
+                : (connected ? L"Device Connected" : L"Device Removed");
         D2D1_RECT_F labelRect = D2D1::RectF(tx, cy - 22, rect.right - 14, cy - 5);
         target_->DrawTextW(label.c_str(), static_cast<UINT32>(label.size()),
                            smallTextFormat_.Get(), labelRect, mutedBrush_.Get(),
@@ -11016,6 +11181,7 @@ bool StartThreads() {
     g_mediaThread = CreateThread(nullptr, 0, MediaThreadProc, nullptr, 0, nullptr);
     g_audioThread = CreateThread(nullptr, 0, AudioThreadProc, nullptr, 0, nullptr);
     g_weatherThread = CreateThread(nullptr, 0, WeatherThreadProc, nullptr, 0, nullptr);
+    g_bluetoothThread = CreateThread(nullptr, 0, BluetoothThreadProc, nullptr, 0, nullptr);
     g_keyboardThread = CreateThread(nullptr, 0, KeyboardThreadProc, nullptr, 0, &g_keyboardThreadId);
 #if DYNAMIC_ISLAND_HAS_USER_NOTIFICATION_LISTENER
     g_notificationThread = CreateThread(nullptr, 0, NotificationThreadProc, nullptr, 0, nullptr);
@@ -11032,7 +11198,9 @@ void StopThreads() {
         SetEvent(g_stopEvent);
     }
 
-    HANDLE handles[] = {g_renderThread, g_mediaThread, g_audioThread, g_weatherThread, g_notificationThread, g_keyboardThread};
+    HANDLE handles[] = {g_renderThread,       g_mediaThread,        g_audioThread,
+                        g_weatherThread,      g_bluetoothThread,    g_notificationThread,
+                        g_keyboardThread};
     for (HANDLE handle : handles) {
         if (handle) {
             WaitForSingleObject(handle, 3000);
@@ -11044,6 +11212,7 @@ void StopThreads() {
     g_mediaThread = nullptr;
     g_audioThread = nullptr;
     g_weatherThread = nullptr;
+    g_bluetoothThread = nullptr;
     g_notificationThread = nullptr;
     g_keyboardThread = nullptr;
     g_keyboardThreadId = 0;
