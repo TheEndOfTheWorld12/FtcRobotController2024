@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.18.0
+// @version         1.18.1
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -45,8 +45,8 @@ media, downloads, clipboard, battery, and more.
   time live on the calendar page one hover away.
 - Timer page: set a length a minute at a time, start, pause and reset it, and
   a button to open the Windows Clock app beside it. A counting timer takes the
-  resting pill, ahead of the media readout and the weather, and the pill beeps
-  and pulses when it ends. Hovering still opens the whole dashboard.
+  pill to itself, ahead of the media readout and the weather, and the pill
+  beeps and pulses when it ends. Hovering still opens the whole dashboard.
 - Idle dashboard with calendar and live weather. The weather page carries
   feels-like, humidity, dew point, wind, chance of precipitation, UV index,
   air quality, visibility and pressure; the resting pill keeps its short
@@ -8586,17 +8586,16 @@ Activity ActivityForKind(IslandKind kind, const Settings& settings, const Shared
 }
 
 // The order these are pushed in is the order they are shown in: the first is
-// the pill, the second sits beside it, and the rest wait. A timer that is
-// counting, or one that has just rung, outranks everything — audio comes next,
-// and the resting weather readout is what is left when nothing else is going
-// on. Everything in between is a brief interruption, and with the timer ahead
-// of them they now appear alongside it rather than in place of it.
+// the pill, the second sits beside it, and the rest wait.
+//
+// The brief alerts come first. Each is a moment long and hands the pill
+// straight back, which is the whole of what they do — a volume change has to
+// be able to show itself, and with the system flyout suppressed the pill is
+// the only place it can. Then the timer, then audio, and the resting weather
+// readout is what is left when nothing else is going on.
 std::vector<IslandKind> ChooseActivities(const SharedState& state, const Settings& settings, double now) {
     std::vector<IslandKind> activities;
 
-    if (state.timer.running || state.timer.finished) {
-        activities.push_back(IslandKind::Timer);
-    }
     if (state.clipboard.active && now < state.clipboard.expiresAt) {
         activities.push_back(IslandKind::Clipboard);
     }
@@ -8615,6 +8614,12 @@ std::vector<IslandKind> ChooseActivities(const SharedState& state, const Setting
     if (settings.battery && state.battery.active && now < state.battery.expiresAt) {
         activities.push_back(IslandKind::BatteryLow);
     }
+
+    const bool timerActive = state.timer.running || state.timer.finished;
+    if (timerActive) {
+        activities.push_back(IslandKind::Timer);
+    }
+
     if (settings.progress && state.progress.active) {
         activities.push_back(IslandKind::Progress);
     }
@@ -8624,6 +8629,14 @@ std::vector<IslandKind> ChooseActivities(const SharedState& state, const Setting
 
     if (activities.empty()) {
         activities.push_back(IslandKind::Idle);
+    }
+
+    // A timer gets the pill to itself. Everywhere else two things going on at
+    // once are shown side by side, but a track playing under a countdown would
+    // park a second pill next to it for the length of the timer, which is not
+    // a passing overlap — it is the normal case, and it reads as clutter.
+    if (timerActive && activities.size() > 1) {
+        activities.resize(1);
     }
 
     return activities;
