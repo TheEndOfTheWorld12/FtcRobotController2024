@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.25.0
+// @version         1.26.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -24,9 +24,9 @@ media, downloads, clipboard, battery, and more.
   pill to put them all back.
 - Arrows left of the transport controls step between the apps actually
   producing audio, so the pill can be pointed at a second player without
-  pausing the first. Apps that merely registered with Windows' transport
-  controls and sit paused — browser tabs that once played a notification
-  sound, for instance — are left out. They dim when there is only one.
+  pausing the first. Everything Windows reports is offered, playing or not, so
+  a video queued up and paused can be started from the pill. They dim when
+  there is only one.
 - Live media pill with album art, waveform, playback controls, and a
   video-player-style scrubber: hovering thickens the bar and grows a knob at
   the playhead, and clicking or dragging seeks within the track. A
@@ -2095,12 +2095,10 @@ DWORD WINAPI MediaThreadProc(void*) {
                 auto sessions = manager.GetSessions();
 
                 std::wstring wanted;
-                std::wstring showing;
                 std::vector<std::wstring> hiddenApps;
                 {
                     std::lock_guard lock(g_stateMutex);
                     wanted = g_selectedSessionId;
-                    showing = g_state.media.sessionKey;
                     hiddenApps = g_hiddenMediaApps;
                 }
 
@@ -2160,39 +2158,19 @@ DWORD WINAPI MediaThreadProc(void*) {
                     }
                 }
 
-                // Anything that has played while the mod has been running stays
-                // in the list even once it is paused, so pausing one track and
-                // starting another does not lose the first. Sessions that never
-                // played — browser tabs registered by a notification sound and
-                // sat idle ever since — stay out.
-                static std::vector<std::wstring> s_playedKeys;
+                // Everything Windows reports, whether it has played or not.
+                //
+                // This used to hold a session back until it had played once,
+                // to keep out apps that register with the transport controls
+                // and then sit there. That was a guess standing in for a
+                // decision, and it cost the case it was worst at: a video
+                // queued up and paused is exactly the thing you want the pill
+                // to be holding, so that pressing play on the pill is what
+                // starts it. Dismissing a source is the explicit version of
+                // what the guess was reaching for, so the guess can go.
                 for (auto const& entry : keyed) {
-                    bool playing = false;
-                    try {
-                        auto info = entry.second.GetPlaybackInfo();
-                        playing = info && info.PlaybackStatus() == PlaybackStatus::Playing;
-                    } catch (...) {
-                    }
-                    if (playing &&
-                        std::find(s_playedKeys.begin(), s_playedKeys.end(), entry.first) ==
-                            s_playedKeys.end()) {
-                        s_playedKeys.push_back(entry.first);
-                    }
-                    if (std::find(s_playedKeys.begin(), s_playedKeys.end(), entry.first) !=
-                            s_playedKeys.end() ||
-                        entry.first == wanted || entry.first == showing) {
-                        next.sessionIds.push_back(entry.first);
-                    }
+                    next.sessionIds.push_back(entry.first);
                 }
-                // Forget sources that have gone away entirely.
-                s_playedKeys.erase(std::remove_if(s_playedKeys.begin(), s_playedKeys.end(),
-                                                  [&keyed](const std::wstring& key) {
-                                                      for (auto const& entry : keyed) {
-                                                          if (entry.first == key) return false;
-                                                      }
-                                                      return true;
-                                                  }),
-                                   s_playedKeys.end());
 
                 Session session{nullptr};
                 std::wstring sessionKey;
@@ -2225,16 +2203,28 @@ DWORD WINAPI MediaThreadProc(void*) {
                 }
                 if (!session) {
                     // Nothing is playing at all, so fall back to whatever
-                    // Windows considers current.
-                    session = manager.GetCurrentSession();
-                    if (session) {
-                        std::wstring appId = session.SourceAppUserModelId().c_str();
+                    // Windows considers current — but only if it survived the
+                    // filtering above, or a dismissed source would walk back in
+                    // through this door.
+                    Session current = manager.GetCurrentSession();
+                    const std::wstring currentId =
+                        current ? std::wstring(current.SourceAppUserModelId().c_str())
+                                : std::wstring();
+                    if (!currentId.empty()) {
                         for (auto const& entry : keyed) {
-                            if (entry.first.rfind(appId + L"#", 0) == 0) {
+                            if (entry.first.rfind(currentId + L"#", 0) == 0) {
+                                session = current;
                                 sessionKey = entry.first;
                                 break;
                             }
                         }
+                    }
+                    // Windows names nothing, or names something that was
+                    // dismissed. Either way there is still a list, so show the
+                    // first of it rather than nothing at all.
+                    if (!session && !keyed.empty()) {
+                        session = keyed.front().second;
+                        sessionKey = keyed.front().first;
                     }
                 }
                 if (!wanted.empty() && sessionKey != wanted) {
