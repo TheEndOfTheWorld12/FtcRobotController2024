@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.24.0
+// @version         1.25.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -18,6 +18,10 @@ A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to
 media, downloads, clipboard, battery, and more.
 
 ## Features
+- A cross beside those arrows dismisses a source: the pill stops offering it
+  and the arrows skip it, which is the answer to an app that registers with
+  Windows' transport controls and then never plays anything. Right-click the
+  pill to put them all back.
 - Arrows left of the transport controls step between the apps actually
   producing audio, so the pill can be pointed at a second player without
   pausing the first. Apps that merely registered with Windows' transport
@@ -871,6 +875,7 @@ PrivacyPopupInfo BuildPrivacyPopup(const SharedState& state, int dot) {
 }
 
 AtomicRect g_goToMediaRectPx;
+AtomicRect g_hideSourceRectPx;
 AtomicRect g_prevSourceRectPx;
 AtomicRect g_nextSourceRectPx;
 AtomicRect g_prevTrackRectPx;
@@ -881,6 +886,7 @@ AtomicRect g_nextTrackRectPx;
 // light up the way the "Go to media" button does.
 enum class MediaControl {
     None = 0,
+    HideSource,
     PrevSource,
     NextSource,
     PrevTrack,
@@ -889,6 +895,20 @@ enum class MediaControl {
     GoToMedia,
 };
 std::atomic<int> g_hoveredMediaControl = static_cast<int>(MediaControl::None);
+
+// Sources the user has dismissed, by app id.
+//
+// Nothing here deletes a media session: the session belongs to the app that
+// registered it, and only that app can take it back. What this does is stop
+// the pill offering one — the arrows skip it and it never becomes the pill's
+// subject — which is the useful half, since the sessions worth dismissing are
+// the ones an app registered and then never played anything through.
+//
+// Keyed by app id rather than by the ordinal key the arrows use, because the
+// ordinal moves as sessions come and go, and "never show me this app" is what
+// dismissing one actually means.
+constexpr int kMaxHiddenMediaApps = 8;
+std::vector<std::wstring> g_hiddenMediaApps;  // guarded by g_stateMutex
 
 // The source the user stepped to, as one of the keys above; empty while the
 // pill simply follows whichever session Windows considers current.
@@ -2076,10 +2096,12 @@ DWORD WINAPI MediaThreadProc(void*) {
 
                 std::wstring wanted;
                 std::wstring showing;
+                std::vector<std::wstring> hiddenApps;
                 {
                     std::lock_guard lock(g_stateMutex);
                     wanted = g_selectedSessionId;
                     showing = g_state.media.sessionKey;
+                    hiddenApps = g_hiddenMediaApps;
                 }
 
                 // Key each session by its app id plus an ordinal among the
@@ -2092,6 +2114,13 @@ DWORD WINAPI MediaThreadProc(void*) {
                 std::vector<std::pair<std::wstring, int>> seen;
                 for (auto const& candidate : sessions) {
                     std::wstring appId = candidate.SourceAppUserModelId().c_str();
+                    // Dismissed sources are dropped here, before anything is
+                    // keyed, so they are absent from the arrows, from the
+                    // pill, and from the log of what Windows reports.
+                    if (std::find(hiddenApps.begin(), hiddenApps.end(), appId) !=
+                        hiddenApps.end()) {
+                        continue;
+                    }
                     int ordinal = 0;
                     for (auto& entry : seen) {
                         if (entry.first == appId) {
@@ -5640,6 +5669,80 @@ void DismissTransientState() {
     Wh_SetIntValue(L"ProgressPercent", -1);
 }
 
+void PersistHiddenMediaApps(const std::vector<std::wstring>& apps) {
+    Wh_SetIntValue(L"HiddenMediaCount", static_cast<int>(apps.size()));
+    for (size_t i = 0; i < apps.size(); ++i) {
+        wchar_t key[32] = {};
+        swprintf_s(key, L"HiddenMedia%d", static_cast<int>(i));
+        Wh_SetStringValue(key, apps[i].c_str());
+    }
+}
+
+void LoadHiddenMediaApps() {
+    const int count = ClampInt(Wh_GetIntValue(L"HiddenMediaCount", 0), 0, kMaxHiddenMediaApps);
+    std::vector<std::wstring> loaded;
+    for (int i = 0; i < count; ++i) {
+        wchar_t key[32] = {};
+        swprintf_s(key, L"HiddenMedia%d", i);
+        // App ids are long — a packaged app's runs to a hundred characters or
+        // so — but not unbounded, and one that does not fit was not going to
+        // match anything anyway.
+        wchar_t buffer[320] = {};
+        Wh_GetStringValue(key, buffer, ARRAYSIZE(buffer));
+        buffer[ARRAYSIZE(buffer) - 1] = L'\0';
+        if (buffer[0] != L'\0') {
+            loaded.push_back(buffer);
+        }
+    }
+
+    std::lock_guard lock(g_stateMutex);
+    g_hiddenMediaApps = std::move(loaded);
+}
+
+int HiddenMediaAppCount() {
+    std::lock_guard lock(g_stateMutex);
+    return static_cast<int>(g_hiddenMediaApps.size());
+}
+
+// Dismisses whatever source the pill is showing. The oldest goes when the list
+// is full, so this can never quietly stop working.
+void HideCurrentMediaSource() {
+    std::vector<std::wstring> apps;
+    std::wstring hidden;
+    {
+        std::lock_guard lock(g_stateMutex);
+        hidden = g_state.media.sourceAppUserModelId;
+        if (hidden.empty()) {
+            return;
+        }
+        if (std::find(g_hiddenMediaApps.begin(), g_hiddenMediaApps.end(), hidden) !=
+            g_hiddenMediaApps.end()) {
+            return;
+        }
+        if (static_cast<int>(g_hiddenMediaApps.size()) >= kMaxHiddenMediaApps) {
+            g_hiddenMediaApps.erase(g_hiddenMediaApps.begin());
+        }
+        g_hiddenMediaApps.push_back(hidden);
+        apps = g_hiddenMediaApps;
+        // The pill is showing the source that just went away, so let it fall
+        // back to whatever Windows considers current rather than sitting on a
+        // selection that no longer exists.
+        g_selectedSessionId.clear();
+    }
+
+    PersistHiddenMediaApps(apps);
+    Wh_Log(L"Media: dismissed source %s", hidden.c_str());
+}
+
+void ClearHiddenMediaApps() {
+    {
+        std::lock_guard lock(g_stateMutex);
+        g_hiddenMediaApps.clear();
+    }
+    PersistHiddenMediaApps({});
+    Wh_Log(L"Media: dismissed sources restored.");
+}
+
 void ShowContextMenu(HWND hwnd, POINT screenPoint) {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, 1, L"Dismiss");
@@ -5666,6 +5769,15 @@ void ShowContextMenu(HWND hwnd, POINT screenPoint) {
     AppendMenuW(menu, MF_STRING, 22, L"Theme: Midnight Blue");
     AppendMenuW(menu, MF_STRING, 23, L"Theme: Deep Purple");
     AppendMenuW(menu, MF_STRING, 24, L"Theme: Fluent Design");
+    const int hiddenMedia = HiddenMediaAppCount();
+    if (hiddenMedia > 0) {
+        wchar_t label[64] = {};
+        swprintf_s(label, L"Restore %d dismissed media source%s", hiddenMedia,
+                   hiddenMedia == 1 ? L"" : L"s");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, 30, label);
+    }
+
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, 9, L"Open Windhawk settings");
 
@@ -5677,6 +5789,9 @@ void ShowContextMenu(HWND hwnd, POINT screenPoint) {
     switch (cmd) {
         case 1:
             DismissTransientState();
+            break;
+        case 30:
+            ClearHiddenMediaApps();
             break;
         case 2:
             Wh_SetIntValue(L"PinnedExpanded", Wh_GetIntValue(L"PinnedExpanded", 0) ? 0 : 1);
@@ -8179,6 +8294,13 @@ class Renderer {
                     const float leftX = cx - 145.0f;
                     const float rightX = cx - 113.0f;
 
+                    // Left of the pair that steps between sources, because it
+                    // acts on the source they select.
+                    const float dismissX = cx - 177.0f;
+                    const float dismissR = 10.0f;
+                    DrawDismissSource(D2D1::Point2F(dismissX, cy), dismissR,
+                                      !state.media.sourceAppUserModelId.empty());
+
                     DrawSourceArrow(D2D1::Point2F(leftX, cy), arrowR, true, canCycle,
                                     MediaControl::PrevSource);
                     DrawSourceArrow(D2D1::Point2F(rightX, cy), arrowR, false, canCycle,
@@ -8192,6 +8314,7 @@ class Renderer {
                                    pcx + (centreX + radius - pcx) * sizeScale_,
                                    pcy + (cy + radius - pcy) * sizeScale_);
                     };
+                    publishDisc(g_hideSourceRectPx, dismissX, dismissR);
                     publishDisc(g_prevSourceRectPx, leftX, arrowR);
                     publishDisc(g_nextSourceRectPx, rightX, arrowR);
                     publishDisc(g_prevTrackRectPx, cx - 64.0f, 15.0f);
@@ -8323,6 +8446,30 @@ class Renderer {
                           D2D1::Point2F(center.x - dir * w, center.y + h),
                           accentBrush_.Get(), 1.7f);
         accentBrush_->SetOpacity(1.0f);
+    }
+
+    // Dismissing a source: the same disc as the arrows beside it, with a cross
+    // rather than a chevron, and drawn in the muted brush rather than the
+    // accent — it takes something away, so it should not be the brightest
+    // thing on the row.
+    void DrawDismissSource(D2D1_POINT_2F center, float radius, bool enabled) {
+        const bool hovered = enabled && IsHovered(MediaControl::HideSource);
+        ComPtr<ID2D1SolidColorBrush> bg;
+        target_->CreateSolidColorBrush(
+            D2D1::ColorF(1, 1, 1,
+                         (enabled ? (hovered ? 0.075f : 0.040f) : 0.018f) * settingsOpacity_),
+            &bg);
+        if (bg) {
+            target_->FillEllipse(D2D1::Ellipse(center, radius, radius), bg.Get());
+        }
+
+        const float arm = radius * 0.36f;
+        mutedBrush_->SetOpacity(enabled ? (hovered ? 0.95f : 0.55f) : 0.20f);
+        target_->DrawLine(D2D1::Point2F(center.x - arm, center.y - arm),
+                          D2D1::Point2F(center.x + arm, center.y + arm), mutedBrush_.Get(), 1.7f);
+        target_->DrawLine(D2D1::Point2F(center.x + arm, center.y - arm),
+                          D2D1::Point2F(center.x - arm, center.y + arm), mutedBrush_.Get(), 1.7f);
+        mutedBrush_->SetOpacity(0.58f);
     }
 
     void DrawMediaButton(D2D1_POINT_2F center, float radius, int kind, bool primary,
@@ -9668,6 +9815,7 @@ static MediaControl HitTestMediaControl(int xPos, int yPos) {
     const float x = static_cast<float>(xPos);
     const float y = static_cast<float>(yPos);
 
+    if (g_hideSourceRectPx.Contains(x, y)) return MediaControl::HideSource;
     if (g_prevSourceRectPx.Contains(x, y)) return MediaControl::PrevSource;
     if (g_nextSourceRectPx.Contains(x, y)) return MediaControl::NextSource;
     if (g_prevTrackRectPx.Contains(x, y)) return MediaControl::PrevTrack;
@@ -10318,6 +10466,10 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                                 break;
                             case MediaControl::NextSource:
                                 CycleMediaSource(1);
+                                g_layoutDirty = true;
+                                break;
+                            case MediaControl::HideSource:
+                                HideCurrentMediaSource();
                                 g_layoutDirty = true;
                                 break;
                             case MediaControl::GoToMedia:
@@ -11166,6 +11318,7 @@ DWORD WINAPI RenderThreadProc(void*) {
 bool StartThreads() {
     LoadTimers();
     LoadTimerNames();
+    LoadHiddenMediaApps();
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_settingsChangedEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!g_stopEvent || !g_settingsChangedEvent) {
