@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.31.0
+// @version         1.31.1
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -18,10 +18,10 @@ A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to
 media, downloads, clipboard, battery, and more.
 
 ## Features
-- A cross beside those arrows dismisses a source: the pill stops offering it
-  and the arrows skip it, which is the answer to an app that registers with
-  Windows' transport controls and then never plays anything. Right-click the
-  pill to put them all back.
+- A cross in the top-right corner of the expanded player dismisses a source:
+  the pill stops offering it and the arrows skip it, which is the answer to an
+  app that registers with Windows' transport controls and then never plays
+  anything. Right-click the pill to put them all back.
 - Arrows left of the transport controls step between the apps actually
   producing audio, so the pill can be pointed at a second player without
   pausing the first. Everything Windows reports is offered, playing or not, so
@@ -8524,13 +8524,6 @@ class Renderer {
                     const float leftX = cx - 145.0f;
                     const float rightX = cx - 113.0f;
 
-                    // Left of the pair that steps between sources, because it
-                    // acts on the source they select.
-                    const float dismissX = cx - 177.0f;
-                    const float dismissR = 10.0f;
-                    DrawDismissSource(D2D1::Point2F(dismissX, cy), dismissR,
-                                      !state.media.sourceAppUserModelId.empty());
-
                     DrawSourceArrow(D2D1::Point2F(leftX, cy), arrowR, true, canCycle,
                                     MediaControl::PrevSource);
                     DrawSourceArrow(D2D1::Point2F(rightX, cy), arrowR, false, canCycle,
@@ -8544,12 +8537,32 @@ class Renderer {
                                    pcx + (centreX + radius - pcx) * sizeScale_,
                                    pcy + (cy + radius - pcy) * sizeScale_);
                     };
-                    publishDisc(g_hideSourceRectPx, dismissX, dismissR);
                     publishDisc(g_prevSourceRectPx, leftX, arrowR);
                     publishDisc(g_nextSourceRectPx, rightX, arrowR);
                     publishDisc(g_prevTrackRectPx, cx - 64.0f, 15.0f);
                     publishDisc(g_playPauseRectPx, cx, 20.0f);
                     publishDisc(g_nextTrackRectPx, cx + 64.0f, 15.0f);
+                }
+
+                // Throwing a source away is a different kind of act from
+                // stepping between them, so it no longer sits in that row: it
+                // goes in the page's top-right corner, the place a window puts
+                // its close button. There is a clear lane there — the page bar
+                // stops above it, the waveform starts below it, and both the
+                // position dots and the privacy dots ride the middle of the
+                // right edge rather than its top.
+                {
+                    const float pcx = (rect.left + rect.right) * 0.5f;
+                    const float pcy = (rect.top + rect.bottom) * 0.5f;
+                    const float dismissR = 10.0f;
+                    const float dismissX = rect.right - 24.0f;
+                    const float dismissY = rect.top + 38.0f;
+                    DrawDismissSource(D2D1::Point2F(dismissX, dismissY), dismissR,
+                                      !state.media.sourceAppUserModelId.empty());
+                    g_hideSourceRectPx.Set(pcx + (dismissX - dismissR - pcx) * sizeScale_,
+                                           pcy + (dismissY - dismissR - pcy) * sizeScale_,
+                                           pcx + (dismissX + dismissR - pcx) * sizeScale_,
+                                           pcy + (dismissY + dismissR - pcy) * sizeScale_);
                 }
 
                 // Bringing the player to the front is a deliberate press now,
