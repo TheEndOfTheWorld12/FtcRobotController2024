@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.31.1
+// @version         1.32.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -18,6 +18,13 @@ A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to
 media, downloads, clipboard, battery, and more.
 
 ## Features
+- A class schedule page, and the class you are in on the resting pill. It
+  reads the format bell.plus publishes - a calendar of weekday defaults and
+  dated overrides, and a set of named day shapes - and fetches it again every
+  three hours, so a rally the school moves reaches the pill on its own. Name
+  your periods in the settings and the pill says "Bio Honors", not "Period 4".
+  While school is in session the collapsed pill shows the time left and what
+  follows; outside it the weather has the pill back.
 - A cross in the top-right corner of the expanded player dismisses a source:
   the pill stops offering it and the arrows skip it, which is the answer to an
   app that registers with Windows' transport controls and then never plays
@@ -195,6 +202,18 @@ shown; that is a platform limitation, not a mod bug.
   - HideSystemVolumeOsd: true
     $name: Hide the Windows volume popup
     $description: Handles the volume keys itself so the system flyout never appears, and shows the change in the pill instead. Only covers the keyboard volume keys - the flyout has no window to hide on current Windows.
+  - Schedule: true
+    $name: Class schedule
+    $description: Shows the class you are in and how long is left of it, from a schedule the school publishes. Adds a page to the dashboard, and takes over the resting pill while school is in session.
+  - ScheduleUrl: "https://bell.plus/api/data/lahs"
+    $name: Schedule source
+    $description: A bell.plus data address - https://bell.plus/api/data/ followed by your school's name, the same name its bell.plus page uses. Fetched again every three hours, so a schedule the school changes reaches the pill without you doing anything.
+  - ScheduleOnPill: true
+    $name: Show the period on the resting pill
+    $description: While school is in session the collapsed pill shows the class and the time left instead of the weather. Turn this off to keep the weather there and leave the schedule to its dashboard page.
+  - ScheduleClasses: ""
+    $name: Class names
+    $description: What you call each period, from period 1 onward, separated by commas - for example "Trig Honors, APCS, Survey Comp/Lit". Any left out show as Period 1, Period 2 and so on.
   - TimerNames: ""
     $name: Timer names
     $description: Names for the timer page's countdowns, in order, separated by commas - for example "Period 1, Period 2, Lunch". Any that are left out fall back to Timer 1, Timer 2 and so on.
@@ -265,6 +284,7 @@ shown; that is a platform limitation, not a mod bug.
 #include <cstdint>
 #include <cstdlib>
 #include <cwchar>
+#include <cwctype>
 #include <cstring>
 #include <initializer_list>
 #include <mutex>
@@ -316,9 +336,9 @@ constexpr int kPillEdgeInsetX = 44;
 static_assert(kRenderPadY < static_cast<float>(kPillEdgeInsetTop),
               "the window would start above the top of the work area");
 
-// Idle dashboard pages: calendar, weather, CPU+RAM, GPU+memory, network &
-// disk, timer.
-constexpr int kIdleTabCount = 6;
+// Idle dashboard pages: calendar, class schedule, weather, CPU+RAM,
+// GPU+memory, network & disk, timer.
+constexpr int kIdleTabCount = 7;
 // The expanded media view adds its own page in front of the idle pages.
 constexpr int kMediaTabCount = kIdleTabCount + 1;
 
@@ -413,6 +433,13 @@ struct Settings {
     // What each countdown on the timer page is called, in order. Shorter than
     // the list of timers is fine; the rest fall back to "Timer 3".
     std::vector<std::wstring> timerNames;
+    // The school schedule, and what the periods in it are called, in order
+    // from period 1. Shorter than the school's list of periods is fine; the
+    // rest fall back to "Period 4".
+    bool scheduleEnabled = true;
+    bool scheduleOnPill = true;
+    std::wstring scheduleUrl;
+    std::vector<std::wstring> classNames;
     bool weatherFahrenheit = false;
     int autoHideIdleSeconds = 0;
     bool unhideOnHover = true;
@@ -622,6 +649,27 @@ struct TimerSnapshot {
     int selected = 0;  // the one the page is showing
 };
 
+
+// One entry in a schedule, with the end time filled in from the entry after it.
+struct ScheduleBlock {
+    int start = 0;   // minutes since midnight
+    int end = 0;
+    std::wstring name;
+    bool passing = false;
+    bool rest = false;   // brunch or lunch: on site, but not in a room
+};
+
+// The day a date resolves to, ready to draw. Empty blocks means no school,
+// and then the title says why.
+struct ScheduleDay {
+    bool valid = false;
+    std::wstring key;     // YYYY-MM-DD, so days can be compared cheaply
+    std::wstring title;   // "Even Block", "Finals Day 1", "Holiday"
+    std::wstring note;    // "Homecoming Week", "Veteran's Day"
+    bool beyond = false;  // past the last date the calendar knows about
+    std::vector<ScheduleBlock> blocks;
+};
+
 struct SharedState {
     MediaSnapshot media;
     ClipboardSnapshot clipboard;
@@ -634,6 +682,7 @@ struct SharedState {
     SystemSnapshot system;
     WeatherSnapshot weather;
     TimerSnapshot timer;
+    ScheduleDay schedule;
     std::array<float, 48> waveform{};
     size_t waveformWrite = 0;
     bool muted = false;
@@ -674,6 +723,7 @@ HANDLE g_renderThread = nullptr;
 HANDLE g_mediaThread = nullptr;
 HANDLE g_audioThread = nullptr;
 HANDLE g_weatherThread = nullptr;
+HANDLE g_scheduleThread = nullptr;
 HANDLE g_bluetoothThread = nullptr;
 HANDLE g_notificationThread = nullptr;
 std::atomic<bool> g_running = false;
@@ -1189,6 +1239,31 @@ bool ParseHotkeySetting(std::wstring text, UINT* modifiers, UINT* vk) {
     return true;
 }
 
+// Two settings are written the same way — a comma-separated list where the
+// order is the meaning and a blank entry keeps its place — so they read it the
+// same way. An empty setting is an empty list, not a list of one blank.
+std::vector<std::wstring> SplitCommaList(const std::wstring& text) {
+    std::vector<std::wstring> out;
+    if (text.empty()) {
+        return out;
+    }
+    size_t start = 0;
+    for (;;) {
+        const size_t comma = text.find(L',', start);
+        const size_t end = comma == std::wstring::npos ? text.size() : comma;
+        const std::wstring item = text.substr(start, end - start);
+        const size_t first = item.find_first_not_of(L" \t");
+        const size_t last = item.find_last_not_of(L" \t");
+        out.push_back(first == std::wstring::npos ? std::wstring()
+                                                  : item.substr(first, last - first + 1));
+        if (comma == std::wstring::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    return out;
+}
+
 void LoadSettings() {
     Settings next;
 
@@ -1248,23 +1323,11 @@ void LoadSettings() {
     next.gameOverlayHotkey = GetStringSettingCopy(L"Modules.GameOverlayHotkey");
     next.weatherCity = GetStringSettingCopy(L"Modules.WeatherCity");
 
-    {
-        const std::wstring names = GetStringSettingCopy(L"Modules.TimerNames");
-        size_t start = 0;
-        while (start <= names.size() && !names.empty()) {
-            const size_t comma = names.find(L',', start);
-            const size_t end = comma == std::wstring::npos ? names.size() : comma;
-            std::wstring name = names.substr(start, end - start);
-            const size_t first = name.find_first_not_of(L" \t");
-            const size_t last = name.find_last_not_of(L" \t");
-            next.timerNames.push_back(
-                first == std::wstring::npos ? std::wstring() : name.substr(first, last - first + 1));
-            if (comma == std::wstring::npos) {
-                break;
-            }
-            start = comma + 1;
-        }
-    }
+    next.timerNames = SplitCommaList(GetStringSettingCopy(L"Modules.TimerNames"));
+    next.scheduleEnabled = Wh_GetIntSetting(L"Modules.Schedule") != 0;
+    next.scheduleOnPill = Wh_GetIntSetting(L"Modules.ScheduleOnPill") != 0;
+    next.scheduleUrl = GetStringSettingCopy(L"Modules.ScheduleUrl");
+    next.classNames = SplitCommaList(GetStringSettingCopy(L"Modules.ScheduleClasses"));
     next.weatherFahrenheit = Wh_GetIntSetting(L"Modules.WeatherFahrenheit") != 0;
     const std::wstring hideSec = GetStringSettingCopy(L"Appearance.AutoHideIdleSeconds");
     next.autoHideIdleSeconds = hideSec.empty() ? 0 : _wtoi(hideSec.c_str());
@@ -3016,6 +3079,978 @@ static std::wstring FetchAirQualityIndex(double latitude, double longitude) {
     wchar_t buf[32] = {};
     swprintf_s(buf, L"%.0f", value);
     return buf;
+}
+
+
+// ── Class schedule ───────────────────────────────────────────────────────────
+// A bell.plus schedule has two halves and they are worth keeping apart. The
+// calendar says which shape a given date takes — a default for each weekday,
+// then dated rules that override it, singly or over a range. The schedules are
+// those shapes: a list of start times, each running until the next one, with
+// the last line of the list ending the day. {Period 3} in a label is a
+// placeholder for whatever the student calls their third period.
+//
+// This copy is the school year as published when the mod was built, so the
+// page works on a machine that has never reached the network. The live fetch
+// replaces it, wholesale, the moment one succeeds.
+constexpr wchar_t kBakedSchedule[] = LR"SCHED(
+* Default Week
+Sun weekend
+Mon schedule-a
+Tue schedule-b
+Wed schedule-c
+Thu schedule-b
+Fri schedule-c
+Sat weekend
+
+* Special Days
+12/21/2024-01/06/2025 holiday # Holiday Break
+01/07/2025 schedule-a
+01/08/2025 schedule-a
+01/09/2025 schedule-b
+01/10/2025 schedule-c
+01/20/2025 holiday # MLK Jr. Day
+02/03/2025 schedule-g
+02/11/2025 schedule-d
+02/12/2025 schedule-e
+02/17/2025-02/22/2025 holiday # Winter Break
+03/18/2025 schedule-h
+03/19/2025 schedule-i
+03/20/2025 schedule-a
+03/21/2025 holiday # End of Quarter No Classes
+03/31/2025 schedule-g
+04/07/2025-04/11/2025 holiday # Spring Recess
+04/29/2025 schedule-d
+04/30/2025 schedule-e
+05/26/2025 holiday # Memorial Day
+06/03/2025 schedule-a
+06/04/2025 finals-day-1
+06/05/2025 finals-day-2
+06/06/2025 finals-day-3
+06/07/2025-08/10/2025 holiday # Summer Break
+08/18/2025 schedule-g # BTS Rally
+09/01/2025 holiday # Labor Day
+09/09/2025 schedule-h
+09/10/2025 schedule-i
+09/29/2025 schedule-g # Homecoming Rally
+10/02/2025 schedule-d # Homecoming Week
+10/03/2025 schedule-e # Homecoming Parade
+10/06/2025 schedule-c
+10/07/2025 schedule-b
+10/08/2025 psat-testing
+10/09/2025 holiday # End of Quarter
+10/10/2025 holiday # End of Quarter
+11/10/2025 schedule-b
+11/11/2025 holiday # Veteran's Day
+11/24/2025-11/28/2025 holiday # Thanksgiving Break
+12/15/2025 schedule-c
+12/16/2025 schedule-b
+12/17/2025 finals-day-1
+12/18/2025 finals-day-2
+12/19/2025 finals-day-3
+12/22/2025-01/02/2026 holiday # Winter Break
+01/05/2026 holiday # Teacher Work Day
+01/19/2026 holiday # MLK Jr. Day
+01/26/2026 schedule-g # Diversity Rally
+02/03/2026 schedule-d
+02/04/2026 schedule-e
+02/16/2026-02/20/2026 holiday # Winter Break
+03/10/2026 schedule-h
+03/11/2026 schedule-i
+03/16/2026 schedule-c
+03/17/2026 schedule-b
+03/18/2026 schedule-c
+03/19/2026 schedule-b
+03/20/2026 holiday
+03/30/2026 schedule-g # COTC Rally
+04/06/2026-04/10/2026 holiday # Spring Break
+04/28/2026 schedule-d
+04/29/2026 schedule-e
+05/25/2026 holiday # Memorial Day
+06/02/2026 schedule-a
+06/03/2026 finals-day-1
+06/04/2026 finals-day-2
+06/05/2026 finals-day-3
+06/06/2026-08/09/2026 holiday # Summer Break
+08/17/2026 schedule-g # BTS Rally
+09/01/2026 schedule-d
+09/02/2026 schedule-e
+09/07/2026 holiday # Labor Day
+10/05/2026 schedule-c
+10/06/2026 schedule-b
+10/07/2026 psat-testing # PSAT Testing
+10/08/2026 holiday
+10/09/2026 holiday
+10/26/2026 schedule-g # Homecoming Assembly
+10/29/2026 schedule-d # Homecoming Week
+10/30/2026 schedule-e # Homecoming Parade
+11/09/2026 schedule-c
+11/10/2026 schedule-b
+11/11/2026 holiday # Veteran's Day
+11/23/2026-11/27/2026 holiday # Thanksgiving Break
+12/14/2026 schedule-c
+12/15/2026 schedule-b
+12/16/2026 finals-day-1
+12/17/2026 finals-day-2
+12/18/2026 finals-day-3
+12/21/2026-01/01/2027 holiday # Winter Break
+
+* schedule-a # All Periods
+8:30 {Period 1}
+9:20 Passing to {Period 2}
+9:27 {Period 2}
+10:17 Brunch
+10:25 Passing to {Period 3}
+10:32 {Period 3}
+11:22 Passing to {Period 4}
+11:29 {Period 4}
+12:19 Lunch
+12:54 Passing to {Period 5}
+13:01 {Period 5}
+13:51 Passing to {Period 6}
+13:58 {Period 6}
+14:48 Passing to {Period 7}
+14:55 {Period 7}
+15:45 Free
+
+* schedule-b # Odd Block
+8:30 {Period 1}
+10:00 Brunch
+10:08 Passing to {Period 3}
+10:15 {Period 3}
+11:45 Lunch
+12:25 Passing to {Period 5}
+12:32 {Period 5}
+14:02 Passing to {Period 7}
+14:09 {Period 7}
+15:39 Free
+
+* schedule-c # Even Block
+8:30 {Period 2}
+10:00 Passing to Academic Collaboration Time
+10:07 Academic Collaboration Time
+11:00 Brunch
+11:08 Passing to {Period 4}
+11:15 {Period 4}
+12:45 Lunch
+13:25 Passing to {Period 6}
+13:32 {Period 6}
+15:02 Free
+
+* schedule-d # PM Modified Odd Block
+8:30 {Period 1}
+9:30 Passing to {Period 3}
+9:37 {Period 3}
+10:37 Brunch
+10:45 Passing to {Period 5}
+10:52 {Period 5}
+11:52 Passing to {Period 7}
+11:59 {Period 7}
+12:59 Lunch
+13:40 Free
+
+* schedule-e # PM Modified Even Block
+8:30 {Period 2}
+9:30 Passing to Academic Collaboration Time
+9:37 Academic Collaboration Time
+10:20 Brunch
+10:28 Passing to {Period 4}
+10:35 {Period 4}
+11:35 Passing to {Period 6}
+11:42 {Period 6}
+12:42 Lunch
+13:25 Free
+
+* schedule-f # Minimum Day
+8:40 {Period 1}
+9:08 Passing to {Period 2}
+9:15 {Period 2}
+9:43 Passing to {Period 3}
+9:50 {Period 3}
+10:18 Passing to {Period 4}
+10:25 {Period 4}
+10:53 Brunch
+11:03 Passing to {Period 5}
+11:10 {Period 5}
+11:38 Passing to {Period 6}
+11:45 {Period 6}
+12:13 Passing to {Period 7}
+12:20 {Period 7}
+12:48 Free
+
+* schedule-g # Assembly Schedule
+8:30 {Period 1}
+9:13 Passing to {Period 2}/A
+9:20 {Period 2}/A
+10:03 Passing to {Period 2}/B
+10:10 {Period 2}/B
+10:53 Brunch
+11:01 Passing to {Period 3}
+11:08 {Period 3}
+11:51 Passing to {Period 4}
+11:58 {Period 4}
+12:41 Lunch
+13:16 Passing to {Period 5}
+13:23 {Period 5}
+14:06 Passing to {Period 6}
+14:13 {Period 6}
+14:56 Passing to {Period 7}
+15:03 {Period 7}
+15:46 Free
+
+* schedule-h # AM Modified Odd Block
+10:30 {Period 1}
+11:30 Passing to {Period 3}
+11:37 {Period 3}
+12:37 Lunch
+13:12 Passing to {Period 5}
+13:19 {Period 5}
+14:19 Passing to {Period 7}
+14:26 {Period 7}
+15:26 Free
+
+* schedule-i # AM Modified Even Block
+10:30 {Period 2}
+11:30 Lunch
+12:05 Passing to {Period 4}
+12:12 {Period 4}
+13:12 Passing to Academic Collaboration Time
+13:19 Academic Collaboration Time
+14:02 Passing to {Period 6}
+14:09 {Period 6}
+15:09 Free
+
+* weekend # Weekend
+
+* holiday # Holiday
+
+* finals-tue # Tuesday Finals
+8:30 {Period 1}
+10:30 Brunch
+10:43 Passing to {Period 6}
+10:50 {Period 6}
+12:50 Lunch
+13:30 Passing to {Period 7}
+13:37 {Period 7}
+15:37 Free
+
+* finals-wed # Wednesday Finals
+8:30 {Period 2}
+10:30 Brunch
+10:43 Passing to {Period 5}
+10:50 {Period 5}
+12:50 Free
+
+* finals-thu # Thursday Finals
+8:30 {Period 3}
+10:30 Brunch
+10:43 Passing to {Period 4}
+10:50 {Period 4}
+12:50 Free
+
+* finals-fri # Friday Finals
+8:40 {Period 4}
+10:25 Free
+
+* sbac-odd # SBAC/CAST Odd Block
+8:30 State Testing
+10:40 Brunch
+10:48 Passing to {Period 1}
+10:55 {Period 1}
+11:45 Lunch
+12:25 Passing to {Period 3}
+12:32 {Period 3}
+13:22 Passing to {Period 5}
+13:29 {Period 5}
+14:19 Passing to {Period 7}
+14:26 {Period 7}
+15:16 Free
+
+* sbac-even # SBAC/CAST Even Block
+8:30 State Testing
+10:40 Brunch
+10:48 Passing to {Period 2}
+10:55 {Period 2}
+11:45 Lunch
+12:25 Passing to {Period 4}
+12:32 {Period 4}
+13:22 Passing to {Period 6}
+13:29 {Period 6}
+14:19 Free
+
+* assembly # Assembly
+7:15 Passing to {Period 0}
+7:20 {Period 0}
+8:05 Passing to {Period 1}
+8:10 {Period 1}
+8:55 Passing to {Period 2}
+9:00 {Period 2}/Assembly A
+9:45 {Period 2}/Assembly B
+10:25 Brunch
+10:35 Passing to {Period 3}
+10:40 {Period 3}
+11:25 Passing to {Period 4}
+11:30 {Period 4}
+12:15 Lunch
+13:00 Passing to {Period 5}
+13:05 {Period 5}
+13:50 Passing to {Period 6}
+13:55 {Period 6}
+14:40 Passing to {Period 7}
+14:45 {Period 7}
+15:30 Free
+
+* eclipse # Eclipse
+7:15 Passing to {Period 0}
+7:20 {Period 0}
+8:05 Passing to {Period 1}
+8:10 {Period 1}
+8:55 Passing to {Period 2}
+9:00 {Period 2}
+9:50 Eclipse Activity
+10:20 Brunch
+10:30 Passing to {Period 3}
+10:35 {Period 3}
+11:20 Passing to {Period 4}
+11:25 {Period 4}
+12:10 Lunch
+13:00 Passing to {Period 5}
+13:05 {Period 5}
+13:50 Passing to {Period 6}
+13:55 {Period 6}
+14:40 Passing to {Period 7}
+14:45 {Period 7}
+15:30 Free
+
+* psat-testing # Student Activity/PSAT or SAT Testing
+8:08 Passing to Student Activity/PSAT or SAT Testing
+8:15 Student Activity/PSAT or SAT Testing
+12:15 Free
+
+* challenge-day-assembly # Challenge Day Assembly (Grades 10-12)
+8:05 Passing to Group A Assembly, Group B Activity
+8:10 Group A Assembly, Group B Activity
+10:05 Brunch
+10:20 Passing to Group B Assembly, Group A Activity
+10:25 Group B Assembly, Group A Activity
+12:20 Free
+
+* course-selection-even-primary # Course Selection Even Block
+7:55 Passing to Counselor Drop In
+8:00 Counselor Drop In
+8:45 Passing to {Period 2}
+8:50 {Period 2}
+9:50 Course Information
+10:25 Brunch
+10:40 Passing to {Period 4}
+10:45 {Period 4}
+11:45 Course Information
+12:15 Lunch
+13:00 Passing to {Period 6}
+13:05 {Period 6}
+14:05 Course Information
+14:35 Passing to Counselor Drop In
+14:45 Counselor Drop In
+15:30 Free
+
+* course-selection-even-secondary # Course Selection Even Block
+7:55 Passing to Counselor Drop In
+8:00 Counselor Drop In
+8:45 Passing to {Period 2}
+8:50 {Period 2}
+9:50 Course Information
+10:25 Brunch
+10:40 Passing to {Period 4}
+10:45 {Period 4}
+11:45 Course Information
+12:15 Lunch
+13:00 Passing to {Period 6}
+13:05 {Period 6}
+14:05 Course Information
+14:35 Free
+
+* course-selection-odd # Course Selection Odd Block
+8:05 Passing to {Period 1}
+8:10 {Period 1}
+9:10 Course Information
+9:45 Brunch
+10:00 Passing to {Period 3}
+10:05 {Period 3}
+11:05 Course Information
+11:35 Lunch
+12:20 Passing to {Period 5}
+12:25 {Period 5}
+13:25 Course Information
+13:55 Passing to {Period 7}
+14:00 {Period 7}
+15:00 Course Information
+15:30 Free
+
+* distance-odd # Distance Learning Odd
+9:10 Passing to {Period 1}
+9:15 {Period 1}
+10:30 Brunch
+10:45 Passing to {Period 3}
+10:50 {Period 3}
+12:05 Lunch
+12:50 {Period 5}
+14:05 Passing to {Period 7}
+14:25 {Period 7}
+15:40 Free
+
+* distance-even # Distance Learning Even
+9:10 Passing to {Period 2}
+9:15 {Period 2}
+10:30 Brunch
+10:45 Passing to {Period 4}
+10:50 {Period 4}
+12:05 Lunch
+12:50 {Period 6}
+14:05 Free
+
+* async-workday # Asynchronous Workday
+9:05 Passing to {Period 1}
+9:15 {Period 1}
+9:45 Passing to {Period 2}
+9:55 {Period 2}
+10:25 Passing to {Period 3}
+10:35 {Period 3}
+11:05 Passing to {Period 4}
+11:15 {Period 4}
+11:45 Lunch
+12:45 {Period 5}
+13:15 Passing to {Period 6}
+13:25 {Period 6}
+13:55 Passing to {Period 7}
+14:05 {Period 7}
+14:35 Free
+
+* finals-2022-mon # Monday Finals
+8:35 Passing to {Period 3}
+8:40 {Period 3}
+10:25 Brunch
+10:55 Passing to {Period 5}
+11:02 {Period 5}
+12:47 Free
+
+* finals-2022-tues # Tuesday Finals
+8:35 Passing to {Period 2}
+8:40 {Period 2}
+10:25 Brunch
+10:55 Passing to {Period 7}
+11:02 {Period 7}
+12:47 Free
+
+* finals-2022-wed # Wednesday Finals
+8:35 Passing to {Period 1}
+8:40 {Period 1}
+10:25 Brunch
+10:55 Passing to {Period 6}
+11:02 {Period 6}
+12:47 Free
+
+* finals-2022-thurs # Thursday Finals
+8:35 Passing to {Period 4}
+8:40 {Period 4}
+10:25 Free
+
+* am-staff-dev-2022-tues-thurs # AM Professional Dev
+10:23 Passing to {Period 1}
+10:30 {Period 1}
+11:30 Lunch
+12:15 Passing to {Period 3}
+12:22 {Period 3}
+13:22 Passing to {Period 5}
+13:29 {Period 5}
+14:29 Passing to {Period 7}
+14:36 {Period 7}
+15:36 Free
+
+* am-staff-dev-2022-wed-fri # AM Professional Dev
+10:23 Passing to {Period 2}
+10:30 {Period 2}
+11:30 Lunch
+12:15 Passing to {Period 4}
+12:22 {Period 4}
+13:22 Passing to Academic Collaboration Time
+13:29 Academic Collaboration Time
+13:59 Passing to {Period 6}
+14:06 {Period 6}
+15:06 Free
+
+* finals-day-1 # Finals Day 1
+8:30 {Period 1}
+10:30 Brunch
+10:43 Passing to {Period 6}
+10:50 {Period 6}
+12:50 Lunch
+13:30 Passing to {Period 7}
+13:37 {Period 7}
+15:37 Free
+
+* finals-day-2 # Finals Day 2
+8:30 {Period 2}
+10:30 Brunch
+10:43 Passing to {Period 5}
+10:50 {Period 5}
+12:50 Free
+
+* finals-day-3 # Finals Day 3
+8:30 {Period 3}
+10:30 Brunch
+10:43 Passing to {Period 4}
+10:50 {Period 4}
+12:50 Free)SCHED";
+struct ScheduleRule {
+    std::wstring from;   // YYYY-MM-DD
+    std::wstring to;
+    std::wstring id;
+    std::wstring note;
+};
+
+struct NamedSchedule {
+    std::wstring title;
+    std::vector<std::pair<int, std::wstring>> marks;   // start time, label
+};
+
+struct ScheduleSource {
+    std::wstring weekly[7];                                     // Sunday first
+    std::vector<ScheduleRule> dated;
+    std::unordered_map<std::wstring, NamedSchedule> schedules;
+    std::wstring horizon;                                       // last date any rule covers
+    int unknownIds = 0;
+};
+
+// Guarded by its own lock rather than the shared state's: the parsed source is
+// large and long-lived, and only the resolved day ever reaches the renderer.
+std::mutex g_scheduleMutex;
+ScheduleSource g_scheduleSource;
+bool g_scheduleFromNetwork = false;
+
+std::wstring TrimSpace(const std::wstring& text) {
+    size_t first = text.find_first_not_of(L" \t\r\n");
+    if (first == std::wstring::npos) return std::wstring();
+    size_t last = text.find_last_not_of(L" \t\r\n");
+    return text.substr(first, last - first + 1);
+}
+
+std::wstring DateKey(int year, int month, int day) {
+    wchar_t buffer[16] = {};
+    swprintf_s(buffer, L"%04d-%02d-%02d", year, month, day);
+    return buffer;
+}
+
+// The whole file, in one pass. A section is a schedule when its first line is a
+// clock time — or when it has no lines at all, which is how weekend and holiday
+// are written. Anything else is calendar.
+ScheduleSource ParseScheduleSource(const std::wstring& text) {
+    ScheduleSource out;
+
+    struct Section {
+        std::wstring name;
+        std::wstring note;
+        std::vector<std::wstring> lines;
+    };
+    std::vector<Section> sections;
+
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        size_t stop = text.find(L'\n', pos);
+        std::wstring line = TrimSpace(text.substr(pos, stop == std::wstring::npos
+                                                          ? std::wstring::npos
+                                                          : stop - pos));
+        pos = (stop == std::wstring::npos) ? text.size() + 1 : stop + 1;
+
+        if (!line.empty() && line[0] == L'*') {
+            Section section;
+            std::wstring body = TrimSpace(line.substr(1));
+            const size_t hash = body.find(L'#');
+            if (hash != std::wstring::npos) {
+                section.note = TrimSpace(body.substr(hash + 1));
+                body = body.substr(0, hash);
+            }
+            section.name = TrimSpace(body);
+            sections.push_back(std::move(section));
+            continue;
+        }
+        if (!sections.empty() && !line.empty()) {
+            sections.back().lines.push_back(line);
+        }
+    }
+
+    auto looksTimed = [](const std::wstring& line) {
+        size_t i = 0;
+        while (i < line.size() && iswdigit(line[i])) ++i;
+        return i >= 1 && i <= 2 && i + 2 < line.size() && line[i] == L':' &&
+               iswdigit(line[i + 1]) && iswdigit(line[i + 2]);
+    };
+
+    static const wchar_t* kDayNames[7] = {L"sun", L"mon", L"tue", L"wed",
+                                          L"thu", L"fri", L"sat"};
+
+    for (Section& section : sections) {
+        if (section.lines.empty() || looksTimed(section.lines[0])) {
+            NamedSchedule schedule;
+            schedule.title = section.note.empty() ? section.name : section.note;
+            for (const std::wstring& line : section.lines) {
+                size_t i = 0;
+                int hour = 0;
+                while (i < line.size() && iswdigit(line[i])) {
+                    hour = hour * 10 + (line[i++] - L'0');
+                }
+                if (i == 0 || i > 2 || i >= line.size() || line[i] != L':') continue;
+                ++i;
+                int minute = 0;
+                size_t digits = 0;
+                while (i < line.size() && iswdigit(line[i])) {
+                    minute = minute * 10 + (line[i++] - L'0');
+                    ++digits;
+                }
+                if (digits != 2 || hour > 23 || minute > 59) continue;
+                std::wstring label = TrimSpace(line.substr(i));
+                if (label.empty()) continue;
+                schedule.marks.emplace_back(hour * 60 + minute, label);
+            }
+            std::sort(schedule.marks.begin(), schedule.marks.end(),
+                      [](const auto& a, const auto& b) { return a.first < b.first; });
+            out.schedules[section.name] = std::move(schedule);
+            continue;
+        }
+
+        for (const std::wstring& raw : section.lines) {
+            std::wstring line = raw;
+            std::wstring note;
+            const size_t hash = line.find(L'#');
+            if (hash != std::wstring::npos) {
+                note = TrimSpace(line.substr(hash + 1));
+                line = line.substr(0, hash);
+            }
+            line = TrimSpace(line);
+            if (line.empty()) continue;
+
+            const size_t gap = line.find_first_of(L" \t");
+            if (gap == std::wstring::npos) continue;
+            const std::wstring head = line.substr(0, gap);
+            const std::wstring id = TrimSpace(line.substr(gap));
+            if (id.empty()) continue;
+
+            std::wstring lower = head.substr(0, 3);
+            for (wchar_t& ch : lower) ch = static_cast<wchar_t>(towlower(ch));
+            bool named = false;
+            for (int d = 0; d < 7; ++d) {
+                if (lower == kDayNames[d]) {
+                    out.weekly[d] = id;
+                    named = true;
+                    break;
+                }
+            }
+            if (named) continue;
+
+            int m1 = 0, d1 = 0, y1 = 0, m2 = 0, d2 = 0, y2 = 0;
+            const int fields = swscanf_s(head.c_str(), L"%d/%d/%d-%d/%d/%d",
+                                         &m1, &d1, &y1, &m2, &d2, &y2);
+            if (fields != 3 && fields != 6) continue;
+
+            ScheduleRule rule;
+            rule.from = DateKey(y1, m1, d1);
+            rule.to = (fields == 6) ? DateKey(y2, m2, d2) : rule.from;
+            rule.id = id;
+            rule.note = note;
+            if (rule.to > out.horizon) out.horizon = rule.to;
+            out.dated.push_back(std::move(rule));
+        }
+    }
+
+    for (const ScheduleRule& rule : out.dated) {
+        if (!out.schedules.count(rule.id)) ++out.unknownIds;
+    }
+    return out;
+}
+
+// What the student calls each period, falling back to the numbering the school
+// itself uses. The names are passed in rather than read from the settings here:
+// this runs on the schedule thread, and the settings can be replaced wholesale
+// by another one at any moment.
+std::wstring PeriodDisplayName(const std::vector<std::wstring>& names, int period) {
+    if (period >= 1 && period <= static_cast<int>(names.size()) &&
+        !names[period - 1].empty()) {
+        return names[period - 1];
+    }
+    wchar_t fallback[24] = {};
+    swprintf_s(fallback, L"Period %d", period);
+    return fallback;
+}
+
+// "Passing to {Period 4}" becomes "Passing to Bio Honors". Only the token is
+// replaced, so the suffixes the assembly schedules use — {Period 2}/A — survive.
+std::wstring ExpandPeriodNames(const std::vector<std::wstring>& names,
+                               const std::wstring& label) {
+    std::wstring out;
+    size_t pos = 0;
+    while (pos < label.size()) {
+        const size_t open = label.find(L"{Period ", pos);
+        if (open == std::wstring::npos) {
+            out += label.substr(pos);
+            break;
+        }
+        const size_t close = label.find(L'}', open);
+        if (close == std::wstring::npos) {
+            out += label.substr(pos);
+            break;
+        }
+        out += label.substr(pos, open - pos);
+        const int period = _wtoi(label.substr(open + 8, close - open - 8).c_str());
+        out += PeriodDisplayName(names, period);
+        pos = close + 1;
+    }
+    return out;
+}
+
+bool IsPassingLabel(const std::wstring& label) {
+    return label.compare(0, 11, L"Passing to ") == 0;
+}
+
+std::wstring StripPassing(const std::wstring& label) {
+    return IsPassingLabel(label) ? label.substr(11) : label;
+}
+
+// Resolves one date against the source. A later rule beats an earlier one, so
+// a single day written after a range that contains it wins — which is how the
+// school writes a rally inside a themed week.
+ScheduleDay ResolveScheduleDay(const SYSTEMTIME& local) {
+    ScheduleDay day;
+    day.key = DateKey(local.wYear, local.wMonth, local.wDay);
+
+    // Copied out first, and the two locks are never held together: the state
+    // lock always comes before the schedule lock, here and everywhere.
+    std::vector<std::wstring> names;
+    {
+        std::lock_guard lock(g_stateMutex);
+        names = g_settings.classNames;
+    }
+
+    std::lock_guard lock(g_scheduleMutex);
+    const ScheduleSource& source = g_scheduleSource;
+    if (source.schedules.empty()) {
+        return day;
+    }
+    day.valid = true;
+    day.beyond = !source.horizon.empty() && day.key > source.horizon;
+
+    const ScheduleRule* hit = nullptr;
+    for (const ScheduleRule& rule : source.dated) {
+        if (day.key >= rule.from && day.key <= rule.to) hit = &rule;
+    }
+
+    const std::wstring id = hit ? hit->id : source.weekly[local.wDayOfWeek % 7];
+    if (hit) day.note = hit->note;
+
+    auto found = source.schedules.find(id);
+    if (found == source.schedules.end()) {
+        day.title = id.empty() ? L"Nothing scheduled" : id;
+        return day;
+    }
+    day.title = found->second.title;
+
+    const auto& marks = found->second.marks;
+    for (size_t i = 0; i + 1 < marks.size(); ++i) {
+        ScheduleBlock block;
+        block.start = marks[i].first;
+        block.end = marks[i + 1].first;
+        block.passing = IsPassingLabel(marks[i].second);
+        block.rest = marks[i].second == L"Brunch" || marks[i].second == L"Lunch";
+        block.name = ExpandPeriodNames(names, marks[i].second);
+        day.blocks.push_back(std::move(block));
+    }
+    return day;
+}
+
+// Whether the schedule should have the collapsed pill: switched on, asked for,
+// and school actually in session — from half an hour before the first bell to
+// the last one. Outside that window the weather has the pill back, which is
+// most of the evening, all weekend and the whole of the summer.
+bool ScheduleOwnsRestingPill(const ScheduleDay& day) {
+    if (!g_settings.scheduleEnabled || !g_settings.scheduleOnPill) {
+        return false;
+    }
+    if (!day.valid || day.blocks.empty()) {
+        return false;
+    }
+    SYSTEMTIME local = {};
+    GetLocalTime(&local);
+    const float minutes = local.wHour * 60.0f + local.wMinute + local.wSecond / 60.0f;
+    return minutes >= day.blocks.front().start - 30.0f && minutes < day.blocks.back().end;
+}
+
+// Pulls one string value out of a JSON object, escapes and all. The schedule
+// arrives as two long strings full of \r\n, so this has to decode rather than
+// hand back the raw span.
+static bool ParseJsonString(const char* object, const char* key, std::string* out) {
+    if (!object || !key || !out) return false;
+    const char* found = strstr(object, key);
+    if (!found) return false;
+    found = strchr(found + strlen(key), '"');
+    if (!found) return false;
+    ++found;
+
+    out->clear();
+    while (*found && *found != '"') {
+        if (*found != '\\') {
+            out->push_back(*found++);
+            continue;
+        }
+        ++found;
+        switch (*found) {
+            case 'n': out->push_back('\n'); ++found; break;
+            case 'r': out->push_back('\r'); ++found; break;
+            case 't': out->push_back('\t'); ++found; break;
+            case 'b': out->push_back('\b'); ++found; break;
+            case 'f': out->push_back('\f'); ++found; break;
+            case '"': out->push_back('"'); ++found; break;
+            case '\\': out->push_back('\\'); ++found; break;
+            case '/': out->push_back('/'); ++found; break;
+            case 'u': {
+                if (strlen(found) < 5) return false;
+                char digits[5] = {found[1], found[2], found[3], found[4], '\0'};
+                const int code = static_cast<int>(strtol(digits, nullptr, 16));
+                // Everything a bell schedule uses is Latin-1 or below; anything
+                // above it would need surrogate pairs, which are not worth
+                // carrying for text that has never contained one.
+                if (code < 0x80) {
+                    out->push_back(static_cast<char>(code));
+                } else {
+                    out->push_back('?');
+                }
+                found += 5;
+                break;
+            }
+            case '\0': return false;
+            default: out->push_back(*found++); break;
+        }
+    }
+    return *found == '"';
+}
+
+std::wstring Utf8ToWide(const std::string& text) {
+    if (text.empty()) return std::wstring();
+    const int needed = MultiByteToWideChar(CP_UTF8, 0, text.c_str(),
+                                           static_cast<int>(text.size()), nullptr, 0);
+    if (needed <= 0) return std::wstring();
+    std::wstring out(static_cast<size_t>(needed), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+                        out.data(), needed);
+    return out;
+}
+
+// Installs a parsed source, but only if it actually parsed: a truncated
+// download or a school that has taken its page down must not replace a working
+// schedule with an empty one.
+bool AdoptScheduleSource(const std::wstring& text, bool fromNetwork) {
+    ScheduleSource parsed = ParseScheduleSource(text);
+    if (parsed.schedules.empty()) {
+        return false;
+    }
+    bool anyWeekly = false;
+    for (const std::wstring& id : parsed.weekly) {
+        if (!id.empty()) anyWeekly = true;
+    }
+    if (!anyWeekly && parsed.dated.empty()) {
+        return false;
+    }
+    {
+        std::lock_guard lock(g_scheduleMutex);
+        g_scheduleSource = std::move(parsed);
+        g_scheduleFromNetwork = fromNetwork;
+    }
+    return true;
+}
+
+// Fetches the school's published schedule and keeps it current. The pill is on
+// screen all day, so it can do what the browser page cannot: notice on its own
+// when the school moves a rally.
+DWORD WINAPI ScheduleThreadProc(void*) {
+    AdoptScheduleSource(kBakedSchedule, false);
+
+    std::wstring lastDayKey;
+    ULONGLONG lastFetch = 0;
+    bool everFetched = false;
+
+    // Long enough that the schedule is not competing with the pill's first
+    // paint for the network.
+    WaitForSingleObject(g_stopEvent, 6000);
+
+    while (WaitForSingleObject(g_stopEvent, 0) == WAIT_TIMEOUT) {
+        bool enabled = false;
+        std::wstring url;
+        {
+            std::lock_guard lock(g_stateMutex);
+            enabled = g_settings.scheduleEnabled;
+            url = g_settings.scheduleUrl;
+        }
+        const ULONGLONG now = GetTickCount64();
+        const ULONGLONG sinceFetch = now - lastFetch;
+
+        if (enabled && !url.empty() && (!everFetched || sinceFetch > 3ULL * 60 * 60 * 1000)) {
+            {
+                wchar_t host[256] = {};
+                wchar_t path[1024] = {};
+                URL_COMPONENTS parts = {};
+                parts.dwStructSize = sizeof(parts);
+                parts.lpszHostName = host;
+                parts.dwHostNameLength = ARRAYSIZE(host);
+                parts.lpszUrlPath = path;
+                parts.dwUrlPathLength = ARRAYSIZE(path);
+
+                if (WinHttpCrackUrl(url.c_str(), static_cast<DWORD>(url.size()), 0, &parts)) {
+                    const bool secure = parts.nScheme != INTERNET_SCHEME_HTTP;
+                    const std::string response = HttpGet(host, path, secure);
+                    std::string calendar, schedules;
+                    if (!response.empty() &&
+                        ParseJsonString(response.c_str(), "\"calendar\"", &calendar) &&
+                        ParseJsonString(response.c_str(), "\"schedules\"", &schedules)) {
+                        const std::wstring text =
+                            Utf8ToWide(calendar) + L"\n\n" + Utf8ToWide(schedules);
+                        if (AdoptScheduleSource(text, true)) {
+                            everFetched = true;
+                            lastDayKey.clear();   // redraw against the new source
+                            Wh_Log(L"Schedule: refreshed from %s (%zu bytes).", host,
+                                   response.size());
+                        } else {
+                            Wh_Log(L"Schedule: response from %s did not parse; keeping the "
+                                   L"schedule already loaded.", host);
+                        }
+                    } else {
+                        Wh_Log(L"Schedule: no usable response from %s.", host);
+                    }
+                } else {
+                    Wh_Log(L"Schedule: could not read the source address.");
+                }
+            }
+            lastFetch = GetTickCount64();
+        }
+
+        // The day rolls over at midnight whether anything was fetched or not,
+        // and the resolved day is what the pill draws.
+        SYSTEMTIME local = {};
+        GetLocalTime(&local);
+        const std::wstring key = DateKey(local.wYear, local.wMonth, local.wDay);
+        if (key != lastDayKey) {
+            lastDayKey = key;
+            ScheduleDay day = ResolveScheduleDay(local);
+            std::lock_guard lock(g_stateMutex);
+            g_state.schedule = std::move(day);
+        }
+
+        HANDLE events[] = {g_stopEvent, g_settingsChangedEvent};
+        const DWORD wait = WaitForMultipleObjects(2, events, FALSE, 60 * 1000);
+        if (wait == WAIT_OBJECT_0) break;
+        if (wait == WAIT_OBJECT_0 + 1) {
+            // Class names live in the settings, and they are baked into the
+            // block labels, so a settings change has to rebuild the day.
+            lastDayKey.clear();
+        }
+    }
+    return 0;
 }
 
 DWORD WINAPI WeatherThreadProc(void*) {
@@ -7725,6 +8760,338 @@ class Renderer {
         published.Set(bar.left, bar.top, bar.right, bar.bottom);
     }
 
+
+    // ── Class schedule ───────────────────────────────────────────────────
+
+    // Where the day stands at this minute. Passing periods count as their own
+    // block, because "four minutes to get to Bio" is the thing worth knowing
+    // in the moment.
+    struct ScheduleNow {
+        const ScheduleBlock* current = nullptr;
+        const ScheduleBlock* next = nullptr;   // the next block that is not a walk
+        bool beforeSchool = false;
+        bool afterSchool = false;
+    };
+
+    static ScheduleNow ScheduleStanding(const ScheduleDay& day, float minutes) {
+        ScheduleNow standing;
+        if (day.blocks.empty()) {
+            return standing;
+        }
+        if (minutes < day.blocks.front().start) {
+            standing.beforeSchool = true;
+            standing.next = &day.blocks.front();
+            return standing;
+        }
+        if (minutes >= day.blocks.back().end) {
+            standing.afterSchool = true;
+            return standing;
+        }
+        for (size_t i = 0; i < day.blocks.size(); ++i) {
+            const ScheduleBlock& block = day.blocks[i];
+            if (minutes < block.start || minutes >= block.end) {
+                continue;
+            }
+            standing.current = &block;
+            for (size_t j = i + 1; j < day.blocks.size(); ++j) {
+                if (!day.blocks[j].passing) {
+                    standing.next = &day.blocks[j];
+                    break;
+                }
+            }
+            break;
+        }
+        return standing;
+    }
+
+    // Minutes since midnight, as a 12-hour clock.
+    static std::wstring ClockLabel(int minutes) {
+        const int hour = (minutes / 60) % 24;
+        const int minute = minutes % 60;
+        const int display = (hour % 12 == 0) ? 12 : hour % 12;
+        wchar_t buffer[16] = {};
+        swprintf_s(buffer, L"%d:%02d%s", display, minute, hour >= 12 ? L"pm" : L"am");
+        return buffer;
+    }
+
+    static std::wstring ScheduleCountdown(float minutesLeft) {
+        const int total = static_cast<int>(std::ceil(std::max(0.0f, minutesLeft) * 60.0f - 0.001f));
+        const int hours = total / 3600;
+        const int minutes = (total % 3600) / 60;
+        const int seconds = total % 60;
+        wchar_t buffer[24] = {};
+        if (hours > 0) {
+            swprintf_s(buffer, L"%d:%02d:%02d", hours, minutes, seconds);
+        } else {
+            swprintf_s(buffer, L"%d:%02d", minutes, seconds);
+        }
+        return buffer;
+    }
+
+    // The whole school day as one strip, with where you are on it. A bell
+    // schedule is a shape more than it is a list, and the shape is what tells
+    // you at a glance whether the hard part of the day is behind you.
+    void DrawScheduleStrip(const ScheduleDay& day, D2D1_RECT_F strip, float minutes) {
+        if (day.blocks.empty()) {
+            return;
+        }
+        const float dayStart = static_cast<float>(day.blocks.front().start);
+        const float dayEnd = static_cast<float>(day.blocks.back().end);
+        const float span = std::max(1.0f, dayEnd - dayStart);
+        const float width = strip.right - strip.left;
+        const float height = strip.bottom - strip.top;
+
+        ComPtr<ID2D1SolidColorBrush> bed;
+        target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.06f * settingsOpacity_), &bed);
+        if (bed) {
+            target_->FillRoundedRectangle(
+                D2D1::RoundedRect(strip, height * 0.5f, height * 0.5f), bed.Get());
+        }
+
+        for (const ScheduleBlock& block : day.blocks) {
+            if (block.passing) {
+                continue;   // the gaps between segments are the walks
+            }
+            const float x0 = strip.left + (block.start - dayStart) / span * width;
+            const float x1 = strip.left + (block.end - dayStart) / span * width;
+            if (x1 - x0 < 0.6f) {
+                continue;
+            }
+            const bool here = minutes >= block.start && minutes < block.end;
+            const D2D1_RECT_F segment = D2D1::RectF(x0, strip.top, x1, strip.bottom);
+            if (here) {
+                accentBrush_->SetOpacity(0.92f);
+                target_->FillRoundedRectangle(
+                    D2D1::RoundedRect(segment, height * 0.5f, height * 0.5f), accentBrush_.Get());
+                accentBrush_->SetOpacity(1.0f);
+                continue;
+            }
+            ComPtr<ID2D1SolidColorBrush> fill;
+            const float alpha = block.rest ? 0.16f : (minutes >= block.end ? 0.22f : 0.42f);
+            target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, alpha * settingsOpacity_), &fill);
+            if (fill) {
+                target_->FillRoundedRectangle(
+                    D2D1::RoundedRect(segment, height * 0.5f, height * 0.5f), fill.Get());
+            }
+        }
+
+        // Where the day has got to, drawn over the segments so it reads against
+        // both the lit one and the spent ones.
+        if (minutes > dayStart && minutes < dayEnd) {
+            const float x = strip.left + (minutes - dayStart) / span * width;
+            ComPtr<ID2D1SolidColorBrush> mark;
+            target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.95f * settingsOpacity_), &mark);
+            if (mark) {
+                target_->FillRoundedRectangle(
+                    D2D1::RoundedRect(D2D1::RectF(x - 0.9f, strip.top - 2.5f, x + 0.9f,
+                                                  strip.bottom + 2.5f),
+                                      0.9f, 0.9f),
+                    mark.Get());
+            }
+        }
+    }
+
+    // Page: what class you are in, how long is left of it, what follows, and
+    // the day as a whole underneath.
+    void DrawScheduleDashboard(const SharedState& state, D2D1_RECT_F rect, double now) {
+        UNREFERENCED_PARAMETER(now);
+        const ScheduleDay& day = state.schedule;
+        const float left = rect.left + 24.0f;
+        if (!g_settings.scheduleEnabled) {
+            textBrush_->SetOpacity(0.90f);
+            target_->DrawTextW(L"Class schedule is off", 21, clockFormat_.Get(),
+                               D2D1::RectF(left, rect.top + 80.0f, rect.right - 34.0f,
+                                           rect.top + 106.0f),
+                               textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            mutedBrush_->SetOpacity(0.62f);
+            target_->DrawTextW(L"Turn it back on under Modules in the mod's settings.", 51,
+                               smallTextFormat_.Get(),
+                               D2D1::RectF(left, rect.top + 108.0f, rect.right - 34.0f,
+                                           rect.top + 124.0f),
+                               mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            mutedBrush_->SetOpacity(0.58f);
+            return;
+        }
+        const float right = rect.right - 34.0f;   // clear of the pagination dots
+
+        SYSTEMTIME local = {};
+        GetLocalTime(&local);
+        const float minutes = local.wHour * 60.0f + local.wMinute + local.wSecond / 60.0f;
+
+        // Header: which shape today is, and why if the calendar said why.
+        std::wstring heading = day.valid ? day.title : L"Loading schedule…";
+        if (!day.note.empty() && !day.blocks.empty()) {
+            heading += L"  ·  " + day.note;
+        }
+        mutedBrush_->SetOpacity(0.62f);
+        target_->DrawTextW(heading.c_str(), static_cast<UINT32>(heading.size()),
+                           smallTextFormat_.Get(),
+                           D2D1::RectF(left, rect.top + 30.0f, right - 74.0f, rect.top + 46.0f),
+                           mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+
+        wchar_t dateLabel[32] = {};
+        GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &local, L"ddd d MMM", dateLabel,
+                        ARRAYSIZE(dateLabel), nullptr);
+        smallTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+        target_->DrawTextW(dateLabel, static_cast<UINT32>(wcslen(dateLabel)),
+                           smallTextFormat_.Get(),
+                           D2D1::RectF(right - 90.0f, rect.top + 30.0f, right, rect.top + 46.0f),
+                           mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        smallTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+
+        const ScheduleNow standing = ScheduleStanding(day, minutes);
+
+        std::wstring headline;
+        std::wstring countdown;
+        std::wstring footnote;
+
+        if (!day.valid) {
+            headline = L"No schedule yet";
+            footnote = L"Fetching it from the address in the settings.";
+        } else if (day.blocks.empty()) {
+            headline = day.note.empty() ? day.title : day.note;
+            footnote = L"Nothing on today.";
+        } else if (standing.beforeSchool) {
+            headline = StripPassing(standing.next->name);
+            countdown = ScheduleCountdown(standing.next->start - minutes);
+            footnote = L"Starts at " + ClockLabel(standing.next->start) + L"  ·  day ends " +
+                       ClockLabel(day.blocks.back().end);
+        } else if (standing.afterSchool) {
+            headline = L"Done for today";
+            footnote = L"Out since " + ClockLabel(day.blocks.back().end) + L".";
+        } else if (standing.current) {
+            const ScheduleBlock& block = *standing.current;
+            headline = block.passing ? StripPassing(block.name) : block.name;
+            countdown = ScheduleCountdown(block.end - minutes);
+            if (block.passing) {
+                footnote = L"Starts at " + ClockLabel(block.end);
+            } else if (standing.next) {
+                footnote = L"Then " + StripPassing(standing.next->name) + L" at " +
+                           ClockLabel(standing.next->start);
+            } else {
+                footnote = L"Last of the day  ·  out at " + ClockLabel(block.end);
+            }
+        }
+
+        // What you are in, or heading to.
+        textBrush_->SetOpacity(0.97f);
+        target_->DrawTextW(headline.c_str(), static_cast<UINT32>(headline.size()),
+                           clockFormat_.Get(),
+                           D2D1::RectF(left, rect.top + 50.0f, right, rect.top + 76.0f),
+                           textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+
+        // The number. Centred, because hugeTextFormat_ is a centred format and
+        // every other user of it depends on that staying true.
+        if (!countdown.empty()) {
+            target_->DrawTextW(countdown.c_str(), static_cast<UINT32>(countdown.size()),
+                               hugeTextFormat_.Get(),
+                               D2D1::RectF(rect.left, rect.top + 78.0f, rect.right,
+                                           rect.top + 126.0f),
+                               textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+
+        if (!day.blocks.empty()) {
+            DrawScheduleStrip(day, D2D1::RectF(left, rect.top + 134.0f, right, rect.top + 141.0f),
+                              minutes);
+        }
+
+        mutedBrush_->SetOpacity(0.66f);
+        target_->DrawTextW(footnote.c_str(), static_cast<UINT32>(footnote.size()),
+                           smallTextFormat_.Get(),
+                           D2D1::RectF(left, rect.top + 148.0f, right, rect.top + 164.0f),
+                           mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+
+        // Only worth saying once the calendar has actually run out — before
+        // then it is noise, and after it the pill is quietly guessing.
+        if (day.beyond) {
+            mutedBrush_->SetOpacity(0.55f);
+            const wchar_t* warning = L"Past the published calendar — ordinary week only.";
+            target_->DrawTextW(warning, static_cast<UINT32>(wcslen(warning)),
+                               smallTextFormat_.Get(),
+                               D2D1::RectF(left, rect.top + 162.0f, right, rect.top + 176.0f),
+                               mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+
+        textBrush_->SetOpacity(0.90f);
+        mutedBrush_->SetOpacity(0.58f);
+    }
+
+    // The collapsed pill during the school day: the time left where the
+    // temperature usually sits, then the class and what follows it.
+    void DrawScheduleCollapsed(const SharedState& state, D2D1_RECT_F rect, float scale) {
+        const ScheduleDay& day = state.schedule;
+        SYSTEMTIME local = {};
+        GetLocalTime(&local);
+        const float minutes = local.wHour * 60.0f + local.wMinute + local.wSecond / 60.0f;
+        const ScheduleNow standing = ScheduleStanding(day, minutes);
+
+        const float right =
+            rect.right - PrivacyShiftX(state.system.micActive, state.system.cameraActive,
+                                       state.system.locationActive);
+
+        std::wstring big;
+        std::wstring line1;
+        std::wstring line2;
+
+        if (standing.current) {
+            const ScheduleBlock& block = *standing.current;
+            big = ScheduleCountdown(block.end - minutes);
+            line1 = block.passing ? L"→ " + StripPassing(block.name) : block.name;
+            line2 = standing.next
+                        ? L"Then " + StripPassing(standing.next->name) + L" · " +
+                              ClockLabel(standing.next->start)
+                        : L"Last of the day · out " + ClockLabel(block.end);
+        } else if (standing.beforeSchool && standing.next) {
+            big = ScheduleCountdown(standing.next->start - minutes);
+            line1 = L"→ " + StripPassing(standing.next->name);
+            line2 = L"Starts " + ClockLabel(standing.next->start) + L" · " + day.title;
+        } else {
+            return;
+        }
+
+        const bool soon = !big.empty() && standing.current && !standing.current->passing &&
+                          (standing.current->end - minutes) <= 5.0f;
+
+        if (soon) {
+            accentBrush_->SetOpacity(0.95f);
+        } else {
+            textBrush_->SetOpacity(0.96f);
+        }
+        target_->DrawTextW(big.c_str(), static_cast<UINT32>(big.size()), textFormat_.Get(),
+                           D2D1::RectF(rect.left + 16.0f * scale, rect.top + 7.0f * scale,
+                                       rect.left + 84.0f * scale, rect.bottom - 6.0f * scale),
+                           soon ? accentBrush_.Get() : textBrush_.Get(),
+                           D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        accentBrush_->SetOpacity(1.0f);
+
+        ComPtr<ID2D1SolidColorBrush> divider;
+        target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.12f * settingsOpacity_), &divider);
+        if (divider) {
+            target_->FillRoundedRectangle(
+                D2D1::RoundedRect(D2D1::RectF(rect.left + 88.0f * scale, rect.top + 9.0f * scale,
+                                              rect.left + 89.5f * scale, rect.bottom - 9.0f * scale),
+                                  0.5f * scale, 0.5f * scale),
+                divider.Get());
+        }
+
+        const float textLeft = rect.left + 100.0f * scale;
+        target_->DrawTextW(line1.c_str(), static_cast<UINT32>(line1.size()),
+                           smallTextFormat_.Get(),
+                           D2D1::RectF(textLeft, rect.top + 4.0f * scale, right,
+                                       rect.top + 18.0f * scale),
+                           textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+
+        mutedBrush_->SetOpacity(0.70f);
+        target_->DrawTextW(line2.c_str(), static_cast<UINT32>(line2.size()),
+                           smallTextFormat_.Get(),
+                           D2D1::RectF(textLeft, rect.top + 18.0f * scale, right,
+                                       rect.top + 32.0f * scale),
+                           mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+
+        mutedBrush_->SetOpacity(0.58f);
+        textBrush_->SetOpacity(1.0f);
+    }
+
     void DrawIdleDashboard(const SharedState& state, D2D1_RECT_F rect, const Settings& settings,
                            double now) {
         // While the game overlay is toggled on it replaces only the pill's
@@ -7759,6 +9126,16 @@ class Renderer {
         // (36 units collapsed against 200 expanded); width cannot, because the
         // collapsed pill is now wide enough to carry the detail lines.
         if ((rect.bottom - rect.top) / scale < 100.0f) {
+            // During the school day the class and the time left are worth more
+            // than the weather, so they take the pill. Everything else about
+            // the pill is untouched: a track playing or a timer running still
+            // takes it from both of them.
+            if (ScheduleOwnsRestingPill(state.schedule)) {
+                DrawScheduleCollapsed(state, rect, scale);
+                target_->PopAxisAlignedClip();
+                return;
+            }
+
             // The privacy dots occupy the right edge, so give way to them.
             const float right =
                 rect.right - PrivacyShiftX(state.system.micActive, state.system.cameraActive,
@@ -7840,18 +9217,21 @@ class Renderer {
                 DrawCalendarDashboard(state, rect, settings, now, scale, local);
                 break;
             case 1:
-                DrawWeatherDashboard(state, rect, settings, now, scale, hasWeather, wIcon, wText);
+                DrawScheduleDashboard(state, rect, now);
                 break;
             case 2:
-                DrawCpuRamDashboard(state, rect);
+                DrawWeatherDashboard(state, rect, settings, now, scale, hasWeather, wIcon, wText);
                 break;
             case 3:
-                DrawGpuDashboard(state, rect);
+                DrawCpuRamDashboard(state, rect);
                 break;
             case 4:
-                DrawNetDiskDashboard(state, rect);
+                DrawGpuDashboard(state, rect);
                 break;
             case 5:
+                DrawNetDiskDashboard(state, rect);
+                break;
+            case 6:
             default:
                 DrawTimerDashboard(state, rect, now);
                 break;
@@ -8598,6 +9978,8 @@ class Renderer {
                 SYSTEMTIME local = {}; GetLocalTime(&local);
                 DrawCalendarDashboard(state, rect, g_settings, now, 1.0f, local);
             } else if (tab == 2) {
+                DrawScheduleDashboard(state, rect, now);
+            } else if (tab == 3) {
                 bool hasWeather = state.weather.hasData && (now - state.weather.lastUpdated < 3600.0);
                 std::wstring wIcon = L"🌡️"; std::wstring wText = L"Loading...";
                 if (hasWeather) {
@@ -8605,11 +9987,11 @@ class Renderer {
                     GetWeatherIconAndText(state.weather.weatherCode, wIcon, wText);
                 }
                 DrawWeatherDashboard(state, rect, g_settings, now, 1.0f, hasWeather, wIcon, wText);
-            } else if (tab == 3) {
-                DrawCpuRamDashboard(state, rect);
             } else if (tab == 4) {
-                DrawGpuDashboard(state, rect);
+                DrawCpuRamDashboard(state, rect);
             } else if (tab == 5) {
+                DrawGpuDashboard(state, rect);
+            } else if (tab == 6) {
                 DrawNetDiskDashboard(state, rect);
             } else {
                 DrawTimerDashboard(state, rect, now);
@@ -11688,6 +13070,7 @@ bool StartThreads() {
     g_mediaThread = CreateThread(nullptr, 0, MediaThreadProc, nullptr, 0, nullptr);
     g_audioThread = CreateThread(nullptr, 0, AudioThreadProc, nullptr, 0, nullptr);
     g_weatherThread = CreateThread(nullptr, 0, WeatherThreadProc, nullptr, 0, nullptr);
+    g_scheduleThread = CreateThread(nullptr, 0, ScheduleThreadProc, nullptr, 0, nullptr);
     g_bluetoothThread = CreateThread(nullptr, 0, BluetoothThreadProc, nullptr, 0, nullptr);
     g_keyboardThread = CreateThread(nullptr, 0, KeyboardThreadProc, nullptr, 0, &g_keyboardThreadId);
 #if DYNAMIC_ISLAND_HAS_USER_NOTIFICATION_LISTENER
@@ -11706,7 +13089,8 @@ void StopThreads() {
     }
 
     HANDLE handles[] = {g_renderThread,       g_mediaThread,        g_audioThread,
-                        g_weatherThread,      g_bluetoothThread,    g_notificationThread,
+                        g_weatherThread,      g_scheduleThread,     g_bluetoothThread,
+                        g_notificationThread,
                         g_keyboardThread};
     for (HANDLE handle : handles) {
         if (handle) {
@@ -11719,6 +13103,7 @@ void StopThreads() {
     g_mediaThread = nullptr;
     g_audioThread = nullptr;
     g_weatherThread = nullptr;
+    g_scheduleThread = nullptr;
     g_bluetoothThread = nullptr;
     g_notificationThread = nullptr;
     g_keyboardThread = nullptr;
