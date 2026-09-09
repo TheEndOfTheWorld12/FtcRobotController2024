@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.28.0
+// @version         1.28.1
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -335,10 +335,13 @@ static_assert(kPageContentTop + 100.0f < kPageContentBottom,
 // purpose — the pill's own top and bottom edges already belong to the page
 // arrows, and a second pair of chevrons a few pixels from those would be a
 // coin toss to read.
-constexpr float kShiftArrowWidth = 30.0f;
-constexpr float kShiftArrowHeight = 14.0f;
-constexpr float kShiftArrowSlack = 3.0f;      // forgiveness around the plate
-constexpr float kShiftZoneHalfWidth = 34.0f;  // how wide the approach to one is
+// The plate is as tall as the margin will take once the slack around it is
+// counted, which is what the assert below is checking: past that the arrows
+// would either overlap the pill or hang off the top of the screen.
+constexpr float kShiftArrowWidth = 44.0f;
+constexpr float kShiftArrowHeight = 18.0f;
+constexpr float kShiftArrowSlack = 2.0f;      // forgiveness around the plate
+constexpr float kShiftZoneHalfWidth = 40.0f;  // how wide the approach to one is
 constexpr int kShiftStepPx = 5;
 // Far enough to place the pill anywhere it is wanted, near enough that it can
 // never be walked off the screen and lost.
@@ -7653,15 +7656,15 @@ class Renderer {
                 bg.Get());
         }
 
-        const float w = 4.6f;
-        const float h = 2.8f;
+        const float w = 6.4f;
+        const float h = 3.6f;
         const float tipY = cy + (up ? -h : h);
         const float baseY = cy + (up ? h : -h);
         textBrush_->SetOpacity(enabled ? (hovered ? 1.0f : 0.62f) : 0.20f);
         target_->DrawLine(D2D1::Point2F(cx - w, baseY), D2D1::Point2F(cx, tipY),
-                          textBrush_.Get(), 1.8f);
+                          textBrush_.Get(), 2.1f);
         target_->DrawLine(D2D1::Point2F(cx, tipY), D2D1::Point2F(cx + w, baseY),
-                          textBrush_.Get(), 1.8f);
+                          textBrush_.Get(), 2.1f);
         textBrush_->SetOpacity(0.90f);
 
         // Published like every other control, with a little slack around the
