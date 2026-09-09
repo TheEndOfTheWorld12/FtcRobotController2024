@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.26.0
+// @version         1.27.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -48,7 +48,7 @@ media, downloads, clipboard, battery, and more.
 - Resting pill shows the weather at a glance — icon and temperature, then
   place and condition, feels-like, humidity and wind. No clock: the date and
   time live on the calendar page one hover away.
-- Timer page: keep up to eight countdowns and step between them with the
+- Timer page: keep as many countdowns as you like and step between them with the
   arrows down either edge of the pill. Click a name to type a new one, or set
   them all at once in the settings; the name is what the page and the resting
   pill call them. Click the number and type a
@@ -4275,16 +4275,28 @@ std::vector<std::wstring> AppsUsingCapability(const wchar_t* capability) {
 constexpr int kTimerStepSeconds = 60;
 constexpr int kTimerMinSeconds = 5;
 constexpr int kTimerMaxSeconds = 6 * 60 * 60;
-constexpr int kTimerMaxCount = 8;
+// Not a limit anyone is meant to reach — a guard, so a stuck press or a
+// corrupt stored count cannot grow the list without end. Each countdown costs
+// two entries in the store and a few dozen bytes copied per frame, so the
+// number here is high enough to be irrelevant and low enough to stay cheap.
+constexpr int kTimerMaxCount = 99;
 
 // What was last written to Windhawk's store, so the render loop can tell that
 // nothing needs writing without reading the store back every second.
 uint64_t g_timerPersistDigest = 0;
 
+// Folds in the names as well as the lengths, so renaming one is a change the
+// coalesced writer notices. Declared before the cache it reads because the
+// cache is only ever non-empty by the time anything calls this.
+extern std::vector<std::wstring> g_timerNameCache;
+
 uint64_t TimerDigest(const TimerSnapshot& timers) {
     uint64_t digest = timers.timers.size();
     for (const TimerEntry& timer : timers.timers) {
         digest = digest * 1000003ull + static_cast<uint64_t>(timer.durationSeconds);
+    }
+    for (const std::wstring& name : g_timerNameCache) {
+        digest = digest * 1000003ull + std::hash<std::wstring>{}(name);
     }
     return digest;
 }
@@ -4296,6 +4308,11 @@ void PersistTimers(const TimerSnapshot& timers) {
         wchar_t key[32] = {};
         swprintf_s(key, L"TimerDuration%d", i);
         Wh_SetIntValue(key, timers.timers[i].durationSeconds);
+
+        swprintf_s(key, L"TimerName%d", i);
+        Wh_SetStringValue(key, i < static_cast<int>(g_timerNameCache.size())
+                                   ? g_timerNameCache[i].c_str()
+                                   : L"");
     }
     g_timerPersistDigest = TimerDigest(timers);
 }
@@ -4335,7 +4352,13 @@ int TimerSelectedIndex(const TimerSnapshot& timers) {
 // Names typed into the pill itself, which override the settings list for that
 // position. Kept in memory as well as in the store, because the name is read
 // on every frame that draws a timer and the store is not a per-frame thing.
-std::wstring g_timerNameCache[kTimerMaxCount];
+//
+// Index-aligned with the list of countdowns, and kept that way by every
+// operation that reorders it — a name left behind when its countdown is
+// deleted would be inherited by whichever one moved up into the gap.
+// Touched only on the thread that owns the overlay window, which is also the
+// thread that draws, so it needs no lock of its own.
+std::vector<std::wstring> g_timerNameCache;
 
 std::wstring TimerStoredName(int index) {
     wchar_t key[32] = {};
@@ -4352,15 +4375,29 @@ std::wstring TimerStoredName(int index) {
 }
 
 void LoadTimerNames() {
-    for (int i = 0; i < kTimerMaxCount; ++i) {
-        g_timerNameCache[i] = TimerStoredName(i);
+    int count = 0;
+    {
+        std::lock_guard lock(g_stateMutex);
+        count = static_cast<int>(g_state.timer.timers.size());
     }
+
+    g_timerNameCache.clear();
+    for (int i = 0; i < count; ++i) {
+        g_timerNameCache.push_back(TimerStoredName(i));
+    }
+
+    // The digest the render loop compares against was taken before these were
+    // read, so take it again — otherwise the first pass sees a change that is
+    // only the names arriving and writes back what it just read.
+    std::lock_guard lock(g_stateMutex);
+    g_timerPersistDigest = TimerDigest(g_state.timer);
 }
 
 // What one countdown is called: a name typed into the pill first, then the
 // settings list, then a plain numbered name when neither reaches it.
 std::wstring TimerNameFor(int index) {
-    if (index >= 0 && index < kTimerMaxCount && !g_timerNameCache[index].empty()) {
+    if (index >= 0 && index < static_cast<int>(g_timerNameCache.size()) &&
+        !g_timerNameCache[index].empty()) {
         return g_timerNameCache[index];
     }
     if (index >= 0 && index < static_cast<int>(g_settings.timerNames.size()) &&
@@ -4384,10 +4421,12 @@ void CommitTimerName() {
         index = TimerSelectedIndex(g_state.timer);
     }
     if (index >= 0 && index < kTimerMaxCount) {
+        if (static_cast<int>(g_timerNameCache.size()) <= index) {
+            g_timerNameCache.resize(index + 1);
+        }
         g_timerNameCache[index] = name;
-        wchar_t key[32] = {};
-        swprintf_s(key, L"TimerName%d", index);
-        Wh_SetStringValue(key, name.c_str());
+        // Not written from here: the render loop persists the whole set once a
+        // second when it has changed, and the digest below now covers names.
     }
 
     g_timerNameEditing = false;
@@ -4562,6 +4601,7 @@ void TimerAdd() {
     }
     g_state.timer.timers.push_back(TimerEntry{});
     g_state.timer.selected = static_cast<int>(g_state.timer.timers.size()) - 1;
+    g_timerNameCache.resize(g_state.timer.timers.size());
 }
 
 void TimerRemove() {
@@ -4571,6 +4611,11 @@ void TimerRemove() {
     }
     const int index = TimerSelectedIndex(g_state.timer);
     g_state.timer.timers.erase(g_state.timer.timers.begin() + index);
+    // The name goes with it. Left behind, it would be inherited by whichever
+    // countdown moved up into the gap.
+    if (index < static_cast<int>(g_timerNameCache.size())) {
+        g_timerNameCache.erase(g_timerNameCache.begin() + index);
+    }
     g_state.timer.selected =
         ClampInt(index, 0, static_cast<int>(g_state.timer.timers.size()) - 1);
 }
@@ -10350,9 +10395,14 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                             // is an edit — but only a real one, not the
                             // numbered stand-in, which would just be seven
                             // keystrokes to delete.
-                            g_timerNameDraft = (index >= 0 && index < kTimerMaxCount)
-                                                   ? g_timerNameCache[index]
-                                                   : std::wstring();
+                            // Bounded by the cache, not by the ceiling on how
+                            // many countdowns there may be: the cache is only
+                            // as long as the list actually is.
+                            g_timerNameDraft =
+                                (index >= 0 &&
+                                 index < static_cast<int>(g_timerNameCache.size()))
+                                    ? g_timerNameCache[index]
+                                    : std::wstring();
                             g_timerNameIdleSince = GetTickCount64();
                             g_timerNameEditing = true;
                         }
