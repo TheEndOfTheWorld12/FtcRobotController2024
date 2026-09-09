@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.32.0
+// @version         1.33.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -24,7 +24,10 @@ media, downloads, clipboard, battery, and more.
   three hours, so a rally the school moves reaches the pill on its own. Name
   your periods in the settings and the pill says "Bio Honors", not "Period 4".
   While school is in session the collapsed pill shows the time left and what
-  follows; outside it the weather has the pill back.
+  follows, ahead of anything playing - something usually is, during those six
+  hours, and underneath it the countdown would be hidden for exactly as long
+  as it is wanted. A timer still comes first, and a brief alert still
+  interrupts. Outside school hours the pill goes back to what it was.
 - A cross in the top-right corner of the expanded player dismisses a source:
   the pill stops offering it and the arrows skip it, which is the answer to an
   app that registers with Windows' transport controls and then never plays
@@ -393,6 +396,7 @@ enum class IslandKind {
     CapsLock,
     Device,
     Timer,
+    Schedule,
     Split,
 };
 
@@ -7440,7 +7444,9 @@ class Renderer {
             target_->DrawRoundedRectangle(pill, redBrush_.Get(), 2.0f);
             redBrush_->SetOpacity(1.0f);
         } else {
-            accentBrush_->SetOpacity(activity.kind == IslandKind::Idle ? 0.18f : 0.34f);
+            const bool restingState = activity.kind == IslandKind::Idle ||
+                                      activity.kind == IslandKind::Schedule;
+            accentBrush_->SetOpacity(restingState ? 0.18f : 0.34f);
             target_->DrawRoundedRectangle(pill, accentBrush_.Get(), 1.0f);
             accentBrush_->SetOpacity(1.0f);
         }
@@ -7492,6 +7498,9 @@ class Renderer {
                 break;
             case IslandKind::Timer:
                 DrawTimerPill(state, unscaledRect, now);
+                break;
+            case IslandKind::Schedule:
+                DrawScheduleCollapsed(state, unscaledRect, 1.0f);
                 break;
             case IslandKind::Idle:
             default:
@@ -9126,16 +9135,9 @@ class Renderer {
         // (36 units collapsed against 200 expanded); width cannot, because the
         // collapsed pill is now wide enough to carry the detail lines.
         if ((rect.bottom - rect.top) / scale < 100.0f) {
-            // During the school day the class and the time left are worth more
-            // than the weather, so they take the pill. Everything else about
-            // the pill is untouched: a track playing or a timer running still
-            // takes it from both of them.
-            if (ScheduleOwnsRestingPill(state.schedule)) {
-                DrawScheduleCollapsed(state, rect, scale);
-                target_->PopAxisAlignedClip();
-                return;
-            }
-
+            // A class in session is its own state now, chosen ahead of this
+            // one, so what reaches here really is the idle pill.
+            //
             // The privacy dots occupy the right edge, so give way to them.
             const float right =
                 rect.right - PrivacyShiftX(state.system.micActive, state.system.cameraActive,
@@ -11030,6 +11032,12 @@ Activity ActivityForKind(IslandKind kind, const Settings& settings, const Shared
             activity.width = 270.0f;
             activity.height = 54.0f;
             break;
+        case IslandKind::Schedule:
+            // The same shape the idle pill takes, because it is the same two
+            // lines of text beside a figure — a class instead of a forecast.
+            activity.width = 300.0f;
+            activity.height = 36.0f;
+            break;
         case IslandKind::Idle:
         default:
             if (settings.autoHideIdleSeconds == -1 && !state.system.micActive && !state.system.cameraActive) {
@@ -11084,6 +11092,16 @@ std::vector<IslandKind> ChooseActivities(const SharedState& state, const Setting
         activities.push_back(IslandKind::Timer);
     }
 
+    // Above a playing track, and deliberately so. Something is nearly always
+    // playing during the school day, and underneath the media pill the class
+    // countdown would be hidden for exactly the six hours it is wanted. Below
+    // a timer, because a timer is something set for right now, while this runs
+    // all day on its own.
+    const bool scheduleActive = ScheduleOwnsRestingPill(state.schedule);
+    if (scheduleActive) {
+        activities.push_back(IslandKind::Schedule);
+    }
+
     if (settings.progress && state.progress.active) {
         activities.push_back(IslandKind::Progress);
     }
@@ -11095,11 +11113,15 @@ std::vector<IslandKind> ChooseActivities(const SharedState& state, const Setting
         activities.push_back(IslandKind::Idle);
     }
 
-    // A timer gets the pill to itself. Everywhere else two things going on at
-    // once are shown side by side, but a track playing under a countdown would
-    // park a second pill next to it for the length of the timer, which is not
-    // a passing overlap — it is the normal case, and it reads as clutter.
-    if (timerActive && activities.size() > 1) {
+    // A timer, and a class in session, each get the pill to themselves.
+    // Everywhere else two things going on at once are shown side by side, but a
+    // track playing under a countdown would park a second pill next to it for
+    // the length of the timer — or the length of the school day — which is not
+    // a passing overlap. It is the normal case, and it reads as clutter.
+    //
+    // A brief alert still interrupts either of them, because the alerts are
+    // pushed ahead of both and this keeps whatever came first.
+    if ((timerActive || scheduleActive) && activities.size() > 1) {
         activities.resize(1);
     }
 
@@ -12487,7 +12509,8 @@ DWORD WINAPI RenderThreadProc(void*) {
             // to Idle quietly took the media page and its controls away for as
             // long as the timer ran. Expanding now goes to Media whenever there
             // is something playing, and to Idle only when there is not.
-            if (primary.kind == IslandKind::Timer && (pinned || isHoverExpanded)) {
+            if ((primary.kind == IslandKind::Timer || primary.kind == IslandKind::Schedule) &&
+                (pinned || isHoverExpanded)) {
                 primary.kind = (g_settings.media && snapshot.media.available)
                                    ? IslandKind::Media
                                    : IslandKind::Idle;
@@ -12584,13 +12607,13 @@ DWORD WINAPI RenderThreadProc(void*) {
             nudgeSpring.Step(dt * speed, 280.0f, 24.0f);
 
             // The shift bars belong to the pill at rest: closed, not pinned
-            // open, and settled into one of the three states it lives in rather
-            // than a notification passing through on its way out.
+            // open, and settled into one of the states it lives in rather than
+            // a notification passing through on its way out.
             const bool restingPill =
                 !pinned && !isHoverExpanded &&
                 heightSpring.value < 100.0f * g_settings.sizeScale &&
                 (primary.kind == IslandKind::Idle || primary.kind == IslandKind::Media ||
-                 primary.kind == IslandKind::Timer);
+                 primary.kind == IslandKind::Timer || primary.kind == IslandKind::Schedule);
 
             // Eased rather than switched, because the bars are part of the
             // pill's body now: appearing all at once would read as the
