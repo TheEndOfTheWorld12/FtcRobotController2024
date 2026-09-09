@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.27.1
+// @version         1.28.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -88,6 +88,11 @@ media, downloads, clipboard, battery, and more.
   40 pixels it re-anchors and glides to the bottom of the screen (or back to
   the top, dragging up). Let go before then and it glides back to where it
   started. Changing Position in the settings takes control back from the drag.
+- A resting pill carries a small chevron in the margin above it and another
+  below: each press walks it five pixels up or down the screen, for lining it
+  up with whatever is underneath. Resting on one holds the pill closed so it
+  does not open out from under the pointer. The placement is remembered, and
+  "Recentre" in the context menu puts it back.
 - Optional game overlay with FPS/CPU/RAM/GPU/disk cards, toggled from the
   context menu or with a configurable hotkey (default Ctrl+Alt+G). While the
   overlay is on it acts as the pill's collapsed look — hovering or clicking
@@ -323,6 +328,23 @@ constexpr float kPageContentBottom =
     kExpandedPillContentHeight - kPageNavStripMargin - kPageNavStripHeight - kPageNavContentGap;
 static_assert(kPageContentTop + 100.0f < kPageContentBottom,
               "expanded pill is too short to hold a page between the nav bars");
+
+// The shift arrows: one chevron in the window's top margin, another in its
+// bottom margin, drawn only while the pill is resting, that walk it up or down
+// the screen five pixels at a press. They sit outside the pill body on
+// purpose — the pill's own top and bottom edges already belong to the page
+// arrows, and a second pair of chevrons a few pixels from those would be a
+// coin toss to read.
+constexpr float kShiftArrowWidth = 30.0f;
+constexpr float kShiftArrowHeight = 14.0f;
+constexpr float kShiftArrowSlack = 3.0f;      // forgiveness around the plate
+constexpr float kShiftZoneHalfWidth = 34.0f;  // how wide the approach to one is
+constexpr int kShiftStepPx = 5;
+// Far enough to place the pill anywhere it is wanted, near enough that it can
+// never be walked off the screen and lost.
+constexpr int kShiftLimitPx = 600;
+static_assert(kShiftArrowHeight + kShiftArrowSlack * 2.0f <= kRenderPadY,
+              "the shift arrows must fit in the margin around the pill");
 
 enum class IslandKind {
     Idle,
@@ -746,6 +768,21 @@ std::atomic<int> g_hoveredPageNav = -1;
 // down arrow, correctly, refused to go anywhere.
 std::atomic<int> g_pageCount = kIdleTabCount;
 
+// The shift arrows in the window's top and bottom margin, in the same shape as
+// the page arrows above: 0 is the top arrow, 1 the bottom, -1 neither.
+std::atomic<bool> g_shiftHitValid = false;
+std::atomic<int> g_hoveredShiftArrow = -1;
+// How far the arrows have walked the pill from its anchor, in screen pixels,
+// positive downwards. Deliberately not the vertical offset in the settings:
+// that one mirrors, so the top and bottom placements sit the same distance
+// from their own edge, while this is the literal direction of the arrow that
+// was pressed. Persisted, so a placement survives a restart.
+std::atomic<int> g_shiftOffsetY = 0;
+// Set when a press lands on an arrow, so the release that follows is spent on
+// the arrow too rather than falling through to whatever the shifted window has
+// since brought under the pointer.
+std::atomic<bool> g_shiftPressed = false;
+
 // The timer page's buttons, in the order they are drawn: the first row drives
 // the countdown being shown, the second manages the list of them.
 enum class TimerButton {
@@ -807,6 +844,8 @@ std::atomic<bool> g_timerBarDragging = false;
 std::atomic<float> g_timerBarEmphasis = 0.0f;
 AtomicRect g_pageNavUpRectPx;
 AtomicRect g_pageNavDownRectPx;
+AtomicRect g_shiftUpRectPx;
+AtomicRect g_shiftDownRectPx;
 
 // The popup's size, in the unscaled units the pill is drawn in.
 constexpr float kPrivacyPopupWidth = 208.0f;
@@ -1369,7 +1408,32 @@ void AnchorPointForPosition(Position position, int width, int height, int* outX,
     // The offset moves the pill away from the edge it hangs off, so a 100px
     // vertical offset sits 100px below the top edge up there and 100px above
     // the bottom edge down here — mirrored, rather than pushed off-screen.
-    if (outY) *outY = bottomAnchored ? y - g_settings.offsetY : y + g_settings.offsetY;
+    //
+    // The shift arrows are added on top of that and do not mirror: pressing the
+    // up arrow moves the pill up the screen wherever it happens to be anchored.
+    if (outY) {
+        *outY = (bottomAnchored ? y - g_settings.offsetY : y + g_settings.offsetY) +
+                g_shiftOffsetY.load();
+    }
+}
+
+// The stored shift, read back at startup so the pill comes up where it was
+// left. Clamped on the way in as well as on the way out, so a value edited by
+// hand cannot strand the pill off the edge of the screen.
+void LoadShiftOffset() {
+    g_shiftOffsetY = ClampInt(Wh_GetIntValue(L"ShiftOffsetY", 0), -kShiftLimitPx, kShiftLimitPx);
+}
+
+// One press of a shift arrow. Positive walks the pill down the screen.
+void ShiftPillBy(int deltaPx) {
+    const int current = g_shiftOffsetY.load();
+    const int next = ClampInt(current + deltaPx, -kShiftLimitPx, kShiftLimitPx);
+    if (next == current) {
+        return;
+    }
+    g_shiftOffsetY = next;
+    Wh_SetIntValue(L"ShiftOffsetY", next);
+    g_layoutDirty = true;
 }
 
 // A fingerprint of the display arrangement: monitor count, the bounds of the
@@ -5813,6 +5877,14 @@ void ShowContextMenu(HWND hwnd, POINT screenPoint) {
         AppendMenuW(menu, MF_STRING, 30, label);
     }
 
+    const int shift = g_shiftOffsetY.load();
+    if (shift != 0) {
+        wchar_t label[64] = {};
+        swprintf_s(label, L"Recentre (%+d px from the arrows)", shift);
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, 31, label);
+    }
+
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, 9, L"Open Windhawk settings");
 
@@ -5827,6 +5899,11 @@ void ShowContextMenu(HWND hwnd, POINT screenPoint) {
             break;
         case 30:
             ClearHiddenMediaApps();
+            break;
+        case 31:
+            // Undoes every press of the shift arrows in one go, for a pill
+            // walked somewhere awkward.
+            ShiftPillBy(-g_shiftOffsetY.load());
             break;
         case 2:
             Wh_SetIntValue(L"PinnedExpanded", Wh_GetIntValue(L"PinnedExpanded", 0) ? 0 : 1);
@@ -5979,7 +6056,7 @@ class Renderer {
 
     bool Render(const SharedState& state, const Settings& settings, const Activity& primary,
                 const std::optional<Activity>& secondary, float width, float height,
-                float nudge, bool hover, bool pinned, double now) {
+                float nudge, bool hover, bool pinned, bool resting, double now) {
         EnsureTextFormats(settings.sizeScale);
 
         // A hovered privacy dot opens a popup that hangs off the pill, so the
@@ -6032,6 +6109,7 @@ class Renderer {
         g_privacyHitValid = false;
         g_timerHitValid = false;
         g_pageNavHitValid = false;
+        g_shiftHitValid = false;
 
         const float hoverScale = hover || pinned ? 1.025f : 1.0f;
         const float scale = hoverScale;
@@ -6057,6 +6135,11 @@ class Renderer {
             } else {
                 DrawPill(state, settings, primary,
                          D2D1::RectF(left, top, left + width, top + height), scale, now);
+            }
+
+            if (resting) {
+                DrawShiftArrows(static_cast<float>(bitmapWidth_),
+                                static_cast<float>(bitmapHeight_));
             }
         }
 
@@ -7528,6 +7611,65 @@ class Renderer {
                 D2D1::Ellipse(D2D1::Point2F(dotX, cy - span * 0.5f + i * spacing), 2.5f, 2.5f),
                 i == tab ? activeDot.Get() : inactiveDot.Get());
         }
+    }
+
+    // The pair of chevrons that walk the pill up and down the screen, one in
+    // the margin above it and one in the margin below. Drawn in device pixels,
+    // outside the transform the pill's contents are scaled by: the margin is a
+    // fixed band whatever the size scale is, and these have to fit inside it.
+    void DrawShiftArrows(float windowWidth, float windowHeight) {
+        if (windowWidth < kShiftArrowWidth || windowHeight < kRenderPadY * 2.0f) {
+            return;
+        }
+        DrawShiftArrow(windowWidth, windowHeight, true);
+        DrawShiftArrow(windowWidth, windowHeight, false);
+        g_shiftHitValid = true;
+    }
+
+    void DrawShiftArrow(float windowWidth, float windowHeight, bool up) {
+        const float cx = windowWidth * 0.5f;
+        const float cy = up ? kRenderPadY * 0.5f : windowHeight - kRenderPadY * 0.5f;
+        const D2D1_RECT_F plate =
+            D2D1::RectF(cx - kShiftArrowWidth * 0.5f, cy - kShiftArrowHeight * 0.5f,
+                        cx + kShiftArrowWidth * 0.5f, cy + kShiftArrowHeight * 0.5f);
+
+        const bool hovered = g_hoveredShiftArrow.load() == (up ? 0 : 1);
+        // At the end of its travel an arrow has nothing left to give, and says
+        // so the way every other spent control on the pill does.
+        const int offset = g_shiftOffsetY.load();
+        const bool enabled = up ? offset > -kShiftLimitPx : offset < kShiftLimitPx;
+
+        // Quieter at rest than the page arrows: these sit off the pill, against
+        // the desktop, where the same weight would read as clutter. Lit under
+        // the pointer like everything else.
+        ComPtr<ID2D1SolidColorBrush> bg;
+        target_->CreateSolidColorBrush(
+            D2D1::ColorF(1, 1, 1,
+                         (enabled ? (hovered ? 0.18f : 0.06f) : 0.02f) * settingsOpacity_),
+            &bg);
+        if (bg) {
+            target_->FillRoundedRectangle(
+                D2D1::RoundedRect(plate, kShiftArrowHeight * 0.5f, kShiftArrowHeight * 0.5f),
+                bg.Get());
+        }
+
+        const float w = 4.6f;
+        const float h = 2.8f;
+        const float tipY = cy + (up ? -h : h);
+        const float baseY = cy + (up ? h : -h);
+        textBrush_->SetOpacity(enabled ? (hovered ? 1.0f : 0.62f) : 0.20f);
+        target_->DrawLine(D2D1::Point2F(cx - w, baseY), D2D1::Point2F(cx, tipY),
+                          textBrush_.Get(), 1.8f);
+        target_->DrawLine(D2D1::Point2F(cx, tipY), D2D1::Point2F(cx + w, baseY),
+                          textBrush_.Get(), 1.8f);
+        textBrush_->SetOpacity(0.90f);
+
+        // Published like every other control, with a little slack around the
+        // plate: it is a small target sitting in a thin margin. No size-scale
+        // conversion here — this rectangle is the one that was just painted.
+        AtomicRect& published = up ? g_shiftUpRectPx : g_shiftDownRectPx;
+        published.Set(plate.left - kShiftArrowSlack, plate.top - kShiftArrowSlack,
+                      plate.right + kShiftArrowSlack, plate.bottom + kShiftArrowSlack);
     }
 
     void DrawIdleDashboard(const SharedState& state, D2D1_RECT_F rect, const Settings& settings,
@@ -9795,6 +9937,41 @@ static ScrubberHit HitTestVolumeBar(int xPos, int yPos) {
 // Which page arrow a point falls on: 0 the top one, 1 the bottom one, -1
 // neither. They are only live while the pill is expanded far enough to have
 // drawn them.
+// Which shift arrow, if either, the pointer is on — against the rectangles the
+// renderer published as it drew them.
+static int HitTestShiftArrow(int xPos, int yPos) {
+    if (!g_shiftHitValid.load()) {
+        return -1;
+    }
+    const float x = static_cast<float>(xPos);
+    const float y = static_cast<float>(yPos);
+    if (g_shiftUpRectPx.Contains(x, y)) return 0;
+    if (g_shiftDownRectPx.Contains(x, y)) return 1;
+    return -1;
+}
+
+// Whether the pointer is in the strip the shift arrows are drawn in. Worked out
+// from the window rather than read back from a published rectangle, because it
+// has to be true *before* they are drawn: it is what holds the pill in the
+// resting shape that shows them.
+static bool PointerInShiftZone(const RECT& windowRect, POINT cursor) {
+    const float w = static_cast<float>(windowRect.right - windowRect.left);
+    const float h = static_cast<float>(windowRect.bottom - windowRect.top);
+    // A hidden pill is nothing but margin, and the two zones would then cover
+    // the whole of it — holding the pill closed against the very hover that is
+    // supposed to bring it back. Below a pill's worth of height there is
+    // nothing here to shift.
+    if (w < kShiftArrowWidth || h < kRenderPadY * 2.0f + 16.0f) {
+        return false;
+    }
+    const float x = static_cast<float>(cursor.x - windowRect.left);
+    const float y = static_cast<float>(cursor.y - windowRect.top);
+    if (std::fabs(x - w * 0.5f) > kShiftZoneHalfWidth) {
+        return false;
+    }
+    return y < kRenderPadY || y > h - kRenderPadY;
+}
+
 static int HitTestPageNav(int xPos, int yPos) {
     if (!g_pageNavHitValid.load()) {
         return -1;
@@ -10064,6 +10241,19 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 int xPos = GET_X_LPARAM(lParam);
                 int yPos = GET_Y_LPARAM(lParam);
 
+                // The shift arrows live outside the pill, in the window's
+                // margin, so nothing else is ever underneath them and they can
+                // be asked first. Acted on as the button goes down, the way the
+                // scrub bars are, so the pill moves under the press.
+                {
+                    const int arrow = HitTestShiftArrow(xPos, yPos);
+                    if (arrow >= 0) {
+                        ShiftPillBy(arrow == 0 ? -kShiftStepPx : kShiftStepPx);
+                        g_shiftPressed = true;
+                        return 0;
+                    }
+                }
+
                 bool mediaActive = false;
                 {
                     std::lock_guard lock(g_stateMutex);
@@ -10229,6 +10419,14 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
                 int xPos = GET_X_LPARAM(lParam);
                 int yPos = GET_Y_LPARAM(lParam);
+
+                // The press that moved the pill owns the release as well. By
+                // now the window has shifted five pixels out from under the
+                // pointer, and without this the release would land on whatever
+                // that motion brought into the spot.
+                if (g_shiftPressed.exchange(false)) {
+                    return 0;
+                }
 
                 if (g_moveGestureActive.exchange(false)) {
                     // Read this before releasing: ReleaseCapture sends
@@ -10805,9 +11003,21 @@ DWORD WINAPI RenderThreadProc(void*) {
 
             bool isHoverExpanded = g_settings.expandOnHover ? hover : (hover && g_clickExpanded.load());
 
+            // The shift arrows sit in the margin above and below a resting
+            // pill, and hovering the pill normally opens it out — which would
+            // take them away in the same motion that reached for them, and put
+            // the page arrows under the pointer instead. The pointer in that
+            // strip holds the pill closed, so the arrows stay where the eye
+            // last saw them for as long as it takes to press one.
+            const bool overShiftZone = hover && PointerInShiftZone(windowRect, cursor);
+            if (overShiftZone) {
+                isHoverExpanded = false;
+            }
+
             if (currentlyHidden && !g_settings.unhideOnHover && primary.kind == IslandKind::Idle) {
                 isHoverExpanded = false;
-            } else if (isHoverExpanded || pinned || primary.kind != IslandKind::Idle) {
+            } else if (isHoverExpanded || pinned || overShiftZone ||
+                       primary.kind != IslandKind::Idle) {
                 lastInteractionTime = now;
             }
 
@@ -11122,6 +11332,17 @@ DWORD WINAPI RenderThreadProc(void*) {
                     needsRender = true;
                 }
 
+                int hoveredShift = -1;
+                if (hover) {
+                    POINT local = cursor;
+                    if (ScreenToClient(hwnd, &local)) {
+                        hoveredShift = HitTestShiftArrow(local.x, local.y);
+                    }
+                }
+                if (g_hoveredShiftArrow.exchange(hoveredShift) != hoveredShift) {
+                    needsRender = true;
+                }
+
                 // The number of pages moves under the index — a timer taking
                 // the pill takes the media page with it — and an index left
                 // past the end shows the first page while the down arrow says
@@ -11317,10 +11538,19 @@ DWORD WINAPI RenderThreadProc(void*) {
                 prevCpuTemp = snapshot.system.cpuTempC;
             }
 
+            // The shift arrows belong to the pill at rest: closed, not pinned
+            // open, and settled into one of the three states it lives in rather
+            // than a notification passing through on its way out.
+            const bool restingPill =
+                !pinned && !isHoverExpanded &&
+                heightSpring.value < 100.0f * g_settings.sizeScale &&
+                (primary.kind == IslandKind::Idle || primary.kind == IslandKind::Media ||
+                 primary.kind == IslandKind::Timer);
+
             if (needsRender) {
                 renderer.Render(snapshot, g_settings, primary, secondary,
                                 widthSpring.value, heightSpring.value, nudgeSpring.value,
-                                hover, pinned, now);
+                                hover, pinned, restingPill, now);
             }
 
             WaitForSingleObject(g_stopEvent, 16);
@@ -11364,6 +11594,7 @@ bool StartThreads() {
     LoadTimers();
     LoadTimerNames();
     LoadHiddenMediaApps();
+    LoadShiftOffset();
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_settingsChangedEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!g_stopEvent || !g_settingsChangedEvent) {
