@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.30.0
+// @version         1.31.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -88,12 +88,11 @@ media, downloads, clipboard, battery, and more.
   40 pixels it re-anchors and glides to the bottom of the screen (or back to
   the top, dragging up). Let go before then and it glides back to where it
   started. Changing Position in the settings takes control back from the drag.
-- A resting pill grows a bar along its top edge and another along its bottom,
-  laid out like the page arrows of the expanded pill: each press walks it five
-  pixels up or down the screen, for lining it up with whatever is underneath.
-  Resting on one holds the pill closed so it does not open out from under the
-  pointer. The placement is remembered, and "Recentre" in the context menu
-  puts it back.
+- A resting pill grows a button on each end: the right one walks it five
+  pixels up the screen, the left one five pixels down, for lining it up with
+  whatever is underneath. Resting on one holds the pill closed so it does not
+  open out from under the pointer. The placement is remembered, and
+  "Recentre" in the context menu puts it back.
 - Optional game overlay with FPS/CPU/RAM/GPU/disk cards, toggled from the
   context menu or with a configurable hotkey (default Ctrl+Alt+G). While the
   overlay is on it acts as the pill's collapsed look — hovering or clicking
@@ -300,15 +299,20 @@ namespace {
 constexpr wchar_t kWindowClass[] = L"Windhawk.DynamicIslandForWindows";
 constexpr UINT WM_APP_LAYOUT_CHANGED = WM_APP + 0x442;
 constexpr UINT WM_APP_NEW_EVENT = WM_APP + 0x443;
-constexpr float kRenderPadX = 28.0f;
-// Vertical margin the window carries around the pill, holding the shift bars.
-// Growing it does not move the pill: the anchor insets below are measured to
+// Horizontal margin the window carries around the pill. The shift buttons reach
+// into it, so it sets how far out they can go — with room to spare for the
+// 2.5% the pill inflates by under the pointer, which grows into the same space.
+// Changing it does not move the pill: the anchor insets below are measured to
 // the pill's own edge and this is subtracted back out of them.
-constexpr float kRenderPadY = 28.0f;
-// Where the pill's own top and bottom edge sit, from the edge of the work
-// area, at the top and bottom anchors respectively.
+constexpr float kRenderPadX = 36.0f;
+// Vertical margin. Changing it does not move the pill: the anchor insets below
+// are measured to the pill's own edge and this is subtracted back out of them.
+constexpr float kRenderPadY = 22.0f;
+// Where the pill's own edges sit, from the edge of the work area, at the
+// anchors that measure to them.
 constexpr int kPillEdgeInsetTop = 30;
 constexpr int kPillEdgeInsetBottom = 62;
+constexpr int kPillEdgeInsetX = 44;
 static_assert(kRenderPadY < static_cast<float>(kPillEdgeInsetTop),
               "the window would start above the top of the work area");
 
@@ -339,26 +343,24 @@ constexpr float kPageContentBottom =
 static_assert(kPageContentTop + 100.0f < kPageContentBottom,
               "expanded pill is too short to hold a page between the nav bars");
 
-// The shift bars: a bar hugging the top edge of a resting pill and another
-// hugging its bottom, each carrying a chevron that walks the pill five pixels
-// up or down the screen at a press. They are laid out exactly like the page
-// arrows of the expanded pill, and the two are never on screen together — the
-// shift bars belong to the resting pill, the page arrows to the opened one.
+// The shift buttons: one on each end of a resting pill, walking it five pixels
+// up or down the screen at a press. Right moves it up, left moves it down.
 //
 // To hold them the painted body reaches past the pill's own rect by the band
-// below, out into the margin the window already carries. The rect the contents
-// are laid out in does not move, so nothing else in the mod — least of all the
-// height it reads to tell a collapsed pill from an expanded one — notices.
-constexpr float kShiftBarHeight = 25.0f;
-constexpr float kShiftBarMargin = 2.0f;   // from the body's top/bottom edge
-constexpr float kShiftBarInset = 10.0f;   // from the body's left/right edge
-constexpr float kShiftBandExtent = kShiftBarMargin + kShiftBarHeight;
+// below, out into the side margin the window already carries. The rect the
+// contents are laid out in does not move, so nothing else in the mod — least
+// of all the height it reads to tell a collapsed pill from an expanded one —
+// notices they are there.
+constexpr float kShiftBarWidth = 25.0f;
+constexpr float kShiftBarMargin = 2.0f;  // from the body's left/right edge
+constexpr float kShiftBarInset = 4.0f;   // from the body's top/bottom edge
+constexpr float kShiftBandExtent = kShiftBarMargin + kShiftBarWidth;
 constexpr int kShiftStepPx = 5;
 // Far enough to place the pill anywhere it is wanted, near enough that it can
 // never be walked off the screen and lost.
 constexpr int kShiftLimitPx = 600;
-static_assert(kShiftBandExtent <= kRenderPadY,
-              "the shift bars must fit in the margin around the pill");
+static_assert(kShiftBandExtent <= kRenderPadX,
+              "the shift buttons must fit in the margin beside the pill");
 
 enum class IslandKind {
     Idle,
@@ -1398,6 +1400,7 @@ void AnchorPointForPosition(Position position, int width, int height, int* outX,
     // The anchor places the window, but what should stay put as the margin
     // around the pill changes is the pill itself, so each inset is a distance
     // to the pill's own edge with the margin taken back off.
+    const int padX = static_cast<int>(kRenderPadX);
     const int padY = static_cast<int>(kRenderPadY);
     int x = work.left + (work.right - work.left - width) / 2;
     int y = work.top + kPillEdgeInsetTop - padY;
@@ -1405,11 +1408,11 @@ void AnchorPointForPosition(Position position, int width, int height, int* outX,
 
     switch (position) {
         case Position::TopLeft:
-            x = work.left + 16;
+            x = work.left + kPillEdgeInsetX - padX;
             y = work.top + kPillEdgeInsetTop - padY;
             break;
         case Position::TopRight:
-            x = work.right - width - 16;
+            x = work.right - width - (kPillEdgeInsetX - padX);
             y = work.top + kPillEdgeInsetTop - padY;
             break;
         case Position::BottomCenter:
@@ -6364,14 +6367,23 @@ class Renderer {
         rect = D2D1::RectF(cx - w * 0.5f, cy - h * 0.5f, cx + w * 0.5f, cy + h * 0.5f);
 
         // Everything painted as the pill — its surface, its edge, its highlight
-        // — goes on the body, which is the pill's rect grown by the shift band
-        // when a resting pill is carrying the bars. The contents keep the rect
-        // itself, so their layout is untouched and the band costs nothing but
-        // paint. The band is in device pixels, like the margin it reaches into,
-        // so it does not take the size scale.
+        // — goes on the body, which is the pill's rect grown sideways by the
+        // shift band when a resting pill is carrying the buttons. The contents
+        // keep the rect itself, so their layout is untouched and the band costs
+        // nothing but paint. Growing it widthways also leaves the pill's height
+        // alone, so its corner radius and whole silhouette are unchanged. The
+        // band is in device pixels, like the margin it reaches into, so it does
+        // not take the size scale.
+        //
+        // Clamped to the room left on the bitmap, because the hover inflation
+        // grows into the same margin the band wants. The margin is sized to
+        // hold both at any ordinary size scale; past that the buttons narrow
+        // rather than being cut off by the edge of the window.
+        const float roomX = std::min(rect.left, static_cast<float>(bitmapWidth_) - rect.right) - 1.0f;
+        const float band = std::max(0.0f, std::min(shiftBand, roomX));
         const D2D1_RECT_F body =
-            shiftBand > 0.01f
-                ? D2D1::RectF(rect.left, rect.top - shiftBand, rect.right, rect.bottom + shiftBand)
+            band > 0.01f
+                ? D2D1::RectF(rect.left - band, rect.top, rect.right + band, rect.bottom)
                 : rect;
 
         float radius = settings.w11Style ? 8.0f * settings.sizeScale : (body.bottom - body.top) * 0.5f;
@@ -6461,8 +6473,8 @@ class Renderer {
 
         // Last, and outside the content transform, so the rectangles published
         // for the hit-test are the ones actually painted.
-        if (shiftBand > 0.01f) {
-            DrawShiftBars(body, shiftBand / kShiftBandExtent);
+        if (band > 0.01f) {
+            DrawShiftBars(body, band, shiftBand / kShiftBandExtent);
         }
     }
 
@@ -7644,36 +7656,40 @@ class Renderer {
         }
     }
 
-    // The two bars that walk the pill up and down the screen, one along the top
-    // edge of its body and one along the bottom — the same placement the page
-    // arrows have on the expanded pill. The rect passed in is the body, already
-    // grown by the band and already carrying the hover inflation, so the bars
-    // ride out of the pill with it and their ends stay flush with its own.
+    // The two buttons that walk the pill up and down the screen, one on each
+    // end of its body: up on the right, down on the left. The rect passed in is
+    // the body, already grown by the band and already carrying the hover
+    // inflation, so the buttons ride out of the pill with it and their outer
+    // edges stay flush with its own.
     //
-    // amount runs 0 to 1 as the band opens and closes. The bars fade with it,
-    // and only take clicks once they have all but arrived: a control halfway
-    // out of the pill is not one to press.
-    void DrawShiftBars(D2D1_RECT_F body, float amount) {
+    // amount runs 0 to 1 as the band opens and closes. The buttons fade with
+    // it, and only take clicks once they have all but arrived: a control
+    // halfway out of the pill is not one to press.
+    void DrawShiftBars(D2D1_RECT_F body, float band, float amount) {
         const float alpha = Clamp(amount, 0.0f, 1.0f);
-        if (alpha <= 0.01f || (body.right - body.left) < kShiftBarInset * 4.0f) {
+        const float barWidth = std::min(kShiftBarWidth, band - kShiftBarMargin);
+        if (alpha <= 0.01f || barWidth < 6.0f ||
+            (body.bottom - body.top) < kShiftBarInset * 2.0f + 8.0f) {
             return;
         }
-        DrawShiftBar(body, true, alpha);
-        DrawShiftBar(body, false, alpha);
+        DrawShiftBar(body, barWidth, true, alpha);
+        DrawShiftBar(body, barWidth, false, alpha);
         if (alpha > 0.9f) {
             g_shiftHitValid = true;
         }
     }
 
-    void DrawShiftBar(D2D1_RECT_F body, bool up, float alpha) {
-        const float barTop = up ? body.top + kShiftBarMargin
-                                : body.bottom - kShiftBarMargin - kShiftBarHeight;
-        const D2D1_RECT_F bar = D2D1::RectF(body.left + kShiftBarInset, barTop,
-                                            body.right - kShiftBarInset, barTop + kShiftBarHeight);
+    // up is the right-hand button: it is the one that carries the up chevron
+    // and walks the pill up the screen.
+    void DrawShiftBar(D2D1_RECT_F body, float barWidth, bool up, float alpha) {
+        const float barLeft =
+            up ? body.right - kShiftBarMargin - barWidth : body.left + kShiftBarMargin;
+        const D2D1_RECT_F bar = D2D1::RectF(barLeft, body.top + kShiftBarInset,
+                                            barLeft + barWidth, body.bottom - kShiftBarInset);
 
         const bool hovered = g_hoveredShiftArrow.load() == (up ? 0 : 1);
-        // At the end of its travel a bar has nothing left to give, and says so
-        // the way every other spent control on the pill does.
+        // At the end of its travel a button has nothing left to give, and says
+        // so the way every other spent control on the pill does.
         const int offset = g_shiftOffsetY.load();
         const bool enabled = up ? offset > -kShiftLimitPx : offset < kShiftLimitPx;
 
@@ -7685,21 +7701,22 @@ class Renderer {
                          (enabled ? (hovered ? 0.20f : 0.07f) : 0.02f) * settingsOpacity_ * alpha),
             &bg);
         if (bg) {
-            target_->FillRoundedRectangle(
-                D2D1::RoundedRect(bar, kShiftBarHeight * 0.5f, kShiftBarHeight * 0.5f), bg.Get());
+            const float radius =
+                std::min(bar.right - bar.left, bar.bottom - bar.top) * 0.5f;
+            target_->FillRoundedRectangle(D2D1::RoundedRect(bar, radius, radius), bg.Get());
         }
 
         const float cx = (bar.left + bar.right) * 0.5f;
         const float cy = (bar.top + bar.bottom) * 0.5f;
-        const float armX = 8.0f;
-        const float armY = 4.6f;
+        const float armX = 6.4f;
+        const float armY = 3.7f;
         const float tipY = cy + (up ? -armY : armY);
         const float baseY = cy + (up ? armY : -armY);
         textBrush_->SetOpacity((enabled ? 1.0f : 0.28f) * alpha);
         target_->DrawLine(D2D1::Point2F(cx - armX, baseY), D2D1::Point2F(cx, tipY),
-                          textBrush_.Get(), 2.4f);
+                          textBrush_.Get(), 2.2f);
         target_->DrawLine(D2D1::Point2F(cx, tipY), D2D1::Point2F(cx + armX, baseY),
-                          textBrush_.Get(), 2.4f);
+                          textBrush_.Get(), 2.2f);
         textBrush_->SetOpacity(0.90f);
 
         // Published like every other control. No size-scale conversion here —
@@ -9986,23 +10003,23 @@ static int HitTestShiftArrow(int xPos, int yPos) {
     return -1;
 }
 
-// Whether the pointer is in the margin strip the shift bars are drawn in.
+// Whether the pointer is in the margin strip the shift buttons are drawn in.
 // Worked out from the window rather than read back from a published rectangle,
 // because it has to be true *before* they are drawn: it is what holds the pill
-// in the resting shape that shows them. The bars span the pill's full width, so
-// the strip is the whole of the margin above and below it.
+// in the resting shape that shows them. The buttons run the pill's full height,
+// so the strip is the whole of the margin to either side of it.
 static bool PointerInShiftZone(const RECT& windowRect, POINT cursor) {
     const float w = static_cast<float>(windowRect.right - windowRect.left);
     const float h = static_cast<float>(windowRect.bottom - windowRect.top);
     // A hidden pill is nothing but margin, and the two strips would then cover
     // the whole of it — holding the pill closed against the very hover that is
-    // supposed to bring it back. Below a pill's worth of height there is
-    // nothing here to shift.
-    if (w < kRenderPadX * 2.0f || h < kRenderPadY * 2.0f + 16.0f) {
+    // supposed to bring it back. Below a pill's worth of width there is nothing
+    // here to shift.
+    if (w < kRenderPadX * 2.0f + 24.0f || h < kRenderPadY * 2.0f) {
         return false;
     }
-    const float y = static_cast<float>(cursor.y - windowRect.top);
-    return y < kRenderPadY || y > h - kRenderPadY;
+    const float x = static_cast<float>(cursor.x - windowRect.left);
+    return x < kRenderPadX || x > w - kRenderPadX;
 }
 
 static int HitTestPageNav(int xPos, int yPos) {
