@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.27.0
+// @version         1.27.1
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -8498,13 +8498,18 @@ class Renderer {
             target_->FillEllipse(D2D1::Ellipse(center, radius, radius), bg.Get());
         }
 
+        // Drawn in the text brush, not the muted one. The muted brush is a
+        // dim grey to begin with, so dimming it further stacked two reductions
+        // and left the cross reading as a disabled control — which it is not.
+        // Keeping a destructive action quiet is worth something; looking
+        // unclickable is not.
         const float arm = radius * 0.36f;
-        mutedBrush_->SetOpacity(enabled ? (hovered ? 0.95f : 0.55f) : 0.20f);
+        textBrush_->SetOpacity(enabled ? (hovered ? 1.0f : 0.78f) : 0.24f);
         target_->DrawLine(D2D1::Point2F(center.x - arm, center.y - arm),
-                          D2D1::Point2F(center.x + arm, center.y + arm), mutedBrush_.Get(), 1.7f);
+                          D2D1::Point2F(center.x + arm, center.y + arm), textBrush_.Get(), 1.9f);
         target_->DrawLine(D2D1::Point2F(center.x + arm, center.y - arm),
-                          D2D1::Point2F(center.x - arm, center.y + arm), mutedBrush_.Get(), 1.7f);
-        mutedBrush_->SetOpacity(0.58f);
+                          D2D1::Point2F(center.x - arm, center.y + arm), textBrush_.Get(), 1.9f);
+        textBrush_->SetOpacity(0.90f);
     }
 
     void DrawMediaButton(D2D1_POINT_2F center, float radius, int kind, bool primary,
