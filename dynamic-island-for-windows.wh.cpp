@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.29.0
+// @version         1.30.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -88,11 +88,12 @@ media, downloads, clipboard, battery, and more.
   40 pixels it re-anchors and glides to the bottom of the screen (or back to
   the top, dragging up). Let go before then and it glides back to where it
   started. Changing Position in the settings takes control back from the drag.
-- A resting pill carries a bar its own width in the margin above it and
-  another below: each press walks it five pixels up or down the screen, for
-  lining it up with whatever is underneath. Resting on one holds the pill
-  closed so it does not open out from under the pointer. The placement is
-  remembered, and "Recentre" in the context menu puts it back.
+- A resting pill grows a bar along its top edge and another along its bottom,
+  laid out like the page arrows of the expanded pill: each press walks it five
+  pixels up or down the screen, for lining it up with whatever is underneath.
+  Resting on one holds the pill closed so it does not open out from under the
+  pointer. The placement is remembered, and "Recentre" in the context menu
+  puts it back.
 - Optional game overlay with FPS/CPU/RAM/GPU/disk cards, toggled from the
   context menu or with a configurable hotkey (default Ctrl+Alt+G). While the
   overlay is on it acts as the pill's collapsed look — hovering or clicking
@@ -338,19 +339,25 @@ constexpr float kPageContentBottom =
 static_assert(kPageContentTop + 100.0f < kPageContentBottom,
               "expanded pill is too short to hold a page between the nav bars");
 
-// The shift bars: a bar the width of the pill in the margin above it and
-// another below, drawn only while the pill is resting, each carrying a chevron
-// that walks the pill five pixels up or down the screen at a press. They sit
-// outside the pill body on purpose — the pill's own top and bottom edges
-// already belong to the page arrows, and a second pair of chevrons a few
-// pixels from those would be a coin toss to read.
+// The shift bars: a bar hugging the top edge of a resting pill and another
+// hugging its bottom, each carrying a chevron that walks the pill five pixels
+// up or down the screen at a press. They are laid out exactly like the page
+// arrows of the expanded pill, and the two are never on screen together — the
+// shift bars belong to the resting pill, the page arrows to the opened one.
+//
+// To hold them the painted body reaches past the pill's own rect by the band
+// below, out into the margin the window already carries. The rect the contents
+// are laid out in does not move, so nothing else in the mod — least of all the
+// height it reads to tell a collapsed pill from an expanded one — notices.
 constexpr float kShiftBarHeight = 25.0f;
-constexpr float kShiftBarGap = 3.0f;  // clearance between the bar and the pill
+constexpr float kShiftBarMargin = 2.0f;   // from the body's top/bottom edge
+constexpr float kShiftBarInset = 10.0f;   // from the body's left/right edge
+constexpr float kShiftBandExtent = kShiftBarMargin + kShiftBarHeight;
 constexpr int kShiftStepPx = 5;
 // Far enough to place the pill anywhere it is wanted, near enough that it can
 // never be walked off the screen and lost.
 constexpr int kShiftLimitPx = 600;
-static_assert(kShiftBarHeight + kShiftBarGap <= kRenderPadY,
+static_assert(kShiftBandExtent <= kRenderPadY,
               "the shift bars must fit in the margin around the pill");
 
 enum class IslandKind {
@@ -6067,7 +6074,7 @@ class Renderer {
 
     bool Render(const SharedState& state, const Settings& settings, const Activity& primary,
                 const std::optional<Activity>& secondary, float width, float height,
-                float nudge, bool hover, bool pinned, bool resting, double now) {
+                float nudge, bool hover, bool pinned, float shiftBand, double now) {
         EnsureTextFormats(settings.sizeScale);
 
         // A hovered privacy dot opens a popup that hangs off the pill, so the
@@ -6137,7 +6144,7 @@ class Renderer {
 
                 DrawPill(state, settings, primary,
                          D2D1::RectF(left, pTop, left + primary.width, pTop + primary.height),
-                         scale, now);
+                         scale, now, shiftBand);
                 DrawPill(state, settings, *secondary,
                          D2D1::RectF(left + primary.width + gap, sTop,
                                       left + primary.width + gap + secondary->width,
@@ -6145,11 +6152,8 @@ class Renderer {
                          scale, now);
             } else {
                 DrawPill(state, settings, primary,
-                         D2D1::RectF(left, top, left + width, top + height), scale, now);
-            }
-
-            if (resting) {
-                DrawShiftArrows(D2D1::RectF(left, top, left + width, top + height), scale);
+                         D2D1::RectF(left, top, left + width, top + height), scale, now,
+                         shiftBand);
             }
         }
 
@@ -6352,24 +6356,35 @@ class Renderer {
     }
 
     void DrawPill(const SharedState& state, const Settings& settings, const Activity& activity,
-                  D2D1_RECT_F rect, float scale, double now) {
+                  D2D1_RECT_F rect, float scale, double now, float shiftBand = 0.0f) {
         const float cx = (rect.left + rect.right) * 0.5f;
         const float cy = (rect.top + rect.bottom) * 0.5f;
         const float w = (rect.right - rect.left) * scale;
         const float h = (rect.bottom - rect.top) * scale;
         rect = D2D1::RectF(cx - w * 0.5f, cy - h * 0.5f, cx + w * 0.5f, cy + h * 0.5f);
 
-        float radius = settings.w11Style ? 8.0f * settings.sizeScale : (rect.bottom - rect.top) * 0.5f;
+        // Everything painted as the pill — its surface, its edge, its highlight
+        // — goes on the body, which is the pill's rect grown by the shift band
+        // when a resting pill is carrying the bars. The contents keep the rect
+        // itself, so their layout is untouched and the band costs nothing but
+        // paint. The band is in device pixels, like the margin it reaches into,
+        // so it does not take the size scale.
+        const D2D1_RECT_F body =
+            shiftBand > 0.01f
+                ? D2D1::RectF(rect.left, rect.top - shiftBand, rect.right, rect.bottom + shiftBand)
+                : rect;
+
+        float radius = settings.w11Style ? 8.0f * settings.sizeScale : (body.bottom - body.top) * 0.5f;
         if (!settings.w11Style) {
             radius = std::min(radius, 44.0f * settings.sizeScale);
         }
-        DrawSoftShadow(rect, radius);
+        DrawSoftShadow(body, radius);
 
-        D2D1_ROUNDED_RECT pill = D2D1::RoundedRect(rect, radius, radius);
-        DrawPillSurface(rect, radius, activity.kind, settings.w11Style);
+        D2D1_ROUNDED_RECT pill = D2D1::RoundedRect(body, radius, radius);
+        DrawPillSurface(body, radius, activity.kind, settings.w11Style);
 
         if (activity.kind == IslandKind::Progress) {
-            DrawProgressRing(rect, state.progress.percent);
+            DrawProgressRing(body, state.progress.percent);
         }
 
         if (activity.kind == IslandKind::BatteryLow) {
@@ -6387,8 +6402,8 @@ class Renderer {
             ComPtr<ID2D1SolidColorBrush> highlight;
             target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.10f * settingsOpacity_), &highlight);
             target_->DrawRoundedRectangle(
-                D2D1::RoundedRect(D2D1::RectF(rect.left + 1, rect.top + 1, rect.right - 1,
-                                              rect.bottom - 1),
+                D2D1::RoundedRect(D2D1::RectF(body.left + 1, body.top + 1, body.right - 1,
+                                              body.bottom - 1),
                                   radius - 1, radius - 1),
                 highlight.Get(), 1.0f);
         }
@@ -6443,6 +6458,12 @@ class Renderer {
         DrawPrivacyDots(state, unscaledRect, now);
 
         target_->SetTransform(oldTransform);
+
+        // Last, and outside the content transform, so the rectangles published
+        // for the hit-test are the ones actually painted.
+        if (shiftBand > 0.01f) {
+            DrawShiftBars(body, shiftBand / kShiftBandExtent);
+        }
     }
 
     void DrawSoftShadow(D2D1_RECT_F rect, float radius) {
@@ -7623,35 +7644,32 @@ class Renderer {
         }
     }
 
-    // The two bars that walk the pill up and down the screen, one in the margin
-    // above it and one below. Drawn in device pixels, outside the transform the
-    // pill's contents are scaled by: the margin is a fixed band whatever the
-    // size scale is, and these have to fit inside it.
+    // The two bars that walk the pill up and down the screen, one along the top
+    // edge of its body and one along the bottom — the same placement the page
+    // arrows have on the expanded pill. The rect passed in is the body, already
+    // grown by the band and already carrying the hover inflation, so the bars
+    // ride out of the pill with it and their ends stay flush with its own.
     //
-    // The rect passed in is the pill before the hover inflation. The bars take
-    // that inflation widthways, so their ends stay flush with the pill's as it
-    // breathes, but not heightways: the margin has no room to give, and a bar
-    // grown into it would be clipped against the edge of the window.
-    void DrawShiftArrows(D2D1_RECT_F pill, float scale) {
-        const float cx = (pill.left + pill.right) * 0.5f;
-        const float w = (pill.right - pill.left) * scale;
-        const float h = pill.bottom - pill.top;
-        pill = D2D1::RectF(cx - w * 0.5f, pill.top, cx + w * 0.5f, pill.bottom);
-
-        if (w < kShiftBarHeight * 2.0f || h < 2.0f) {
+    // amount runs 0 to 1 as the band opens and closes. The bars fade with it,
+    // and only take clicks once they have all but arrived: a control halfway
+    // out of the pill is not one to press.
+    void DrawShiftBars(D2D1_RECT_F body, float amount) {
+        const float alpha = Clamp(amount, 0.0f, 1.0f);
+        if (alpha <= 0.01f || (body.right - body.left) < kShiftBarInset * 4.0f) {
             return;
         }
-        DrawShiftBar(pill, true);
-        DrawShiftBar(pill, false);
-        g_shiftHitValid = true;
+        DrawShiftBar(body, true, alpha);
+        DrawShiftBar(body, false, alpha);
+        if (alpha > 0.9f) {
+            g_shiftHitValid = true;
+        }
     }
 
-    void DrawShiftBar(D2D1_RECT_F pill, bool up) {
-        const D2D1_RECT_F bar =
-            up ? D2D1::RectF(pill.left, pill.top - kShiftBarGap - kShiftBarHeight, pill.right,
-                             pill.top - kShiftBarGap)
-               : D2D1::RectF(pill.left, pill.bottom + kShiftBarGap, pill.right,
-                             pill.bottom + kShiftBarGap + kShiftBarHeight);
+    void DrawShiftBar(D2D1_RECT_F body, bool up, float alpha) {
+        const float barTop = up ? body.top + kShiftBarMargin
+                                : body.bottom - kShiftBarMargin - kShiftBarHeight;
+        const D2D1_RECT_F bar = D2D1::RectF(body.left + kShiftBarInset, barTop,
+                                            body.right - kShiftBarInset, barTop + kShiftBarHeight);
 
         const bool hovered = g_hoveredShiftArrow.load() == (up ? 0 : 1);
         // At the end of its travel a bar has nothing left to give, and says so
@@ -7664,7 +7682,7 @@ class Renderer {
         ComPtr<ID2D1SolidColorBrush> bg;
         target_->CreateSolidColorBrush(
             D2D1::ColorF(1, 1, 1,
-                         (enabled ? (hovered ? 0.20f : 0.07f) : 0.02f) * settingsOpacity_),
+                         (enabled ? (hovered ? 0.20f : 0.07f) : 0.02f) * settingsOpacity_ * alpha),
             &bg);
         if (bg) {
             target_->FillRoundedRectangle(
@@ -7677,7 +7695,7 @@ class Renderer {
         const float armY = 4.6f;
         const float tipY = cy + (up ? -armY : armY);
         const float baseY = cy + (up ? armY : -armY);
-        textBrush_->SetOpacity(enabled ? 1.0f : 0.28f);
+        textBrush_->SetOpacity((enabled ? 1.0f : 0.28f) * alpha);
         target_->DrawLine(D2D1::Point2F(cx - armX, baseY), D2D1::Point2F(cx, tipY),
                           textBrush_.Get(), 2.4f);
         target_->DrawLine(D2D1::Point2F(cx, tipY), D2D1::Point2F(cx + armX, baseY),
@@ -10861,6 +10879,9 @@ DWORD WINAPI RenderThreadProc(void*) {
         SpringValue widthSpring;
         SpringValue heightSpring;
         SpringValue nudgeSpring;
+        // How far the body currently reaches past the pill to hold the shift
+        // bars, in device pixels: 0 with none out, kShiftBandExtent with both.
+        float shiftBand = 0.0f;
         widthSpring.Reset((g_settings.autoHideIdleSeconds == -1 ? 0.0f : 120.0f) * g_settings.sizeScale);
         heightSpring.Reset((g_settings.autoHideIdleSeconds == -1 ? 0.0f : 36.0f) * g_settings.sizeScale);
         nudgeSpring.Reset(0.0f);
@@ -11149,6 +11170,27 @@ DWORD WINAPI RenderThreadProc(void*) {
             }
 
             nudgeSpring.Step(dt * speed, 280.0f, 24.0f);
+
+            // The shift bars belong to the pill at rest: closed, not pinned
+            // open, and settled into one of the three states it lives in rather
+            // than a notification passing through on its way out.
+            const bool restingPill =
+                !pinned && !isHoverExpanded &&
+                heightSpring.value < 100.0f * g_settings.sizeScale &&
+                (primary.kind == IslandKind::Idle || primary.kind == IslandKind::Media ||
+                 primary.kind == IslandKind::Timer);
+
+            // Eased rather than switched, because the bars are part of the
+            // pill's body now: appearing all at once would read as the
+            // silhouette jumping rather than a control arriving.
+            const float shiftTarget = restingPill ? kShiftBandExtent : 0.0f;
+            if (std::fabs(shiftTarget - shiftBand) > 0.25f) {
+                shiftBand += (shiftTarget - shiftBand) * std::min(1.0f, dt * speed * 16.0f);
+                needsRender = true;
+            } else if (shiftBand != shiftTarget) {
+                shiftBand = shiftTarget;
+                needsRender = true;
+            }
 
             {
                 std::lock_guard lock(g_stateMutex);
@@ -11553,19 +11595,10 @@ DWORD WINAPI RenderThreadProc(void*) {
                 prevCpuTemp = snapshot.system.cpuTempC;
             }
 
-            // The shift arrows belong to the pill at rest: closed, not pinned
-            // open, and settled into one of the three states it lives in rather
-            // than a notification passing through on its way out.
-            const bool restingPill =
-                !pinned && !isHoverExpanded &&
-                heightSpring.value < 100.0f * g_settings.sizeScale &&
-                (primary.kind == IslandKind::Idle || primary.kind == IslandKind::Media ||
-                 primary.kind == IslandKind::Timer);
-
             if (needsRender) {
                 renderer.Render(snapshot, g_settings, primary, secondary,
                                 widthSpring.value, heightSpring.value, nudgeSpring.value,
-                                hover, pinned, restingPill, now);
+                                hover, pinned, shiftBand, now);
             }
 
             WaitForSingleObject(g_stopEvent, 16);
