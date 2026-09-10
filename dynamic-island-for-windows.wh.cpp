@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.40.0
+// @version         1.41.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -124,9 +124,15 @@ tracks what Task Manager shows. The similarly named "% Processor Utility" is
 scaled by current-over-base clock speed and reads far higher on a CPU that
 boosts well above its base frequency.
 
-Weather comes from two services: wttr.in resolves the location (from your IP,
-or from the city in the settings) and names it, and Open-Meteo supplies the
-readings for those coordinates. wttr.in's own current_condition block is a
+Weather comes from three services. wttr.in resolves the location (from your IP,
+or from the city or coordinates in the settings) and names it. Where the United
+States' weather service covers that position, the temperature, humidity, dew
+point and wind are the nearest reporting station's own measurements - a
+thermometer a mile or two away, which is what everyone else means by "the
+temperature". Open-Meteo supplies the rest, and everything, everywhere the
+station network does not reach: it serves forecast models, and a model grid
+splits the difference across a microclimate, so it can read several degrees
+cool on a clear day where a bay shore and a foothill share a postcode. wttr.in's own current_condition block is a
 nearest-station observation that can sit a few degrees and a lot of humidity
 away from the national forecast models; Open-Meteo serves those models. If
 Open-Meteo cannot be reached, wttr.in's readings are shown instead.
@@ -3128,6 +3134,298 @@ static bool FetchOpenMeteoExtras(double latitude, double longitude, bool isImper
     return true;
 }
 
+
+// ── Observed conditions: the United States' weather service ──────────────────
+// Open-Meteo serves forecast models. A model is a grid, and a grid smooths: on
+// a clear morning it splits the difference between the bay shore and the
+// foothills three miles away, and reads several degrees cool for the warmer of
+// the two. What everyone else calls "the temperature" is a thermometer
+// reading, so where there is a thermometer nearby, this asks it.
+//
+// api.weather.gov covers the United States and its territories and nothing
+// else, so a location it does not know is remembered as such and not asked
+// about again until the location moves.
+
+struct NwsObservation {
+    bool hasTemperature = false;
+    double temperature = 0.0;
+    std::wstring feelsLike;
+    std::wstring humidity;
+    std::wstring dewPoint;
+    std::wstring windSpeed;
+    std::wstring windDir;
+    std::wstring desc;
+    int weatherCode = -1;   // -1 leaves whatever the model said about the sky
+};
+
+// Reads the number out of a {"unitCode":..., "value":N} pair belonging to a
+// named field. Returns false for the JSON null the service writes wherever an
+// instrument is missing or out of service, which is common enough that every
+// caller has to cope with it.
+static bool ParseNwsValue(const char* object, const char* key, double* out) {
+    if (!object || !key || !out) {
+        return false;
+    }
+    const char* found = strstr(object, key);
+    if (!found) {
+        return false;
+    }
+    const char* value = strstr(found + strlen(key), "\"value\"");
+    if (!value) {
+        return false;
+    }
+    value += 7;
+    while (*value == ' ' || *value == ':') {
+        ++value;
+    }
+    char* end = nullptr;
+    const double parsed = strtod(value, &end);
+    if (end == value) {
+        return false;   // null
+    }
+    *out = parsed;
+    return true;
+}
+
+// How long ago the observation was taken. Stations report hourly and some go
+// quiet for a while, so a stale one is worse than no override at all — the
+// model at least knows what time it is.
+static bool NwsObservationAgeMinutes(const char* properties, double* outMinutes) {
+    const char* stamp = strstr(properties, "\"timestamp\"");
+    if (!stamp) {
+        return false;
+    }
+    stamp = strchr(stamp + 11, '"');
+    if (!stamp) {
+        return false;
+    }
+    int year = 0, month = 0, day = 0, hour = 0, minute = 0;
+    if (sscanf(stamp + 1, "%d-%d-%dT%d:%d", &year, &month, &day, &hour, &minute) != 5) {
+        return false;
+    }
+
+    SYSTEMTIME taken = {};
+    taken.wYear = static_cast<WORD>(year);
+    taken.wMonth = static_cast<WORD>(month);
+    taken.wDay = static_cast<WORD>(day);
+    taken.wHour = static_cast<WORD>(hour);
+    taken.wMinute = static_cast<WORD>(minute);
+
+    SYSTEMTIME now = {};
+    GetSystemTime(&now);
+
+    FILETIME takenFt = {}, nowFt = {};
+    if (!SystemTimeToFileTime(&taken, &takenFt) || !SystemTimeToFileTime(&now, &nowFt)) {
+        return false;
+    }
+    ULARGE_INTEGER a = {}, b = {};
+    a.LowPart = takenFt.dwLowDateTime;
+    a.HighPart = takenFt.dwHighDateTime;
+    b.LowPart = nowFt.dwLowDateTime;
+    b.HighPart = nowFt.dwHighDateTime;
+    if (b.QuadPart < a.QuadPart) {
+        *outMinutes = 0.0;   // a clock a minute ahead of the service is not staleness
+        return true;
+    }
+    *outMinutes = static_cast<double>(b.QuadPart - a.QuadPart) / 600000000.0;
+    return true;
+}
+
+// The service writes the sky in words. The pill draws it from a WMO code, so
+// the words are turned back into one — coarsely, because the icon set is
+// coarse.
+static int NwsWeatherCode(const std::string& text) {
+    std::string lower;
+    lower.reserve(text.size());
+    for (char ch : text) {
+        lower.push_back(static_cast<char>(tolower(static_cast<unsigned char>(ch))));
+    }
+    auto has = [&lower](const char* needle) { return lower.find(needle) != std::string::npos; };
+
+    if (has("thunder")) return 95;
+    if (has("snow") || has("sleet") || has("ice")) return 73;
+    if (has("freezing")) return 66;
+    if (has("drizzle")) return 53;
+    if (has("rain") || has("shower")) return 63;
+    if (has("fog") || has("mist")) return 45;
+    if (has("haze") || has("smoke") || has("dust")) return 45;
+    if (has("overcast")) return 3;
+    if (has("mostly cloudy") || has("broken")) return 3;
+    if (has("partly cloudy") || has("partly sunny") || has("scattered")) return 2;
+    if (has("mostly clear") || has("mostly sunny") || has("few")) return 1;
+    if (has("clear") || has("sunny") || has("fair")) return 0;
+    return -1;
+}
+
+// The stations nearest a position, nearest first, and whether the service
+// covers the position at all. Only the weather thread touches this.
+struct NwsStations {
+    double latitude = 999.0;
+    double longitude = 999.0;
+    bool unavailable = false;
+    std::vector<std::string> ids;
+};
+static NwsStations g_nwsStations;
+
+static void ResolveNwsStations(double latitude, double longitude) {
+    const bool moved = std::fabs(latitude - g_nwsStations.latitude) > 0.02 ||
+                       std::fabs(longitude - g_nwsStations.longitude) > 0.02;
+    if (!moved && (!g_nwsStations.ids.empty() || g_nwsStations.unavailable)) {
+        return;
+    }
+
+    g_nwsStations = NwsStations();
+    g_nwsStations.latitude = latitude;
+    g_nwsStations.longitude = longitude;
+
+    wchar_t url[128] = {};
+    swprintf_s(url, L"/points/%.4f,%.4f", latitude, longitude);
+    const std::string points = HttpGet(L"api.weather.gov", url, true);
+
+    // The grid the position falls in names its own station list, so the path
+    // is taken from the answer rather than rebuilt out of the three fields it
+    // was assembled from.
+    const char* link = points.empty() ? nullptr : strstr(points.c_str(), "\"observationStations\"");
+    const char* path = link ? strstr(link, "/gridpoints/") : nullptr;
+    if (!path) {
+        g_nwsStations.unavailable = true;
+        Wh_Log(L"Weather: no US weather service coverage at %.4f,%.4f; keeping the model's "
+               L"readings.", latitude, longitude);
+        return;
+    }
+    const char* end = strchr(path, '"');
+    if (!end) {
+        g_nwsStations.unavailable = true;
+        return;
+    }
+
+    // Four is enough to get past a station that is down or has no thermometer,
+    // and the full list runs to seventy kilobytes.
+    std::string stationsPath(path, end - path);
+    stationsPath += "?limit=4";
+    std::wstring widePath(stationsPath.begin(), stationsPath.end());
+
+    const std::string list = HttpGet(L"api.weather.gov", widePath.c_str(), true);
+    const char* cursor = list.c_str();
+    while ((cursor = strstr(cursor, "\"stationIdentifier\"")) != nullptr) {
+        cursor = strchr(cursor + 19, '"');
+        if (!cursor) break;
+        ++cursor;
+        const char* stop = strchr(cursor, '"');
+        if (!stop) break;
+        g_nwsStations.ids.emplace_back(cursor, stop - cursor);
+        cursor = stop;
+    }
+
+    if (g_nwsStations.ids.empty()) {
+        g_nwsStations.unavailable = true;
+        return;
+    }
+    Wh_Log(L"Weather: nearest reporting station is %S.", g_nwsStations.ids.front().c_str());
+}
+
+static bool FetchNwsObservation(double latitude, double longitude, bool isImperial,
+                                NwsObservation* out) {
+    if (!out) {
+        return false;
+    }
+    ResolveNwsStations(latitude, longitude);
+    if (g_nwsStations.unavailable || g_nwsStations.ids.empty()) {
+        return false;
+    }
+
+    for (const std::string& id : g_nwsStations.ids) {
+        std::string path = "/stations/" + id + "/observations/latest";
+        std::wstring widePath(path.begin(), path.end());
+        const std::string response = HttpGet(L"api.weather.gov", widePath.c_str(), true);
+        if (response.empty()) {
+            continue;
+        }
+        const char* properties = strstr(response.c_str(), "\"properties\"");
+        if (!properties) {
+            continue;
+        }
+
+        double celsius = 0.0;
+        if (!ParseNwsValue(properties, "\"temperature\"", &celsius)) {
+            continue;   // the station is up but has no thermometer reporting
+        }
+
+        double age = 0.0;
+        if (NwsObservationAgeMinutes(properties, &age) && age > 90.0) {
+            continue;   // reporting, but not lately
+        }
+
+        auto toDisplay = [isImperial](double c) { return isImperial ? c * 9.0 / 5.0 + 32.0 : c; };
+
+        NwsObservation reading;
+        reading.hasTemperature = true;
+        reading.temperature = toDisplay(celsius);
+
+        wchar_t buf[32] = {};
+        double value = 0.0;
+
+        // Heat index and wind chill are the service's own "feels like", and at
+        // most one of them is ever set. Each is taken only in the direction it
+        // is for: below about eighty degrees the heat index formula returns
+        // numbers cooler than the air, which is not what "feels like" means to
+        // anyone reading it.
+        double feels = celsius;
+        if (ParseNwsValue(properties, "\"heatIndex\"", &value) && value > celsius) {
+            feels = value;
+        } else if (ParseNwsValue(properties, "\"windChill\"", &value) && value < celsius) {
+            feels = value;
+        }
+        swprintf_s(buf, L"%.0f", toDisplay(feels));
+        reading.feelsLike = buf;
+
+        if (ParseNwsValue(properties, "\"relativeHumidity\"", &value)) {
+            swprintf_s(buf, L"%.0f", value);
+            reading.humidity = buf;
+        }
+        if (ParseNwsValue(properties, "\"dewpoint\"", &value)) {
+            swprintf_s(buf, L"%.0f\x00B0", toDisplay(value));
+            reading.dewPoint = buf;
+        }
+        if (ParseNwsValue(properties, "\"windSpeed\"", &value)) {
+            // Reported in km/h whatever the temperature is in.
+            swprintf_s(buf, L"%.0f", isImperial ? value * 0.621371 : value);
+            reading.windSpeed = buf;
+        }
+        if (ParseNwsValue(properties, "\"windDirection\"", &value)) {
+            reading.windDir = CompassFromDegrees(value);
+        }
+
+        const char* described = strstr(properties, "\"textDescription\"");
+        if (described) {
+            described = strchr(described + 17, '"');
+            if (described) {
+                const char* stop = strchr(described + 1, '"');
+                if (stop) {
+                    const std::string words(described + 1, stop - described - 1);
+                    if (!words.empty()) {
+                        reading.weatherCode = NwsWeatherCode(words);
+                        const int chars =
+                            MultiByteToWideChar(CP_UTF8, 0, words.c_str(), -1, nullptr, 0);
+                        if (chars > 0) {
+                            std::vector<wchar_t> wide(chars);
+                            MultiByteToWideChar(CP_UTF8, 0, words.c_str(), -1, wide.data(), chars);
+                            reading.desc = wide.data();
+                        }
+                    }
+                }
+            }
+        }
+
+        Wh_Log(L"Weather: %S observed %.1f%s, %s%% humidity, %.0f minutes ago.", id.c_str(),
+               reading.temperature, isImperial ? L"F" : L"C", reading.humidity.c_str(), age);
+        *out = std::move(reading);
+        return true;
+    }
+
+    return false;
+}
+
 // Air quality is a different Open-Meteo service, so it is a request of its own
 // and its own kind of failure.
 static std::wstring FetchAirQualityIndex(double latitude, double longitude) {
@@ -4276,10 +4574,33 @@ DWORD WINAPI WeatherThreadProc(void*) {
                            windSpeed.c_str(), windDir.c_str(), desc.c_str());
                 }
 
+                // A thermometer three miles away beats a grid cell that
+                // spans both sides of a microclimate, so where the service
+                // covers the position its reading replaces the model's.
+                // Everything it does not measure — the chance of rain, the UV
+                // index — stays with the model below.
+                NwsObservation observed;
+                if (FetchNwsObservation(latitude, longitude, isFahrenheit, &observed) &&
+                    observed.hasTemperature) {
+                    temp = static_cast<float>(observed.temperature);
+                    if (observed.weatherCode >= 0) code = observed.weatherCode;
+                    if (!observed.desc.empty()) desc = observed.desc;
+                    if (!observed.feelsLike.empty()) feelsLike = observed.feelsLike;
+                    if (!observed.humidity.empty()) humidity = observed.humidity;
+                    if (!observed.windSpeed.empty()) windSpeed = observed.windSpeed;
+                    if (!observed.windDir.empty()) windDir = observed.windDir;
+                }
+
                 // Only the expanded page shows these, and neither failure
                 // costs anything the pill was already showing.
                 if (!FetchOpenMeteoExtras(latitude, longitude, isFahrenheit, &extras)) {
                     Wh_Log(L"Weather: the extra readings could not be fetched.");
+                }
+
+                // After the model's, not before: the dew point is one of the
+                // extras, and fetching them fills the whole struct.
+                if (!observed.dewPoint.empty()) {
+                    extras.dewPoint = observed.dewPoint;
                 }
                 airQuality = FetchAirQualityIndex(latitude, longitude);
             } else {

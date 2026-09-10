@@ -1,0 +1,201 @@
+{
+    "@context": [
+        "https://geojson.org/geojson-ld/geojson-context.jsonld",
+        {
+            "@version": "1.1",
+            "wx": "https://api.weather.gov/ontology#",
+            "s": "https://schema.org/",
+            "geo": "http://www.opengis.net/ont/geosparql#",
+            "unit": "http://codes.wmo.int/common/unit/",
+            "@vocab": "https://api.weather.gov/ontology#",
+            "geometry": {
+                "@id": "s:GeoCoordinates",
+                "@type": "geo:wktLiteral"
+            },
+            "city": "s:addressLocality",
+            "state": "s:addressRegion",
+            "distance": {
+                "@id": "s:Distance",
+                "@type": "s:QuantitativeValue"
+            },
+            "bearing": {
+                "@type": "s:QuantitativeValue"
+            },
+            "value": {
+                "@id": "s:value"
+            },
+            "unitCode": {
+                "@id": "s:unitCode",
+                "@type": "@id"
+            },
+            "forecastOffice": {
+                "@type": "@id"
+            },
+            "forecastGridData": {
+                "@type": "@id"
+            },
+            "publicZone": {
+                "@type": "@id"
+            },
+            "county": {
+                "@type": "@id"
+            },
+            "observationStations": {
+                "@container": "@list",
+                "@type": "@id"
+            }
+        }
+    ],
+    "type": "FeatureCollection",
+    "features": [
+        {
+            "id": "https://api.weather.gov/stations/AW020",
+            "type": "Feature",
+            "geometry": {
+                "type": "Point",
+                "coordinates": [
+                    -122.10517,
+                    37.4015
+                ]
+            },
+            "properties": {
+                "@id": "https://api.weather.gov/stations/AW020",
+                "@type": "wx:ObservationStation",
+                "elevation": {
+                    "unitCode": "wmoUnit:m",
+                    "value": 10.000488
+                },
+                "stationIdentifier": "AW020",
+                "name": "AE6EO MOUNTAIN VIEW",
+                "timeZone": "America/Los_Angeles",
+                "provider": "APRSWXNET",
+                "subProvider": "",
+                "distance": {
+                    "unitCode": "wmoUnit:m",
+                    "value": 1454.9887770788
+                },
+                "bearing": {
+                    "unitCode": "wmoUnit:degree_(angle)",
+                    "value": 18
+                },
+                "forecast": "https://api.weather.gov/zones/forecast/CAZ508",
+                "county": "https://api.weather.gov/zones/county/CAC085",
+                "fireWeatherZone": "https://api.weather.gov/zones/fire/CAZ508"
+            }
+        },
+        {
+            "id": "https://api.weather.gov/stations/LOAC1",
+            "type": "Feature",
+            "geometry": {
+                "type": "Point",
+                "coordinates": [
+                    -122.14167,
+                    37.35472
+                ]
+            },
+            "properties": {
+                "@id": "https://api.weather.gov/stations/LOAC1",
+                "@type": "wx:ObservationStation",
+                "elevation": {
+                    "unitCode": "wmoUnit:m",
+                    "value": 164.2872
+                },
+                "stationIdentifier": "LOAC1",
+                "name": "LOS ALTOS",
+                "timeZone": "America/Los_Angeles",
+                "provider": "RAWS",
+                "subProvider": "",
+                "distance": {
+                    "unitCode": "wmoUnit:m",
+                    "value": 4716.3780583906
+                },
+                "bearing": {
+                    "unitCode": "wmoUnit:degree_(angle)",
+                    "value": 215
+                },
+                "forecast": "https://api.weather.gov/zones/forecast/CAZ508",
+                "county": "https://api.weather.gov/zones/county/CAC085",
+                "fireWeatherZone": "https://api.weather.gov/zones/fire/CAZ508"
+            }
+        },
+        {
+            "id": "https://api.weather.gov/stations/KNUQ",
+            "type": "Feature",
+            "geometry": {
+                "type": "Point",
+                "coordinates": [
+                    -122.04806,
+                    37.40583
+                ]
+            },
+            "properties": {
+                "@id": "https://api.weather.gov/stations/KNUQ",
+                "@type": "wx:ObservationStation",
+                "elevation": {
+                    "unitCode": "wmoUnit:m",
+                    "value": 10.0584
+                },
+                "stationIdentifier": "KNUQ",
+                "name": "Mountain View, Moffett Field",
+                "timeZone": "America/Los_Angeles",
+                "provider": "ASOS",
+                "subProvider": "",
+                "distance": {
+                    "unitCode": "wmoUnit:m",
+                    "value": 5812.7898677829
+                },
+                "bearing": {
+                    "unitCode": "wmoUnit:degree_(angle)",
+                    "value": 71
+                },
+                "forecast": "https://api.weather.gov/zones/forecast/CAZ508",
+                "county": "https://api.weather.gov/zones/county/CAC085",
+                "fireWeatherZone": "https://api.weather.gov/zones/fire/CAZ508"
+            }
+        },
+        {
+            "id": "https://api.weather.gov/stations/KPAO",
+            "type": "Feature",
+            "geometry": {
+                "type": "Point",
+                "coordinates": [
+                    -122.11667,
+                    37.46667
+                ]
+            },
+            "properties": {
+                "@id": "https://api.weather.gov/stations/KPAO",
+                "@type": "wx:ObservationStation",
+                "elevation": {
+                    "unitCode": "wmoUnit:m",
+                    "value": 2.1336
+                },
+                "stationIdentifier": "KPAO",
+                "name": "Palo Alto Airport",
+                "timeZone": "America/Los_Angeles",
+                "provider": "OTHER-MTR",
+                "subProvider": "",
+                "distance": {
+                    "unitCode": "wmoUnit:m",
+                    "value": 8644.1120685528
+                },
+                "bearing": {
+                    "unitCode": "wmoUnit:degree_(angle)",
+                    "value": 356
+                },
+                "forecast": "https://api.weather.gov/zones/forecast/CAZ508",
+                "county": "https://api.weather.gov/zones/county/CAC081",
+                "fireWeatherZone": "https://api.weather.gov/zones/fire/CAZ508"
+            }
+        }
+    ],
+    "observationStations": [
+        "https://api.weather.gov/stations/AW020",
+        "https://api.weather.gov/stations/LOAC1",
+        "https://api.weather.gov/stations/KNUQ",
+        "https://api.weather.gov/stations/KPAO"
+    ],
+    "pagination": {
+        "next": "https://api.weather.gov/stations?id%5B0%5D=AP803&id%5B1%5D=AR323&id%5B2%5D=ASRC1&id%5B3%5D=AW020&id%5B4%5D=BBEC1&id%5B5%5D=BNDC1&id%5B6%5D=C4787&id%5B7%5D=C9585&id%5B8%5D=CI114&id%5B9%5D=CQ076&id%5B10%5D=CTOC1&id%5B11%5D=D1132&id%5B12%5D=D3169&id%5B13%5D=D3835&id%5B14%5D=D6436&id%5B15%5D=D7094&id%5B16%5D=D9751&id%5B17%5D=D9961&id%5B18%5D=E1227&id%5B19%5D=F3625&id%5B20%5D=FHLC1&id%5B21%5D=HSEC1&id%5B22%5D=HWKC1&id%5B23%5D=KAPC&id%5B24%5D=KCCR&id%5B25%5D=KCVH&id%5B26%5D=KDVO&id%5B27%5D=KHAF&id%5B28%5D=KHWD&id%5B29%5D=KLVK&id%5B30%5D=KMRY&id%5B31%5D=KNUQ&id%5B32%5D=KOAK&id%5B33%5D=KPAO&id%5B34%5D=KRHV&id%5B35%5D=KSFO&id%5B36%5D=KSJC&id%5B37%5D=KSNS&id%5B38%5D=KSTS&id%5B39%5D=KWVI&id%5B40%5D=LAHC1&id%5B41%5D=LBNL1&id%5B42%5D=LOAC1&id%5B43%5D=LSGC1&id%5B44%5D=LTRC1&id%5B45%5D=MDEC1&id%5B46%5D=OAAC1&id%5B47%5D=OAMC1&id%5B48%5D=PCLC1&id%5B49%5D=PCOC1&id%5B50%5D=PG727&id%5B51%5D=PIBC1&id%5B52%5D=PKFC1&id%5B53%5D=PPSC1&id%5B54%5D=RBYC1&id%5B55%5D=SFOC1&id%5B56%5D=SJS02&id%5B57%5D=XCDC1&cursor=eyJzIjo1MDB9"
+    }
+}
