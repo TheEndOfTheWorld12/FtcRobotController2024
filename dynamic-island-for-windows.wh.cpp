@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.38.1
+// @version         1.38.2
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -9103,9 +9103,15 @@ class Renderer {
             headline = day.note.empty() ? day.title : day.note;
             footnote = L"Nothing on today.";
         } else if (standing.beforeSchool) {
-            headline = StripPassing(standing.next->name);
+            // The heading names the state, not the first class. Naming the
+            // class put "Trig Honors" over a running number an hour before the
+            // bell, which reads as a lesson in progress with an hour of it
+            // left — the opposite of what it means. The class moves down to
+            // the line that is already about times.
+            headline = L"Before school";
             countdown = ScheduleCountdown(standing.next->start - minutes);
-            footnote = L"Starts at " + ClockLabel(standing.next->start) + L"  ·  day ends " +
+            footnote = StripPassing(standing.next->name) + L" at " +
+                       ClockLabel(standing.next->start) + L"  ·  out at " +
                        ClockLabel(day.blocks.back().end);
         } else if (standing.afterSchool) {
             headline = L"Done for today";
