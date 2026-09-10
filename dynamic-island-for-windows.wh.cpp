@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.38.2
+// @version         1.39.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -34,7 +34,9 @@ media, downloads, clipboard, battery, and more.
   fade, a marker rides the bar at the current minute, and pointing at any
   block names it - the page's heading, figure and times all swing round to
   whatever is under the pointer, so the figure becomes how long that block
-  runs for.
+  runs for. The countdown itself is colour-coded by how far through the block
+  it has got - green for the first half, blue past halfway, grey for the last
+  stretch, red for the final five minutes - on the page and on the pill alike.
 - A cross in the top-right corner of the expanded player dismisses a source:
   the pill stops offering it and the arrows skip it, which is the answer to an
   app that registers with Windows' transport controls and then never plays
@@ -8859,6 +8861,27 @@ class Renderer {
         return buffer;
     }
 
+    // How far through the block you are, as a colour: green for the first half,
+    // blue once past it, grey for the last stretch, red for the final five
+    // minutes.
+    //
+    // The grey is the one the strip uses for a passing period, not a genuinely
+    // dark one. The pill's ground is near-black, and a dark grey numeral on it
+    // is a numeral you cannot read — which is the opposite of what a warning
+    // colour is for.
+    static D2D1_COLOR_F ScheduleUrgencyColour(float elapsed, float minutesLeft) {
+        if (minutesLeft <= 5.0f) {
+            return D2D1::ColorF(0.96f, 0.36f, 0.34f, 1.0f);   // last five minutes
+        }
+        if (elapsed >= 0.85f) {
+            return D2D1::ColorF(0.62f, 0.67f, 0.72f, 1.0f);   // last fifteen percent
+        }
+        if (elapsed >= 0.50f) {
+            return D2D1::ColorF(0.36f, 0.62f, 0.96f, 1.0f);   // past halfway
+        }
+        return D2D1::ColorF(0.29f, 0.80f, 0.42f, 1.0f);       // first half
+    }
+
     // How long a block runs for. Not the countdown format: a length does not
     // tick, and "1:30:00" reads as a stopwatch rather than an hour and a half.
     static std::wstring ScheduleLength(int minutes) {
@@ -9096,6 +9119,13 @@ class Renderer {
         std::wstring countdown;
         std::wstring footnote;
 
+        // Set only while the figure really is a countdown inside a block, so
+        // the wait before school and the length of a block you are pointing at
+        // stay in the plain text colour.
+        bool ticking = false;
+        float elapsed = 0.0f;
+        float minutesLeft = 0.0f;
+
         if (!day.valid) {
             headline = L"No schedule yet";
             footnote = L"Fetching it from the address in the settings.";
@@ -9118,6 +9148,10 @@ class Renderer {
             footnote = L"Out since " + ClockLabel(day.blocks.back().end) + L".";
         } else if (standing.current) {
             const ScheduleBlock& block = *standing.current;
+            ticking = true;
+            minutesLeft = block.end - minutes;
+            elapsed = (minutes - block.start) /
+                      std::max(1.0f, static_cast<float>(block.end - block.start));
             // "Passing to Bio Honors" rather than "Bio Honors". The label is
             // the school's own, the class name is already substituted into it,
             // and the page has room for the whole phrase — stripping it left a
@@ -9144,6 +9178,7 @@ class Renderer {
             const int length = std::max(0, block.end - block.start);
             headline = block.name;
             countdown = ScheduleLength(length);
+            ticking = false;
             wchar_t span[64] = {};
             swprintf_s(span, L"%s – %s  ·  %d min", ClockLabel(block.start).c_str(),
                        ClockLabel(block.end).c_str(), length);
@@ -9160,11 +9195,18 @@ class Renderer {
         // The number. Centred, because hugeTextFormat_ is a centred format and
         // every other user of it depends on that staying true.
         if (!countdown.empty()) {
+            ComPtr<ID2D1SolidColorBrush> figure;
+            if (ticking) {
+                D2D1_COLOR_F colour = ScheduleUrgencyColour(elapsed, minutesLeft);
+                colour.a = 0.98f * settingsOpacity_;
+                target_->CreateSolidColorBrush(colour, &figure);
+            }
             target_->DrawTextW(countdown.c_str(), static_cast<UINT32>(countdown.size()),
                                hugeTextFormat_.Get(),
                                D2D1::RectF(rect.left, rect.top + 72.0f, rect.right,
                                            rect.top + 120.0f),
-                               textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                               figure ? figure.Get() : textBrush_.Get(),
+                               D2D1_DRAW_TEXT_OPTIONS_CLIP);
         }
 
         if (!day.blocks.empty()) {
@@ -9230,20 +9272,25 @@ class Renderer {
             return;
         }
 
-        const bool soon = !big.empty() && standing.current && !standing.current->passing &&
-                          (standing.current->end - minutes) <= 5.0f;
-
-        if (soon) {
-            accentBrush_->SetOpacity(0.95f);
-        } else {
-            textBrush_->SetOpacity(0.96f);
+        // Same scale the page's figure runs on, so the glance and the look are
+        // saying the same thing. Before the first bell there is no block to be
+        // a fraction of, so that one stays plain.
+        ComPtr<ID2D1SolidColorBrush> figure;
+        if (standing.current) {
+            const ScheduleBlock& block = *standing.current;
+            const float elapsed = (minutes - block.start) /
+                                  std::max(1.0f, static_cast<float>(block.end - block.start));
+            D2D1_COLOR_F colour = ScheduleUrgencyColour(elapsed, block.end - minutes);
+            colour.a = 0.97f * settingsOpacity_;
+            target_->CreateSolidColorBrush(colour, &figure);
         }
+
+        textBrush_->SetOpacity(0.96f);
         target_->DrawTextW(big.c_str(), static_cast<UINT32>(big.size()), textFormat_.Get(),
                            D2D1::RectF(rect.left + 16.0f * scale, rect.top + 7.0f * scale,
                                        rect.left + 84.0f * scale, rect.bottom - 6.0f * scale),
-                           soon ? accentBrush_.Get() : textBrush_.Get(),
+                           figure ? figure.Get() : textBrush_.Get(),
                            D2D1_DRAW_TEXT_OPTIONS_CLIP);
-        accentBrush_->SetOpacity(1.0f);
 
         ComPtr<ID2D1SolidColorBrush> divider;
         target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.12f * settingsOpacity_), &divider);
