@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.34.0
+// @version         1.35.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -100,9 +100,11 @@ media, downloads, clipboard, battery, and more.
   started. Changing Position in the settings takes control back from the drag.
 - A resting pill grows a button on each end: the left one walks it five pixels
   up the screen, the right one five pixels down, for lining it up with
-  whatever is underneath. Resting on one holds the pill closed so it does not
-  open out from under the pointer. The placement is remembered, and
-  "Recentre" in the context menu puts it back.
+  whatever is underneath. What is stored is the distance from the edge the
+  pill hangs off, so a pill set 100px below the top sits 100px above the
+  bottom once it is dragged down there. Resting on a button holds the pill
+  closed so it does not open out from under the pointer. The placement is
+  remembered, and "Recentre" in the context menu puts it back.
 - Optional game overlay with FPS/CPU/RAM/GPU/disk cards, toggled from the
   context menu or with a configurable hotkey (default Ctrl+Alt+G). While the
   overlay is on it acts as the pill's collapsed look — hovering or clicking
@@ -842,11 +844,14 @@ std::atomic<int> g_pageCount = kIdleTabCount;
 // the page arrows above: 0 is the top arrow, 1 the bottom, -1 neither.
 std::atomic<bool> g_shiftHitValid = false;
 std::atomic<int> g_hoveredShiftArrow = -1;
-// How far the arrows have walked the pill from its anchor, in screen pixels,
-// positive downwards. Deliberately not the vertical offset in the settings:
-// that one mirrors, so the top and bottom placements sit the same distance
-// from their own edge, while this is the literal direction of the arrow that
-// was pressed. Persisted, so a placement survives a restart.
+// How far the arrows have walked the pill away from the edge it hangs off, in
+// pixels. Measured to that edge rather than down the screen, so a pill set 100
+// from the top is 100 from the bottom once it is dragged down there — which is
+// what "the same place, on the other side" means to anyone looking at it. The
+// arrows still move the pill in the direction they point; at the bottom that
+// simply means the up arrow is the one that adds. Same convention as the
+// vertical offset in the settings, and persisted, so a placement survives a
+// restart.
 std::atomic<int> g_shiftOffsetY = 0;
 // Set when a press lands on an arrow, so the release that follows is spent on
 // the arrow too rather than falling through to whatever the shifted window has
@@ -1493,15 +1498,14 @@ void AnchorPointForPosition(Position position, int width, int height, int* outX,
     }
 
     if (outX) *outX = x + g_settings.offsetX;
-    // The offset moves the pill away from the edge it hangs off, so a 100px
-    // vertical offset sits 100px below the top edge up there and 100px above
-    // the bottom edge down here — mirrored, rather than pushed off-screen.
-    //
-    // The shift arrows are added on top of that and do not mirror: pressing the
-    // up arrow moves the pill up the screen wherever it happens to be anchored.
+    // Both offsets measure away from the edge the pill hangs off, so 100px sits
+    // 100px below the top edge up there and 100px above the bottom edge down
+    // here — mirrored, rather than pushed off-screen. The one the arrows drive
+    // is added to the one in the settings; nothing distinguishes them once the
+    // pill is placed.
     if (outY) {
-        *outY = (bottomAnchored ? y - g_settings.offsetY : y + g_settings.offsetY) +
-                g_shiftOffsetY.load();
+        const int away = g_settings.offsetY + g_shiftOffsetY.load();
+        *outY = bottomAnchored ? y - away : y + away;
     }
 }
 
@@ -1512,7 +1516,16 @@ void LoadShiftOffset() {
     g_shiftOffsetY = ClampInt(Wh_GetIntValue(L"ShiftOffsetY", 0), -kShiftLimitPx, kShiftLimitPx);
 }
 
-// One press of a shift arrow. Positive walks the pill down the screen.
+// Which way a press changes the stored distance. The arrows always move the
+// pill the way they point, but what is stored is measured from the edge the
+// pill hangs off — so at the bottom of the screen the up arrow is the one
+// moving it further away, and the sign flips with the anchor.
+int ShiftStepForArrow(int arrow, bool bottomAnchored) {
+    const bool up = arrow == 0;
+    return (up == bottomAnchored) ? kShiftStepPx : -kShiftStepPx;
+}
+
+// One press of a shift arrow. Positive moves the pill away from its edge.
 void ShiftPillBy(int deltaPx) {
     const int current = g_shiftOffsetY.load();
     const int next = ClampInt(current + deltaPx, -kShiftLimitPx, kShiftLimitPx);
@@ -8716,8 +8729,10 @@ class Renderer {
             (body.bottom - body.top) < kShiftBarInset * 2.0f + 8.0f) {
             return;
         }
-        DrawShiftBar(body, barWidth, true, alpha);
-        DrawShiftBar(body, barWidth, false, alpha);
+        // Asked once and handed to both, rather than read twice a frame.
+        const bool bottomAnchored = EffectivePosition() == Position::BottomCenter;
+        DrawShiftBar(body, barWidth, true, bottomAnchored, alpha);
+        DrawShiftBar(body, barWidth, false, bottomAnchored, alpha);
         if (alpha > 0.9f) {
             g_shiftHitValid = true;
         }
@@ -8725,7 +8740,8 @@ class Renderer {
 
     // up is the left-hand button: it is the one that carries the up chevron and
     // walks the pill up the screen.
-    void DrawShiftBar(D2D1_RECT_F body, float barWidth, bool up, float alpha) {
+    void DrawShiftBar(D2D1_RECT_F body, float barWidth, bool up, bool bottomAnchored,
+                      float alpha) {
         const float barLeft =
             up ? body.left + kShiftBarMargin : body.right - kShiftBarMargin - barWidth;
         const D2D1_RECT_F bar = D2D1::RectF(barLeft, body.top + kShiftBarInset,
@@ -8733,9 +8749,12 @@ class Renderer {
 
         const bool hovered = g_hoveredShiftArrow.load() == (up ? 0 : 1);
         // At the end of its travel a button has nothing left to give, and says
-        // so the way every other spent control on the pill does.
+        // so the way every other spent control on the pill does. Which end that
+        // is depends on the anchor, for the same reason the press does.
         const int offset = g_shiftOffsetY.load();
-        const bool enabled = up ? offset > -kShiftLimitPx : offset < kShiftLimitPx;
+        const int step = ShiftStepForArrow(up ? 0 : 1, bottomAnchored);
+        const bool enabled =
+            step > 0 ? offset < kShiftLimitPx : offset > -kShiftLimitPx;
 
         // The plate carries the whole of the hover response now that the
         // chevron on it is drawn at full strength either way.
@@ -11729,7 +11748,8 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 {
                     const int arrow = HitTestShiftArrow(xPos, yPos);
                     if (arrow >= 0) {
-                        ShiftPillBy(arrow == 0 ? -kShiftStepPx : kShiftStepPx);
+                        ShiftPillBy(ShiftStepForArrow(
+                            arrow, EffectivePosition() == Position::BottomCenter));
                         g_shiftPressed = true;
                         return 0;
                     }
