@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.35.0
+// @version         1.36.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -27,7 +27,10 @@ media, downloads, clipboard, battery, and more.
   follows, ahead of anything playing - something usually is, during those six
   hours, and underneath it the countdown would be hidden for exactly as long
   as it is wanted. A timer still comes first, and a brief alert still
-  interrupts. Outside school hours the pill goes back to what it was.
+  interrupts. Outside school hours the pill goes back to what it was. The page
+  carries the day as a strip of even segments, one per block in order - green
+  for a class, red for brunch and lunch, grey for the walk between them. The
+  one you are in stands proud of the rest, and the ones behind you fade.
 - A cross in the top-right corner of the expanded player dismisses a source:
   the pill stops offering it and the arrows skip it, which is the answer to an
   app that registers with Windows' transport controls and then never plays
@@ -8856,80 +8859,62 @@ class Renderer {
         return buffer;
     }
 
-    // The whole school day as one strip, with where you are on it. A bell
-    // schedule is a shape more than it is a list, and the shape is what tells
-    // you at a glance whether the hard part of the day is behind you.
+    // The whole school day as one strip: every block in order, each the same
+    // width, coloured by what kind of thing it is. Classes green, brunch and
+    // lunch red, the walks between them grey.
+    //
+    // Deliberately not a timeline. Drawn to scale the walks were slivers and
+    // the long blocks were slabs, and the eye had to do arithmetic to answer
+    // the only question worth asking of it — how much of the day is left, and
+    // what kind of thing is next. Even widths make it countable instead.
     void DrawScheduleStrip(const ScheduleDay& day, D2D1_RECT_F strip, float minutes) {
-        if (day.blocks.empty()) {
+        const int count = static_cast<int>(day.blocks.size());
+        if (count <= 0) {
             return;
         }
-        const float dayStart = static_cast<float>(day.blocks.front().start);
-        const float dayEnd = static_cast<float>(day.blocks.back().end);
-        const float span = std::max(1.0f, dayEnd - dayStart);
+
+        const float gap = count > 12 ? 1.5f : 2.5f;
         const float width = strip.right - strip.left;
+        const float cell = (width - gap * (count - 1)) / count;
+        if (cell < 1.5f) {
+            return;
+        }
         const float height = strip.bottom - strip.top;
 
-        ComPtr<ID2D1SolidColorBrush> bed;
-        target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.06f * settingsOpacity_), &bed);
-        if (bed) {
-            target_->FillRoundedRectangle(
-                D2D1::RoundedRect(strip, height * 0.5f, height * 0.5f), bed.Get());
+        // Three brushes for the whole strip rather than one per segment: the
+        // colour says what a block is, and opacity says whether it is spent.
+        ComPtr<ID2D1SolidColorBrush> classBrush, restBrush, walkBrush;
+        target_->CreateSolidColorBrush(D2D1::ColorF(0.29f, 0.80f, 0.42f, 1.0f), &classBrush);
+        target_->CreateSolidColorBrush(D2D1::ColorF(0.96f, 0.36f, 0.34f, 1.0f), &restBrush);
+        target_->CreateSolidColorBrush(D2D1::ColorF(0.62f, 0.67f, 0.72f, 1.0f), &walkBrush);
+        if (!classBrush || !restBrush || !walkBrush) {
+            return;
         }
 
-        for (const ScheduleBlock& block : day.blocks) {
+        for (int i = 0; i < count; ++i) {
+            const ScheduleBlock& block = day.blocks[i];
+            const float x0 = strip.left + i * (cell + gap);
+            const float x1 = x0 + cell;
+
+            ID2D1SolidColorBrush* brush = classBrush.Get();
             if (block.passing) {
-                continue;   // the gaps between segments are the walks
-            }
-            const float x0 = strip.left + (block.start - dayStart) / span * width;
-            const float x1 = strip.left + (block.end - dayStart) / span * width;
-            if (x1 - x0 < 0.6f) {
-                continue;
+                brush = walkBrush.Get();
+            } else if (block.rest) {
+                brush = restBrush.Get();
             }
 
-            // Brunch and lunch are drawn as a thinner bar, not merely a fainter
-            // one. Shade alone said "class or break" and "done or still to
-            // come" at the same time, in the same channel, and by the end of
-            // the day — when everything is done — it said nothing at all. A
-            // difference in height survives that: the fat bars are the classes
-            // whatever the hour.
-            const float inset = block.rest ? height * 0.27f : 0.0f;
-            const D2D1_RECT_F segment =
-                D2D1::RectF(x0, strip.top + inset, x1, strip.bottom - inset);
-            const float corner = (segment.bottom - segment.top) * 0.5f;
+            // The one you are in stands proud of the rest, since colour is
+            // spoken for and cannot also mean "now".
+            const bool here = minutes >= block.start && minutes < block.end;
+            const float lift = here ? 2.0f : 0.0f;
+            const D2D1_RECT_F cellRect =
+                D2D1::RectF(x0, strip.top - lift, x1, strip.bottom + lift);
+            const float corner = std::min(cell, height + lift * 2.0f) * 0.5f;
 
-            if (minutes >= block.start && minutes < block.end) {
-                accentBrush_->SetOpacity(0.92f);
-                target_->FillRoundedRectangle(D2D1::RoundedRect(segment, corner, corner),
-                                              accentBrush_.Get());
-                accentBrush_->SetOpacity(1.0f);
-                continue;
-            }
-
-            ComPtr<ID2D1SolidColorBrush> fill;
-            float alpha = minutes >= block.end ? 0.28f : 0.52f;
-            if (block.rest) {
-                alpha *= 0.72f;
-            }
-            target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, alpha * settingsOpacity_), &fill);
-            if (fill) {
-                target_->FillRoundedRectangle(D2D1::RoundedRect(segment, corner, corner),
-                                              fill.Get());
-            }
-        }
-
-        // Where the day has got to, drawn over the segments so it reads against
-        // both the lit one and the spent ones.
-        if (minutes > dayStart && minutes < dayEnd) {
-            const float x = strip.left + (minutes - dayStart) / span * width;
-            ComPtr<ID2D1SolidColorBrush> mark;
-            target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.95f * settingsOpacity_), &mark);
-            if (mark) {
-                target_->FillRoundedRectangle(
-                    D2D1::RoundedRect(D2D1::RectF(x - 0.9f, strip.top - 2.5f, x + 0.9f,
-                                                  strip.bottom + 2.5f),
-                                      0.9f, 0.9f),
-                    mark.Get());
-            }
+            brush->SetOpacity((here ? 1.0f : (minutes >= block.end ? 0.30f : 0.66f)) *
+                              settingsOpacity_);
+            target_->FillRoundedRectangle(D2D1::RoundedRect(cellRect, corner, corner), brush);
+            brush->SetOpacity(1.0f);
         }
     }
 
@@ -9033,7 +9018,7 @@ class Renderer {
         }
 
         if (!day.blocks.empty()) {
-            DrawScheduleStrip(day, D2D1::RectF(left, rect.top + 134.0f, right, rect.top + 141.0f),
+            DrawScheduleStrip(day, D2D1::RectF(left, rect.top + 132.0f, right, rect.top + 142.0f),
                               minutes);
         }
 
