@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.39.0
+// @version         1.40.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -238,7 +238,7 @@ shown; that is a platform limitation, not a mod bug.
     $name: Show metric labels
   - WeatherCity: ""
     $name: Weather city
-    $description: Leave empty for auto-detection (wttr.in)
+    $description: Leave empty to detect it from your connection. A name is looked up, which lands on whichever point the gazetteer holds for it - fine in flat country, several degrees out where a bay shore and a foothill share a town name. Coordinates instead - 37.3852,-122.1141 - skip the lookup and are read exactly.
   - WeatherFahrenheit: false
     $name: Weather in Fahrenheit
 */
@@ -2949,6 +2949,42 @@ struct OpenMeteoReading {
     std::wstring windDir;
 };
 
+// "37.3852,-122.1141" in the city setting, taken as a position rather than a
+// name to be looked up. Geocoding a town name lands on whichever point the
+// gazetteer holds for it, and in country where the weather changes over a
+// couple of miles — a bay shore against a foothill — that point being three
+// miles and forty metres out is worth several degrees. Coordinates skip the
+// lookup and its error.
+static bool ParseCoordinatePair(const std::wstring& text, double* outLat, double* outLon) {
+    if (!outLat || !outLon) {
+        return false;
+    }
+    wchar_t* stop = nullptr;
+    const double lat = wcstod(text.c_str(), &stop);
+    if (!stop || stop == text.c_str()) {
+        return false;
+    }
+    while (*stop == L' ') ++stop;
+    if (*stop != L',') {
+        return false;
+    }
+    wchar_t* after = nullptr;
+    const double lon = wcstod(stop + 1, &after);
+    if (!after || after == stop + 1) {
+        return false;
+    }
+    while (*after == L' ') ++after;
+    if (*after != L'\0') {
+        return false;
+    }
+    if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) {
+        return false;
+    }
+    *outLat = lat;
+    *outLon = lon;
+    return true;
+}
+
 static bool FetchOpenMeteo(double latitude, double longitude, bool isFahrenheit,
                            OpenMeteoReading* out) {
     if (!out) {
@@ -4219,7 +4255,10 @@ DWORD WINAPI WeatherThreadProc(void*) {
             std::wstring airQuality;
             double latitude = 0.0;
             double longitude = 0.0;
-            if (ParseWttrCoordinates(wRes.c_str(), &latitude, &longitude)) {
+            const bool pinned = ParseCoordinatePair(cityOverride, &latitude, &longitude);
+            if (pinned || ParseWttrCoordinates(wRes.c_str(), &latitude, &longitude)) {
+                Wh_Log(L"Weather: readings for %.4f,%.4f (%s).", latitude, longitude,
+                       pinned ? L"pinned in the settings" : L"resolved by wttr.in");
                 OpenMeteoReading reading;
                 if (FetchOpenMeteo(latitude, longitude, isFahrenheit, &reading)) {
                     temp = reading.temperature;
@@ -4253,8 +4292,15 @@ DWORD WINAPI WeatherThreadProc(void*) {
                 g_state.weather.hasData = true;
                 g_state.weather.temperature = temp;
                 g_state.weather.weatherCode = code;
-                if (!cityOverride.empty()) g_state.weather.city = cityOverride;
-                else g_state.weather.city = cityLabel;
+                // A pinned position has no name of its own, so the place
+                // wttr.in put nearest to it is the one worth showing.
+                double ignoredLat = 0.0, ignoredLon = 0.0;
+                if (!cityOverride.empty() &&
+                    !ParseCoordinatePair(cityOverride, &ignoredLat, &ignoredLon)) {
+                    g_state.weather.city = cityOverride;
+                } else {
+                    g_state.weather.city = cityLabel;
+                }
                 g_state.weather.weatherDesc = desc;
                 g_state.weather.windSpeed = windSpeed;
                 g_state.weather.windDir = windDir;
