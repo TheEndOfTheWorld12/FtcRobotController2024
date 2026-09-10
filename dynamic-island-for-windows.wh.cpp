@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.37.0
+// @version         1.38.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -30,8 +30,11 @@ media, downloads, clipboard, battery, and more.
   interrupts. Outside school hours the pill goes back to what it was. The page
   carries the day as one bar, each block as wide as it is long - green for a
   class, red for brunch and lunch, grey for the walk between them, cut from
-  one another by a hairline. The blocks behind you fade, and a marker rides
-  the bar at the current minute.
+  one another by a hairline, with a legend under it. The blocks behind you
+  fade, a marker rides the bar at the current minute, and pointing at any
+  block names it - the page's heading, figure and times all swing round to
+  whatever is under the pointer, so the figure becomes how long that block
+  runs for.
 - A cross in the top-right corner of the expanded player dismisses a source:
   the pill stops offering it and the arrows skip it, which is the answer to an
   app that registers with Windows' transport controls and then never plays
@@ -925,6 +928,15 @@ AtomicRect g_pageNavUpRectPx;
 AtomicRect g_pageNavDownRectPx;
 AtomicRect g_shiftUpRectPx;
 AtomicRect g_shiftDownRectPx;
+
+// The day strip on the schedule page. The rectangle is what was drawn; the two
+// minute marks are the clock it was drawn against, so a pointer lands on a
+// block by the same arithmetic that placed it. -1 is nothing under the pointer.
+std::atomic<bool> g_scheduleStripValid = false;
+AtomicRect g_scheduleStripRectPx;
+std::atomic<int> g_scheduleStripStartMin = 0;
+std::atomic<int> g_scheduleStripEndMin = 0;
+std::atomic<int> g_hoveredScheduleBlock = -1;
 
 // The popup's size, in the unscaled units the pill is drawn in.
 constexpr float kPrivacyPopupWidth = 208.0f;
@@ -7187,6 +7199,7 @@ class Renderer {
         g_timerHitValid = false;
         g_pageNavHitValid = false;
         g_shiftHitValid = false;
+        g_scheduleStripValid = false;
 
         const float hoverScale = hover || pinned ? 1.025f : 1.0f;
         const float scale = hoverScale;
@@ -8846,6 +8859,24 @@ class Renderer {
         return buffer;
     }
 
+    // How long a block runs for. Not the countdown format: a length does not
+    // tick, and "1:30:00" reads as a stopwatch rather than an hour and a half.
+    static std::wstring ScheduleLength(int minutes) {
+        wchar_t buffer[24] = {};
+        if (minutes >= 60) {
+            const int hours = minutes / 60;
+            const int rest = minutes % 60;
+            if (rest == 0) {
+                swprintf_s(buffer, L"%dh", hours);
+            } else {
+                swprintf_s(buffer, L"%dh %dm", hours, rest);
+            }
+        } else {
+            swprintf_s(buffer, L"%dm", std::max(0, minutes));
+        }
+        return buffer;
+    }
+
     static std::wstring ScheduleCountdown(float minutesLeft) {
         const int total = static_cast<int>(std::ceil(std::max(0.0f, minutesLeft) * 60.0f - 0.001f));
         const int hours = total / 3600;
@@ -8868,7 +8899,8 @@ class Renderer {
     //
     // The ends are rounded and the joins are square, which a rounded rectangle
     // per segment cannot give: the bar is drawn flat inside a rounded mask.
-    void DrawScheduleStrip(const ScheduleDay& day, D2D1_RECT_F strip, float minutes) {
+    void DrawScheduleStrip(const ScheduleDay& day, D2D1_RECT_F strip, float minutes,
+                           int hovered) {
         if (day.blocks.empty()) {
             return;
         }
@@ -8920,7 +8952,8 @@ class Renderer {
             }
 
             const bool here = minutes >= block.start && minutes < block.end;
-            brush->SetOpacity((here ? 1.0f : (minutes >= block.end ? 0.32f : 0.68f)) *
+            const bool under = static_cast<int>(i) == hovered;
+            brush->SetOpacity((here || under ? 1.0f : (minutes >= block.end ? 0.32f : 0.68f)) *
                               settingsOpacity_);
             const D2D1_RECT_F cell = masked
                                          ? D2D1::RectF(x0, strip.top, x1, strip.bottom)
@@ -8958,6 +8991,52 @@ class Renderer {
         }
     }
 
+    // What the three colours in the bar mean. Three swatches and three words —
+    // the bar is the only place in the pill where colour carries meaning rather
+    // than decoration, so it is the one place that has to say so.
+    void DrawScheduleLegend(D2D1_RECT_F row) {
+        struct Key {
+            D2D1_COLOR_F colour;
+            const wchar_t* label;
+        };
+        const Key keys[] = {
+            {D2D1::ColorF(0.29f, 0.80f, 0.42f, 1.0f), L"Class"},
+            {D2D1::ColorF(0.96f, 0.36f, 0.34f, 1.0f), L"Brunch / Lunch"},
+            {D2D1::ColorF(0.62f, 0.67f, 0.72f, 1.0f), L"Passing"},
+        };
+
+        const float cy = (row.top + row.bottom) * 0.5f;
+        const float swatch = 7.0f;
+        float x = row.left;
+
+        for (const Key& key : keys) {
+            ComPtr<ID2D1SolidColorBrush> chip;
+            D2D1_COLOR_F colour = key.colour;
+            colour.a = 0.78f * settingsOpacity_;
+            target_->CreateSolidColorBrush(colour, &chip);
+            if (chip) {
+                target_->FillRoundedRectangle(
+                    D2D1::RoundedRect(D2D1::RectF(x, cy - swatch * 0.5f, x + swatch,
+                                                  cy + swatch * 0.5f),
+                                      2.0f, 2.0f),
+                    chip.Get());
+            }
+            x += swatch + 5.0f;
+
+            const float textWidth = 6.05f * static_cast<float>(wcslen(key.label)) + 6.0f;
+            mutedBrush_->SetOpacity(0.62f);
+            target_->DrawTextW(key.label, static_cast<UINT32>(wcslen(key.label)),
+                               smallTextFormat_.Get(),
+                               D2D1::RectF(x, row.top, x + textWidth, row.bottom),
+                               mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            x += textWidth + 9.0f;
+            if (x > row.right) {
+                break;
+            }
+        }
+        mutedBrush_->SetOpacity(0.58f);
+    }
+
     // Page: what class you are in, how long is left of it, what follows, and
     // the day as a whole underneath.
     void DrawScheduleDashboard(const SharedState& state, D2D1_RECT_F rect, double now) {
@@ -8985,10 +9064,15 @@ class Renderer {
         GetLocalTime(&local);
         const float minutes = local.wHour * 60.0f + local.wMinute + local.wSecond / 60.0f;
 
-        // Header: which shape today is, and why if the calendar said why.
+        // Header: which shape today is, and why if the calendar said why. The
+        // warning about running past the published calendar rides here too,
+        // rather than taking a line of its own the page cannot spare.
         std::wstring heading = day.valid ? day.title : L"Loading schedule…";
         if (!day.note.empty() && !day.blocks.empty()) {
             heading += L"  ·  " + day.note;
+        }
+        if (day.beyond) {
+            heading += L"  ·  past the published calendar";
         }
         mutedBrush_->SetOpacity(0.62f);
         target_->DrawTextW(heading.c_str(), static_cast<UINT32>(heading.size()),
@@ -9040,11 +9124,27 @@ class Renderer {
             }
         }
 
+        // Pointing at the strip aims the three slots — name, figure, times —
+        // at whatever is under the pointer instead of at the present minute.
+        // The figure becomes how long that block runs for, which is the
+        // question you are asking by pointing at it.
+        const int hovered = g_hoveredScheduleBlock.load();
+        if (hovered >= 0 && hovered < static_cast<int>(day.blocks.size())) {
+            const ScheduleBlock& block = day.blocks[hovered];
+            const int length = std::max(0, block.end - block.start);
+            headline = StripPassing(block.name);
+            countdown = ScheduleLength(length);
+            wchar_t span[64] = {};
+            swprintf_s(span, L"%s – %s  ·  %d min", ClockLabel(block.start).c_str(),
+                       ClockLabel(block.end).c_str(), length);
+            footnote = span;
+        }
+
         // What you are in, or heading to.
         textBrush_->SetOpacity(0.97f);
         target_->DrawTextW(headline.c_str(), static_cast<UINT32>(headline.size()),
                            clockFormat_.Get(),
-                           D2D1::RectF(left, rect.top + 50.0f, right, rect.top + 76.0f),
+                           D2D1::RectF(left, rect.top + 47.0f, right, rect.top + 71.0f),
                            textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
         // The number. Centred, because hugeTextFormat_ is a centred format and
@@ -9052,32 +9152,36 @@ class Renderer {
         if (!countdown.empty()) {
             target_->DrawTextW(countdown.c_str(), static_cast<UINT32>(countdown.size()),
                                hugeTextFormat_.Get(),
-                               D2D1::RectF(rect.left, rect.top + 78.0f, rect.right,
-                                           rect.top + 126.0f),
+                               D2D1::RectF(rect.left, rect.top + 72.0f, rect.right,
+                                           rect.top + 120.0f),
                                textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
         }
 
         if (!day.blocks.empty()) {
-            DrawScheduleStrip(day, D2D1::RectF(left, rect.top + 132.0f, right, rect.top + 142.0f),
-                              minutes);
+            const D2D1_RECT_F strip =
+                D2D1::RectF(left, rect.top + 124.0f, right, rect.top + 134.0f);
+            DrawScheduleStrip(day, strip, minutes, hovered);
+            DrawScheduleLegend(D2D1::RectF(left, rect.top + 138.0f, right, rect.top + 152.0f));
+
+            // Published for the hover, along with the clock it was drawn
+            // against, so the pointer lands on a block by the same arithmetic
+            // that placed it.
+            const float pcx = (rect.left + rect.right) * 0.5f;
+            const float pcy = (rect.top + rect.bottom) * 0.5f;
+            g_scheduleStripRectPx.Set(pcx + (strip.left - pcx) * sizeScale_,
+                                      pcy + (strip.top - pcy) * sizeScale_,
+                                      pcx + (strip.right - pcx) * sizeScale_,
+                                      pcy + (strip.bottom - pcy) * sizeScale_);
+            g_scheduleStripStartMin = day.blocks.front().start;
+            g_scheduleStripEndMin = day.blocks.back().end;
+            g_scheduleStripValid = true;
         }
 
         mutedBrush_->SetOpacity(0.66f);
         target_->DrawTextW(footnote.c_str(), static_cast<UINT32>(footnote.size()),
                            smallTextFormat_.Get(),
-                           D2D1::RectF(left, rect.top + 148.0f, right, rect.top + 164.0f),
+                           D2D1::RectF(left, rect.top + 152.0f, right, rect.top + 168.0f),
                            mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
-
-        // Only worth saying once the calendar has actually run out — before
-        // then it is noise, and after it the pill is quietly guessing.
-        if (day.beyond) {
-            mutedBrush_->SetOpacity(0.55f);
-            const wchar_t* warning = L"Past the published calendar — ordinary week only.";
-            target_->DrawTextW(warning, static_cast<UINT32>(wcslen(warning)),
-                               smallTextFormat_.Get(),
-                               D2D1::RectF(left, rect.top + 162.0f, right, rect.top + 176.0f),
-                               mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
-        }
 
         textBrush_->SetOpacity(0.90f);
         mutedBrush_->SetOpacity(0.58f);
@@ -11465,6 +11569,38 @@ static ScrubberHit HitTestVolumeBar(int xPos, int yPos) {
 // Which page arrow a point falls on: 0 the top one, 1 the bottom one, -1
 // neither. They are only live while the pill is expanded far enough to have
 // drawn them.
+// Which block of the day the pointer is over, from the strip the renderer
+// published and the day it was drawn from. Passing periods count: a walk is a
+// block like any other, and it is the one you most often want named.
+static int HitTestScheduleBlock(int xPos, int yPos, const ScheduleDay& day) {
+    if (!g_scheduleStripValid.load() || day.blocks.empty()) {
+        return -1;
+    }
+    const float x = static_cast<float>(xPos);
+    const float y = static_cast<float>(yPos);
+    // A ten-pixel bar is a small target, so the band is deepened rather than
+    // asking for the pointer to be on the bar itself.
+    const float top = g_scheduleStripRectPx.top.load() - 5.0f;
+    const float bottom = g_scheduleStripRectPx.bottom.load() + 5.0f;
+    const float left = g_scheduleStripRectPx.left.load();
+    const float right = g_scheduleStripRectPx.right.load();
+    if (x < left || x > right || y < top || y > bottom || right - left < 1.0f) {
+        return -1;
+    }
+
+    const float dayStart = static_cast<float>(g_scheduleStripStartMin.load());
+    const float dayEnd = static_cast<float>(g_scheduleStripEndMin.load());
+    const float span = std::max(1.0f, dayEnd - dayStart);
+    const float minutes = dayStart + (x - left) / (right - left) * span;
+
+    for (size_t i = 0; i < day.blocks.size(); ++i) {
+        if (minutes >= day.blocks[i].start && minutes < day.blocks[i].end) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
 // Which shift arrow, if either, the pointer is on — against the rectangles the
 // renderer published as it drew them.
 static int HitTestShiftArrow(int xPos, int yPos) {
@@ -12201,6 +12337,22 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     }
                 }
 
+                // Pressing the day strip names the block, which hovering it
+                // has already done — so the press has nothing left to do except
+                // not be handed to whatever else is under that part of the
+                // page. Tested against the press itself rather than against
+                // what the last frame decided the pointer was over.
+                if (g_scheduleStripValid.load()) {
+                    ScheduleDay day;
+                    {
+                        std::lock_guard lock(g_stateMutex);
+                        day = g_state.schedule;
+                    }
+                    if (HitTestScheduleBlock(xPos, yPos, day) >= 0) {
+                        return 0;
+                    }
+                }
+
                 // The page arrows at the top and bottom edges, tested against
                 // the strips the renderer published as it drew them rather than
                 // against a second calculation of where they ought to be.
@@ -12880,6 +13032,17 @@ DWORD WINAPI RenderThreadProc(void*) {
                     }
                 }
                 if (g_hoveredPageNav.exchange(hoveredArrow) != hoveredArrow) {
+                    needsRender = true;
+                }
+
+                int hoveredBlock = -1;
+                if (hover && g_scheduleStripValid.load()) {
+                    POINT local = cursor;
+                    if (ScreenToClient(hwnd, &local)) {
+                        hoveredBlock = HitTestScheduleBlock(local.x, local.y, snapshot.schedule);
+                    }
+                }
+                if (g_hoveredScheduleBlock.exchange(hoveredBlock) != hoveredBlock) {
                     needsRender = true;
                 }
 
