@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.36.0
+// @version         1.37.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -28,9 +28,10 @@ media, downloads, clipboard, battery, and more.
   hours, and underneath it the countdown would be hidden for exactly as long
   as it is wanted. A timer still comes first, and a brief alert still
   interrupts. Outside school hours the pill goes back to what it was. The page
-  carries the day as a strip of even segments, one per block in order - green
-  for a class, red for brunch and lunch, grey for the walk between them. The
-  one you are in stands proud of the rest, and the ones behind you fade.
+  carries the day as one bar, each block as wide as it is long - green for a
+  class, red for brunch and lunch, grey for the walk between them, cut from
+  one another by a hairline. The blocks behind you fade, and a marker rides
+  the bar at the current minute.
 - A cross in the top-right corner of the expanded player dismisses a source:
   the pill stops offering it and the arrows skip it, which is the answer to an
   app that registers with Windows' transport controls and then never plays
@@ -8859,42 +8860,57 @@ class Renderer {
         return buffer;
     }
 
-    // The whole school day as one strip: every block in order, each the same
-    // width, coloured by what kind of thing it is. Classes green, brunch and
-    // lunch red, the walks between them grey.
+    // The whole school day as one bar. Every block in order, each as wide as it
+    // is long, coloured by what kind of thing it is — classes green, brunch and
+    // lunch red, the walks between them grey — and cut from its neighbours by a
+    // hairline rather than a gap, so the day reads as one object rather than a
+    // row of tiles.
     //
-    // Deliberately not a timeline. Drawn to scale the walks were slivers and
-    // the long blocks were slabs, and the eye had to do arithmetic to answer
-    // the only question worth asking of it — how much of the day is left, and
-    // what kind of thing is next. Even widths make it countable instead.
+    // The ends are rounded and the joins are square, which a rounded rectangle
+    // per segment cannot give: the bar is drawn flat inside a rounded mask.
     void DrawScheduleStrip(const ScheduleDay& day, D2D1_RECT_F strip, float minutes) {
-        const int count = static_cast<int>(day.blocks.size());
-        if (count <= 0) {
+        if (day.blocks.empty()) {
             return;
         }
-
-        const float gap = count > 12 ? 1.5f : 2.5f;
+        const float dayStart = static_cast<float>(day.blocks.front().start);
+        const float dayEnd = static_cast<float>(day.blocks.back().end);
+        const float span = std::max(1.0f, dayEnd - dayStart);
         const float width = strip.right - strip.left;
-        const float cell = (width - gap * (count - 1)) / count;
-        if (cell < 1.5f) {
+        const float height = strip.bottom - strip.top;
+        const float radius = height * 0.5f;
+        if (width < height) {
             return;
         }
-        const float height = strip.bottom - strip.top;
 
-        // Three brushes for the whole strip rather than one per segment: the
-        // colour says what a block is, and opacity says whether it is spent.
-        ComPtr<ID2D1SolidColorBrush> classBrush, restBrush, walkBrush;
+        // Three brushes for the whole bar rather than one per segment: colour
+        // says what a block is, opacity says whether it is spent.
+        ComPtr<ID2D1SolidColorBrush> classBrush, restBrush, walkBrush, cut;
         target_->CreateSolidColorBrush(D2D1::ColorF(0.29f, 0.80f, 0.42f, 1.0f), &classBrush);
         target_->CreateSolidColorBrush(D2D1::ColorF(0.96f, 0.36f, 0.34f, 1.0f), &restBrush);
         target_->CreateSolidColorBrush(D2D1::ColorF(0.62f, 0.67f, 0.72f, 1.0f), &walkBrush);
+        target_->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, 0.55f * settingsOpacity_), &cut);
         if (!classBrush || !restBrush || !walkBrush) {
             return;
         }
 
-        for (int i = 0; i < count; ++i) {
+        ComPtr<ID2D1RoundedRectangleGeometry> mask;
+        ComPtr<ID2D1Layer> layer;
+        d2dFactory_->CreateRoundedRectangleGeometry(D2D1::RoundedRect(strip, radius, radius),
+                                                    &mask);
+        target_->CreateLayer(&layer);
+        const bool masked = mask && layer;
+        if (masked) {
+            target_->PushLayer(D2D1::LayerParameters(strip, mask.Get(),
+                                                     D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                                                     D2D1::IdentityMatrix(), 1.0f, nullptr,
+                                                     D2D1_LAYER_OPTIONS_NONE),
+                               layer.Get());
+        }
+
+        for (size_t i = 0; i < day.blocks.size(); ++i) {
             const ScheduleBlock& block = day.blocks[i];
-            const float x0 = strip.left + i * (cell + gap);
-            const float x1 = x0 + cell;
+            const float x0 = strip.left + (block.start - dayStart) / span * width;
+            const float x1 = strip.left + (block.end - dayStart) / span * width;
 
             ID2D1SolidColorBrush* brush = classBrush.Get();
             if (block.passing) {
@@ -8903,18 +8919,42 @@ class Renderer {
                 brush = restBrush.Get();
             }
 
-            // The one you are in stands proud of the rest, since colour is
-            // spoken for and cannot also mean "now".
             const bool here = minutes >= block.start && minutes < block.end;
-            const float lift = here ? 2.0f : 0.0f;
-            const D2D1_RECT_F cellRect =
-                D2D1::RectF(x0, strip.top - lift, x1, strip.bottom + lift);
-            const float corner = std::min(cell, height + lift * 2.0f) * 0.5f;
-
-            brush->SetOpacity((here ? 1.0f : (minutes >= block.end ? 0.30f : 0.66f)) *
+            brush->SetOpacity((here ? 1.0f : (minutes >= block.end ? 0.32f : 0.68f)) *
                               settingsOpacity_);
-            target_->FillRoundedRectangle(D2D1::RoundedRect(cellRect, corner, corner), brush);
+            const D2D1_RECT_F cell = masked
+                                         ? D2D1::RectF(x0, strip.top, x1, strip.bottom)
+                                         : D2D1::RectF(std::max(x0, strip.left), strip.top,
+                                                       std::min(x1, strip.right), strip.bottom);
+            target_->FillRectangle(cell, brush);
             brush->SetOpacity(1.0f);
+
+            // The hairline goes on the leading edge of every block but the
+            // first, so each cut is drawn once.
+            if (i > 0 && cut) {
+                target_->FillRectangle(D2D1::RectF(x0 - 0.5f, strip.top, x0 + 0.5f, strip.bottom),
+                                       cut.Get());
+            }
+        }
+
+        if (masked) {
+            target_->PopLayer();
+        }
+
+        // Where the day has got to. Meaningful again now that the bar is drawn
+        // to scale, and it is the only thing that says how far through a block
+        // you are rather than merely which one you are in.
+        if (minutes > dayStart && minutes < dayEnd) {
+            const float x = strip.left + (minutes - dayStart) / span * width;
+            ComPtr<ID2D1SolidColorBrush> mark;
+            target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.95f * settingsOpacity_), &mark);
+            if (mark) {
+                target_->FillRoundedRectangle(
+                    D2D1::RoundedRect(D2D1::RectF(x - 1.0f, strip.top - 2.5f, x + 1.0f,
+                                                  strip.bottom + 2.5f),
+                                      1.0f, 1.0f),
+                    mark.Get());
+            }
         }
     }
 
