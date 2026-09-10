@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.41.1
+// @version         1.42.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -124,8 +124,14 @@ tracks what Task Manager shows. The similarly named "% Processor Utility" is
 scaled by current-over-base clock speed and reads far higher on a CPU that
 boosts well above its base frequency.
 
-Weather comes from three services. wttr.in resolves the location (from your IP,
-or from the city or coordinates in the settings) and names it. Where the United
+Weather comes from three services. Where the machine is can come from three
+places too, in this order: coordinates typed into the settings, then Windows'
+own location service if "Follow this machine's location" is on, then a guess
+from your IP address. The last of those is the worst by a distance - an address
+is registered to whoever sells the connection, so it lands on their equipment
+rather than on you, which in country where the weather turns over a couple of
+miles is worth several degrees. wttr.in does that guess, and names whichever
+position wins. Where the United
 States' weather service covers that position, the temperature, humidity, dew
 point and wind are the nearest reporting station's own measurements - a
 thermometer a mile or two away, which is what everyone else means by "the
@@ -245,6 +251,9 @@ shown; that is a platform limitation, not a mod bug.
   - WeatherCity: ""
     $name: Weather city
     $description: Leave empty to detect it from your connection. A name is looked up, which lands on whichever point the gazetteer holds for it - fine in flat country, several degrees out where a bay shore and a foothill share a town name. Coordinates instead - 37.3852,-122.1141 - skip the lookup and are read exactly.
+  - WeatherFollowMe: false
+    $name: Follow this machine's location
+    $description: Asks Windows where the machine is rather than guessing it from the network, so the weather follows a laptop between home and school. Needs Location switched on in Windows Settings - Privacy and security - Location - including "Let desktop apps access your location". A position typed into the box above wins over this, and if Windows will not answer it falls back to the network guess.
   - WeatherFahrenheit: false
     $name: Weather in Fahrenheit
 */
@@ -321,6 +330,13 @@ shown; that is a platform limitation, not a mod bug.
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Media.Control.h>
 #include <winrt/Windows.Storage.Streams.h>
+#if __has_include(<winrt/Windows.Devices.Geolocation.h>)
+#define DYNAMIC_ISLAND_HAS_GEOLOCATION 1
+#include <winrt/Windows.Devices.Geolocation.h>
+#else
+#define DYNAMIC_ISLAND_HAS_GEOLOCATION 0
+#endif
+
 #if __has_include(<winrt/Windows.UI.Notifications.Management.h>) && \
     __has_include(<winrt/Windows.UI.Notifications.h>)
 #define DYNAMIC_ISLAND_HAS_USER_NOTIFICATION_LISTENER 1
@@ -461,6 +477,7 @@ struct Settings {
     bool scheduleOnPill = true;
     std::wstring scheduleUrl;
     std::vector<std::wstring> classNames;
+    bool weatherFollowMe = false;
     bool weatherFahrenheit = false;
     int autoHideIdleSeconds = 0;
     bool unhideOnHover = true;
@@ -1361,6 +1378,7 @@ void LoadSettings() {
     next.scheduleOnPill = Wh_GetIntSetting(L"Modules.ScheduleOnPill") != 0;
     next.scheduleUrl = GetStringSettingCopy(L"Modules.ScheduleUrl");
     next.classNames = SplitCommaList(GetStringSettingCopy(L"Modules.ScheduleClasses"));
+    next.weatherFollowMe = Wh_GetIntSetting(L"Modules.WeatherFollowMe") != 0;
     next.weatherFahrenheit = Wh_GetIntSetting(L"Modules.WeatherFahrenheit") != 0;
     const std::wstring hideSec = GetStringSettingCopy(L"Appearance.AutoHideIdleSeconds");
     next.autoHideIdleSeconds = hideSec.empty() ? 0 : _wtoi(hideSec.c_str());
@@ -4422,17 +4440,93 @@ DWORD WINAPI ScheduleThreadProc(void*) {
     return 0;
 }
 
+// Where Windows says the machine is. It knows better than the network does:
+// an address is registered to whoever sells the connection, and lands on their
+// equipment rather than on the person using it, while this is the same fix the
+// Maps app gets — satellites where there are any, and the surrounding wireless
+// networks where there are not.
+//
+// It answers only if location is switched on for desktop applications, which
+// is not the mod's to decide, so a refusal is reported once and then let be.
+#if DYNAMIC_ISLAND_HAS_GEOLOCATION
+static bool FetchWindowsLocation(double* outLat, double* outLon) {
+    if (!outLat || !outLon) {
+        return false;
+    }
+    try {
+        using namespace winrt::Windows::Devices::Geolocation;
+
+        const GeolocationAccessStatus access = Geolocator::RequestAccessAsync().get();
+        if (access != GeolocationAccessStatus::Allowed) {
+            static bool said = false;
+            if (!said) {
+                said = true;
+                Wh_Log(L"Weather: Windows will not give the location. Switch it on under "
+                       L"Settings, Privacy and security, Location — including \"Let desktop "
+                       L"apps access your location\" — or turn the setting back off.");
+            }
+            return false;
+        }
+
+        Geolocator locator;
+        locator.DesiredAccuracy(PositionAccuracy::High);
+        // A fix up to ten minutes old is plenty for weather, and asking for a
+        // fresher one wakes radios for no gain. Twenty seconds is long enough
+        // for a cold start and short enough not to hold the poll up.
+        const Geoposition position =
+            locator.GetGeopositionAsync(std::chrono::minutes(10), std::chrono::seconds(20)).get();
+        if (!position) {
+            return false;
+        }
+        const auto point = position.Coordinate().Point().Position();
+        *outLat = point.Latitude;
+        *outLon = point.Longitude;
+        return true;
+    } catch (...) {
+        // No location provider, no radios, a service that is switched off —
+        // all of it arrives as an exception, and all of it means the same
+        // thing here.
+        return false;
+    }
+}
+#else
+static bool FetchWindowsLocation(double*, double*) {
+    return false;
+}
+#endif
+
 DWORD WINAPI WeatherThreadProc(void*) {
+    // The location service is a WinRT object, so this thread needs an
+    // apartment. Nothing else here does, which is why it never had one.
+    const HRESULT hrCo = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
     // Initial delay to avoid slowing down startup
     WaitForSingleObject(g_stopEvent, 3000);
 
     while (WaitForSingleObject(g_stopEvent, 0) == WAIT_TIMEOUT) {
         std::wstring cityOverride;
         bool isFahrenheit = false;
+        bool followMe = false;
         {
             std::lock_guard lock(g_stateMutex);
             cityOverride = g_settings.weatherCity;
             isFahrenheit = g_settings.weatherFahrenheit;
+            followMe = g_settings.weatherFollowMe;
+        }
+
+        // A position typed into the settings is a deliberate choice and beats
+        // one asked for. Where Windows answers, its coordinates go in as the
+        // override — which is the path that already exists for a typed pair,
+        // so wttr.in names the place and the readings come from exactly there.
+        double pinnedLat = 0.0, pinnedLon = 0.0;
+        if (followMe && !ParseCoordinatePair(cityOverride, &pinnedLat, &pinnedLon)) {
+            double lat = 0.0, lon = 0.0;
+            if (FetchWindowsLocation(&lat, &lon)) {
+                wchar_t here[48] = {};
+                swprintf_s(here, L"%.4f,%.4f", lat, lon);
+                cityOverride = here;
+                Wh_Log(L"Weather: Windows puts this machine at %s.", here);
+            }
         }
 
         std::wstring url = L"/?format=j1";
@@ -4644,6 +4738,10 @@ DWORD WINAPI WeatherThreadProc(void*) {
         if (waitResult == WAIT_OBJECT_0) {
             break;
         }
+    }
+
+    if (SUCCEEDED(hrCo)) {
+        CoUninitialize();
     }
     return 0;
 }
