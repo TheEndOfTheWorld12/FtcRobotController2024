@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.33.0
+// @version         1.34.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -98,8 +98,8 @@ media, downloads, clipboard, battery, and more.
   40 pixels it re-anchors and glides to the bottom of the screen (or back to
   the top, dragging up). Let go before then and it glides back to where it
   started. Changing Position in the settings takes control back from the drag.
-- A resting pill grows a button on each end: the right one walks it five
-  pixels up the screen, the left one five pixels down, for lining it up with
+- A resting pill grows a button on each end: the left one walks it five pixels
+  up the screen, the right one five pixels down, for lining it up with
   whatever is underneath. Resting on one holds the pill closed so it does not
   open out from under the pointer. The placement is remembered, and
   "Recentre" in the context menu puts it back.
@@ -367,7 +367,7 @@ static_assert(kPageContentTop + 100.0f < kPageContentBottom,
               "expanded pill is too short to hold a page between the nav bars");
 
 // The shift buttons: one on each end of a resting pill, walking it five pixels
-// up or down the screen at a press. Right moves it up, left moves it down.
+// up or down the screen at a press. Left moves it up, right moves it down.
 //
 // To hold them the painted body reaches past the pill's own rect by the band
 // below, out into the side margin the window already carries. The rect the
@@ -8701,7 +8701,7 @@ class Renderer {
     }
 
     // The two buttons that walk the pill up and down the screen, one on each
-    // end of its body: up on the right, down on the left. The rect passed in is
+    // end of its body: up on the left, down on the right. The rect passed in is
     // the body, already grown by the band and already carrying the hover
     // inflation, so the buttons ride out of the pill with it and their outer
     // edges stay flush with its own.
@@ -8723,11 +8723,11 @@ class Renderer {
         }
     }
 
-    // up is the right-hand button: it is the one that carries the up chevron
-    // and walks the pill up the screen.
+    // up is the left-hand button: it is the one that carries the up chevron and
+    // walks the pill up the screen.
     void DrawShiftBar(D2D1_RECT_F body, float barWidth, bool up, float alpha) {
         const float barLeft =
-            up ? body.right - kShiftBarMargin - barWidth : body.left + kShiftBarMargin;
+            up ? body.left + kShiftBarMargin : body.right - kShiftBarMargin - barWidth;
         const D2D1_RECT_F bar = D2D1::RectF(barLeft, body.top + kShiftBarInset,
                                             barLeft + barWidth, body.bottom - kShiftBarInset);
 
@@ -8866,21 +8866,35 @@ class Renderer {
             if (x1 - x0 < 0.6f) {
                 continue;
             }
-            const bool here = minutes >= block.start && minutes < block.end;
-            const D2D1_RECT_F segment = D2D1::RectF(x0, strip.top, x1, strip.bottom);
-            if (here) {
+
+            // Brunch and lunch are drawn as a thinner bar, not merely a fainter
+            // one. Shade alone said "class or break" and "done or still to
+            // come" at the same time, in the same channel, and by the end of
+            // the day — when everything is done — it said nothing at all. A
+            // difference in height survives that: the fat bars are the classes
+            // whatever the hour.
+            const float inset = block.rest ? height * 0.27f : 0.0f;
+            const D2D1_RECT_F segment =
+                D2D1::RectF(x0, strip.top + inset, x1, strip.bottom - inset);
+            const float corner = (segment.bottom - segment.top) * 0.5f;
+
+            if (minutes >= block.start && minutes < block.end) {
                 accentBrush_->SetOpacity(0.92f);
-                target_->FillRoundedRectangle(
-                    D2D1::RoundedRect(segment, height * 0.5f, height * 0.5f), accentBrush_.Get());
+                target_->FillRoundedRectangle(D2D1::RoundedRect(segment, corner, corner),
+                                              accentBrush_.Get());
                 accentBrush_->SetOpacity(1.0f);
                 continue;
             }
+
             ComPtr<ID2D1SolidColorBrush> fill;
-            const float alpha = block.rest ? 0.16f : (minutes >= block.end ? 0.22f : 0.42f);
+            float alpha = minutes >= block.end ? 0.28f : 0.52f;
+            if (block.rest) {
+                alpha *= 0.72f;
+            }
             target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, alpha * settingsOpacity_), &fill);
             if (fill) {
-                target_->FillRoundedRectangle(
-                    D2D1::RoundedRect(segment, height * 0.5f, height * 0.5f), fill.Get());
+                target_->FillRoundedRectangle(D2D1::RoundedRect(segment, corner, corner),
+                                              fill.Get());
             }
         }
 
