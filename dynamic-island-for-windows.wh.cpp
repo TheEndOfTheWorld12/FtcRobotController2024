@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.38.0
+// @version         1.38.1
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -9112,7 +9112,11 @@ class Renderer {
             footnote = L"Out since " + ClockLabel(day.blocks.back().end) + L".";
         } else if (standing.current) {
             const ScheduleBlock& block = *standing.current;
-            headline = block.passing ? StripPassing(block.name) : block.name;
+            // "Passing to Bio Honors" rather than "Bio Honors". The label is
+            // the school's own, the class name is already substituted into it,
+            // and the page has room for the whole phrase — stripping it left a
+            // walk looking exactly like the lesson at the end of it.
+            headline = block.name;
             countdown = ScheduleCountdown(block.end - minutes);
             if (block.passing) {
                 footnote = L"Starts at " + ClockLabel(block.end);
@@ -9132,7 +9136,7 @@ class Renderer {
         if (hovered >= 0 && hovered < static_cast<int>(day.blocks.size())) {
             const ScheduleBlock& block = day.blocks[hovered];
             const int length = std::max(0, block.end - block.start);
-            headline = StripPassing(block.name);
+            headline = block.name;
             countdown = ScheduleLength(length);
             wchar_t span[64] = {};
             swprintf_s(span, L"%s – %s  ·  %d min", ClockLabel(block.start).c_str(),
