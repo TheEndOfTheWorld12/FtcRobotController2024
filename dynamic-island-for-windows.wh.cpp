@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.41.0
+// @version         1.41.1
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -13171,7 +13171,7 @@ DWORD WINAPI RenderThreadProc(void*) {
                 g_settings.gameOverlay || Wh_GetIntValue(L"GameOverlayPinned", 0) != 0;
             if (overlayMode && !pinned && !isHoverExpanded &&
                 (primary.kind == IslandKind::Idle || primary.kind == IslandKind::Media ||
-                 primary.kind == IslandKind::Timer)) {
+                 primary.kind == IslandKind::Timer || primary.kind == IslandKind::Schedule)) {
                 primary.kind = IslandKind::Idle;
                 primary.width = 372.0f * g_settings.sizeScale;
                 primary.height = 64.0f * g_settings.sizeScale;
@@ -13267,10 +13267,12 @@ DWORD WINAPI RenderThreadProc(void*) {
                 g_state.system.renderFps = ClampInt(static_cast<int>(1.0f / std::max(dt, 0.001f) + 0.5f), 0, 240);
             }
 
-            // A timer counting down is as passive as the resting pill: the
-            // pointer has to be on it before any of it is clickable anyway.
-            const bool passiveKind =
-                primary.kind == IslandKind::Idle || primary.kind == IslandKind::Timer;
+            // A timer counting down, and a class in session, are as passive as
+            // the resting pill: neither has anything on it to press, so a click
+            // meant for the window underneath should reach it.
+            const bool passiveKind = primary.kind == IslandKind::Idle ||
+                                     primary.kind == IslandKind::Timer ||
+                                     primary.kind == IslandKind::Schedule;
             SetClickThrough(hwnd, passiveKind && !hover && !pinned);
 
             // Keep the system volume popup down, so a volume change shows only
@@ -13591,15 +13593,31 @@ DWORD WINAPI RenderThreadProc(void*) {
                 needsRender = true;
             }
 
-            // Idle dashboard clock changes once a minute
+            // The idle dashboard's clock changes once a minute. The schedule
+            // pill counts down by the second, so it needs a frame by the
+            // second — until this it was riding on whatever else happened to
+            // dirty the frame, which is the CPU reading changing, which is not
+            // a clock.
             static SYSTEMTIME prevTime = {};
-            if (primary.kind == IslandKind::Idle && !isHidden) {
+            const bool showsTime =
+                primary.kind == IslandKind::Idle || primary.kind == IslandKind::Schedule;
+            if (showsTime && !isHidden) {
                 SYSTEMTIME local = {};
                 GetLocalTime(&local);
-                if (local.wMinute != prevTime.wMinute) {
+                const bool moved = primary.kind == IslandKind::Schedule
+                                       ? local.wSecond != prevTime.wSecond
+                                       : local.wMinute != prevTime.wMinute;
+                if (moved) {
                     needsRender = true;
                     prevTime = local;
                 }
+            }
+
+            // The schedule page counts down too, and it publishes a rectangle
+            // for every frame it is drawn on — so the flag being up is exactly
+            // "that page is on screen", and it stays up only while it is.
+            if (g_scheduleStripValid.load()) {
+                needsRender = true;
             }
 
             // Compare data snapshot to detect changes
