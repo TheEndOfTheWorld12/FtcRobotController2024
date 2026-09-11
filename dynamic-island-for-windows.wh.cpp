@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.42.0
+// @version         1.43.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -702,6 +702,7 @@ struct ScheduleBlock {
 struct ScheduleDay {
     bool valid = false;
     std::wstring key;     // YYYY-MM-DD, so days can be compared cheaply
+    SYSTEMTIME date{};    // midnight on that date, for counting down to a bell
     std::wstring title;   // "Even Block", "Finals Day 1", "Holiday"
     std::wstring note;    // "Homecoming Week", "Veteran's Day"
     bool beyond = false;  // past the last date the calendar knows about
@@ -721,6 +722,10 @@ struct SharedState {
     WeatherSnapshot weather;
     TimerSnapshot timer;
     ScheduleDay schedule;
+    // The next date after today with anything on it, so the page has somewhere
+    // to point once today is over. Fixed for the whole of today, so it is
+    // worked out alongside it rather than searched for on every frame.
+    ScheduleDay nextSchoolDay;
     std::array<float, 48> waveform{};
     size_t waveformWrite = 0;
     bool muted = false;
@@ -958,6 +963,9 @@ AtomicRect g_shiftDownRectPx;
 // minute marks are the clock it was drawn against, so a pointer lands on a
 // block by the same arithmetic that placed it. -1 is nothing under the pointer.
 std::atomic<bool> g_scheduleStripValid = false;
+// True while the strip is showing the next school day rather than today's, so
+// a pointer over it is answered from the day that was actually drawn.
+std::atomic<bool> g_scheduleStripShowsNext = false;
 AtomicRect g_scheduleStripRectPx;
 std::atomic<int> g_scheduleStripStartMin = 0;
 std::atomic<int> g_scheduleStripEndMin = 0;
@@ -4207,6 +4215,11 @@ std::wstring StripPassing(const std::wstring& label) {
 ScheduleDay ResolveScheduleDay(const SYSTEMTIME& local) {
     ScheduleDay day;
     day.key = DateKey(local.wYear, local.wMonth, local.wDay);
+    day.date = local;
+    day.date.wHour = 0;
+    day.date.wMinute = 0;
+    day.date.wSecond = 0;
+    day.date.wMilliseconds = 0;
 
     // Copied out first, and the two locks are never held together: the state
     // lock always comes before the schedule lock, here and everywhere.
@@ -4250,6 +4263,68 @@ ScheduleDay ResolveScheduleDay(const SYSTEMTIME& local) {
         day.blocks.push_back(std::move(block));
     }
     return day;
+}
+
+// Midnight on a day, as a file time, so two dates can be subtracted.
+ULONGLONG DayStartTicks(const SYSTEMTIME& date) {
+    SYSTEMTIME midnight = date;
+    midnight.wHour = 0;
+    midnight.wMinute = 0;
+    midnight.wSecond = 0;
+    midnight.wMilliseconds = 0;
+    FILETIME ft = {};
+    if (!SystemTimeToFileTime(&midnight, &ft)) {
+        return 0;
+    }
+    ULARGE_INTEGER value = {};
+    value.LowPart = ft.dwLowDateTime;
+    value.HighPart = ft.dwHighDateTime;
+    return value.QuadPart;
+}
+
+// The next date after this one that has anything on it. Summer recess is nine
+// weeks, so the search has to be able to cross one; past that the calendar has
+// run out and there is nothing honest to point at.
+ScheduleDay ResolveNextSchoolDay(const SYSTEMTIME& from) {
+    constexpr ULONGLONG kDayInTicks = 24ULL * 60 * 60 * 10000000ULL;
+    ULONGLONG ticks = DayStartTicks(from);
+    if (ticks == 0) {
+        return ScheduleDay();
+    }
+
+    for (int i = 0; i < 130; ++i) {
+        ticks += kDayInTicks;
+        ULARGE_INTEGER value = {};
+        value.QuadPart = ticks;
+        FILETIME ft = {value.LowPart, value.HighPart};
+        SYSTEMTIME probe = {};
+        if (!FileTimeToSystemTime(&ft, &probe)) {
+            break;
+        }
+        ScheduleDay day = ResolveScheduleDay(probe);
+        if (!day.blocks.empty()) {
+            return day;
+        }
+    }
+    return ScheduleDay();
+}
+
+// Minutes from now until a bell on a given day, which may not be today.
+float MinutesUntilBell(const ScheduleDay& day, int minuteOfDay) {
+    const ULONGLONG start = DayStartTicks(day.date);
+    if (start == 0) {
+        return 0.0f;
+    }
+    SYSTEMTIME now = {};
+    GetLocalTime(&now);
+    const ULONGLONG here = DayStartTicks(now) +
+                           (now.wHour * 3600ULL + now.wMinute * 60ULL + now.wSecond) *
+                               10000000ULL;
+    const ULONGLONG bell = start + static_cast<ULONGLONG>(minuteOfDay) * 60ULL * 10000000ULL;
+    if (bell <= here) {
+        return 0.0f;
+    }
+    return static_cast<float>(bell - here) / (60.0f * 10000000.0f);
 }
 
 // Whether the schedule should have the collapsed pill: switched on, asked for,
@@ -4424,8 +4499,10 @@ DWORD WINAPI ScheduleThreadProc(void*) {
         if (key != lastDayKey) {
             lastDayKey = key;
             ScheduleDay day = ResolveScheduleDay(local);
+            ScheduleDay next = ResolveNextSchoolDay(local);
             std::lock_guard lock(g_stateMutex);
             g_state.schedule = std::move(day);
+            g_state.nextSchoolDay = std::move(next);
         }
 
         HANDLE events[] = {g_stopEvent, g_settingsChangedEvent};
@@ -9365,12 +9442,37 @@ class Renderer {
         return buffer;
     }
 
+    // "Tomorrow" when it is one, the weekday otherwise. "Monday" reads better
+    // than a date for something a few days out, and the date itself is already
+    // sitting in the corner of the page.
+    static std::wstring NextDayLabel(const ScheduleDay& day) {
+        SYSTEMTIME now = {};
+        GetLocalTime(&now);
+        constexpr ULONGLONG kDayInTicks = 24ULL * 60 * 60 * 10000000ULL;
+        const ULONGLONG today = DayStartTicks(now);
+        if (today != 0 && DayStartTicks(day.date) == today + kDayInTicks) {
+            return L"Tomorrow";
+        }
+        wchar_t weekday[48] = {};
+        if (GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &day.date, L"dddd", weekday,
+                            ARRAYSIZE(weekday), nullptr)) {
+            return weekday;
+        }
+        return L"Next school day";
+    }
+
     static std::wstring ScheduleCountdown(float minutesLeft) {
         const int total = static_cast<int>(std::ceil(std::max(0.0f, minutesLeft) * 60.0f - 0.001f));
         const int hours = total / 3600;
         const int minutes = (total % 3600) / 60;
         const int seconds = total % 60;
         wchar_t buffer[24] = {};
+        if (hours >= 24) {
+            // A wait to the next school day can be a weekend or a recess, and
+            // "87:14:02" is a number nobody reads as three and a half days.
+            swprintf_s(buffer, L"%dd %dh", hours / 24, hours % 24);
+            return buffer;
+        }
         if (hours > 0) {
             swprintf_s(buffer, L"%d:%02d:%02d", hours, minutes, seconds);
         } else {
@@ -9529,7 +9631,22 @@ class Renderer {
     // the day as a whole underneath.
     void DrawScheduleDashboard(const SharedState& state, D2D1_RECT_F rect, double now) {
         UNREFERENCED_PARAMETER(now);
-        const ScheduleDay& day = state.schedule;
+        // Once today is spent — the last bell rung, or a holiday with nothing
+        // on it at all — the page stops being about today. Showing a finished
+        // day all evening and all weekend answers a question nobody is asking;
+        // the one worth answering is when school is next.
+        SYSTEMTIME nowTime = {};
+        GetLocalTime(&nowTime);
+        const float clockNow =
+            nowTime.wHour * 60.0f + nowTime.wMinute + nowTime.wSecond / 60.0f;
+        const bool todaySpent =
+            state.schedule.valid &&
+            (state.schedule.blocks.empty() ||
+             clockNow >= state.schedule.blocks.back().end);
+        const bool showNext = todaySpent && !state.nextSchoolDay.blocks.empty();
+        const ScheduleDay& day = showNext ? state.nextSchoolDay : state.schedule;
+        g_scheduleStripShowsNext = showNext;
+
         const float left = rect.left + 24.0f;
         if (!g_settings.scheduleEnabled) {
             textBrush_->SetOpacity(0.90f);
@@ -9569,8 +9686,8 @@ class Renderer {
                            mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
         wchar_t dateLabel[32] = {};
-        GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &local, L"ddd d MMM", dateLabel,
-                        ARRAYSIZE(dateLabel), nullptr);
+        GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, day.valid ? &day.date : &local,
+                        L"ddd d MMM", dateLabel, ARRAYSIZE(dateLabel), nullptr);
         smallTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
         target_->DrawTextW(dateLabel, static_cast<UINT32>(wcslen(dateLabel)),
                            smallTextFormat_.Get(),
@@ -9578,7 +9695,12 @@ class Renderer {
                            mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
         smallTextFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
 
-        const ScheduleNow standing = ScheduleStanding(day, minutes);
+        // A day that has not arrived yet is read against no clock: today's time
+        // of day says nothing about tomorrow's bells, and comparing the two
+        // would have six in the evening reading as "after school" on a morning
+        // that has not happened.
+        const float dayClock = showNext ? -1.0f : minutes;
+        const ScheduleNow standing = ScheduleStanding(day, dayClock);
 
         std::wstring headline;
         std::wstring countdown;
@@ -9603,8 +9725,10 @@ class Renderer {
             // bell, which reads as a lesson in progress with an hour of it
             // left — the opposite of what it means. The class moves down to
             // the line that is already about times.
-            headline = L"Before school";
-            countdown = ScheduleCountdown(standing.next->start - minutes);
+            headline = showNext ? NextDayLabel(day) : L"Before school";
+            countdown = ScheduleCountdown(showNext
+                                              ? MinutesUntilBell(day, standing.next->start)
+                                              : standing.next->start - minutes);
             footnote = StripPassing(standing.next->name) + L" at " +
                        ClockLabel(standing.next->start) + L"  ·  out at " +
                        ClockLabel(day.blocks.back().end);
@@ -9677,7 +9801,7 @@ class Renderer {
         if (!day.blocks.empty()) {
             const D2D1_RECT_F strip =
                 D2D1::RectF(left, rect.top + 124.0f, right, rect.top + 134.0f);
-            DrawScheduleStrip(day, strip, minutes, hovered);
+            DrawScheduleStrip(day, strip, dayClock, hovered);
             DrawScheduleLegend(D2D1::RectF(left, rect.top + 138.0f, right, rect.top + 152.0f));
 
             // Published for the hover, along with the clock it was drawn
@@ -12868,7 +12992,8 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     ScheduleDay day;
                     {
                         std::lock_guard lock(g_stateMutex);
-                        day = g_state.schedule;
+                        day = g_scheduleStripShowsNext.load() ? g_state.nextSchoolDay
+                                                              : g_state.schedule;
                     }
                     if (HitTestScheduleBlock(xPos, yPos, day) >= 0) {
                         return 0;
@@ -13563,7 +13688,10 @@ DWORD WINAPI RenderThreadProc(void*) {
                 if (hover && g_scheduleStripValid.load()) {
                     POINT local = cursor;
                     if (ScreenToClient(hwnd, &local)) {
-                        hoveredBlock = HitTestScheduleBlock(local.x, local.y, snapshot.schedule);
+                        hoveredBlock = HitTestScheduleBlock(
+                            local.x, local.y,
+                            g_scheduleStripShowsNext.load() ? snapshot.nextSchoolDay
+                                                            : snapshot.schedule);
                     }
                 }
                 if (g_hoveredScheduleBlock.exchange(hoveredBlock) != hoveredBlock) {
