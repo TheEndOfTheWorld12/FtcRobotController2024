@@ -2,7 +2,7 @@
 // @id              dynamic-island-for-windows
 // @name            Dynamic Island for Windows
 // @description     A living, breathing pill overlay inspired by iPhone's Dynamic Island. Reacts to media, downloads, clipboard, battery, and more.
-// @version         1.44.0
+// @version         1.45.0
 // @author          Himanshu
 // @github          https://github.com/devcode90
 // @include         windhawk.exe
@@ -930,6 +930,11 @@ std::atomic<uint64_t> g_timerEditIdleSince = 0;
 // apply. wParam carries the character, with backspace, return and escape
 // arriving as their own control codes.
 constexpr UINT WM_APP_TIMER_NAME_KEY = WM_APP + 0x449;
+constexpr UINT WM_APP_VOLUME_EDIT = WM_APP + 0x44A;  // wParam: 0 commit, 1 cancel
+std::atomic<bool> g_volumeEditing = false;
+std::atomic<int> g_volumeEditValue = 0;      // as typed, 0-100
+std::atomic<bool> g_volumeEditTyped = false; // false until the first digit
+std::atomic<uint64_t> g_volumeEditIdleSince = 0;
 constexpr int kTimerNameMaxChars = 22;
 std::atomic<bool> g_timerNameEditing = false;
 std::atomic<uint64_t> g_timerNameIdleSince = 0;
@@ -947,6 +952,11 @@ std::atomic<bool> g_privacyHitValid = false;
 AtomicRect g_privacyDotRectPx[3];
 AtomicRect g_privacyPopupRectPx;
 AtomicRect g_timerButtonRectPx[kTimerButtonCount];
+// The level readout on the volume pill, which doubles as a field you can
+// type into. Published by the renderer like every other control.
+std::atomic<bool> g_volumeValueHitValid = false;
+AtomicRect g_volumeValueRectPx;
+
 AtomicRect g_timerClockRectPx;
 AtomicRect g_timerNameRectPx;
 
@@ -5926,16 +5936,48 @@ void UpdateSystemSnapshot() {
     next.hasCpuTemp = s_hasCpuTemp;
     next.cpuTempC = s_cpuTempC;
 
+    // Plugging in headphones makes a different endpoint the default. Every
+    // path that *writes* the level re-acquires the default first, so holding
+    // one endpoint here forever meant reads came from the old device while
+    // writes went to the new one: set 20% on the headphones, and a second
+    // later this poll reported the speakers still sitting at 6%, which is the
+    // level the pill then showed. Re-check which device is default each tick
+    // and re-activate when it moves. Once a second, so the extra call costs
+    // nothing worth measuring.
+    static ComPtr<IMMDeviceEnumerator> s_volumeEnumerator;
     static ComPtr<IAudioEndpointVolume> s_volume;
-    if (!s_volume) {
-        ComPtr<IMMDeviceEnumerator> enumerator;
-        ComPtr<IMMDevice> device;
-        HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
-        if (SUCCEEDED(hr)) {
-            hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+    static std::wstring s_volumeDeviceId;
+    {
+        if (!s_volumeEnumerator) {
+            CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                             IID_PPV_ARGS(s_volumeEnumerator.GetAddressOf()));
         }
-        if (SUCCEEDED(hr)) {
-            hr = device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(s_volume.GetAddressOf()));
+        ComPtr<IMMDevice> device;
+        std::wstring deviceId;
+        if (s_volumeEnumerator &&
+            SUCCEEDED(s_volumeEnumerator->GetDefaultAudioEndpoint(eRender, eConsole,
+                                                                  device.GetAddressOf()))) {
+            LPWSTR rawId = nullptr;
+            if (SUCCEEDED(device->GetId(&rawId)) && rawId) {
+                deviceId.assign(rawId);
+                CoTaskMemFree(rawId);
+            }
+        }
+        if (deviceId.empty()) {
+            // No default endpoint, or the enumerator died with the audio
+            // service. Drop everything and rebuild on the next tick.
+            s_volume.Reset();
+            s_volumeDeviceId.clear();
+            s_volumeEnumerator.Reset();
+        } else if (!s_volume || deviceId != s_volumeDeviceId) {
+            s_volume.Reset();
+            if (SUCCEEDED(device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr,
+                                           reinterpret_cast<void**>(s_volume.GetAddressOf())))) {
+                s_volumeDeviceId = deviceId;
+            } else {
+                s_volume.Reset();
+                s_volumeDeviceId.clear();
+            }
         }
     }
 
@@ -5947,6 +5989,7 @@ void UpdateSystemSnapshot() {
             next.volumeMuted = muted != FALSE;
         } else {
             s_volume.Reset(); // Retry next time
+            s_volumeDeviceId.clear();
         }
     }
 
@@ -7969,6 +8012,7 @@ class Renderer {
         // controls, so a stale rectangle can never take a click.
         g_mediaHitValid = false;
         g_volumeHitValid = false;
+        g_volumeValueHitValid = false;
         g_privacyHitValid = false;
         g_timerHitValid = false;
         g_pageNavHitValid = false;
@@ -11616,8 +11660,17 @@ class Renderer {
                            smallTextFormat_.Get(), labelRect, mutedBrush_.Get(),
                            D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
+        // While it is being typed the readout shows the digits as they land,
+        // with a caret, rather than the level underneath them.
+        const bool volumeEditing = g_volumeEditing.load();
         wchar_t value[16] = {};
-        if (muted) {
+        if (volumeEditing) {
+            if (g_volumeEditTyped.load()) {
+                swprintf_s(value, L"%d_", ClampInt(g_volumeEditValue.load(), 0, 100));
+            } else {
+                wcscpy_s(value, ARRAYSIZE(value), L"_");
+            }
+        } else if (muted) {
             wcscpy_s(value, ARRAYSIZE(value), L"Muted");
         } else {
             swprintf_s(value, L"%d%%", state.volume.percent);
@@ -11625,6 +11678,19 @@ class Renderer {
         D2D1_RECT_F valueRect = D2D1::RectF(rect.right - 58, cy - 22, rect.right - 14, cy - 6);
         target_->DrawTextW(value, static_cast<UINT32>(wcslen(value)), smallTextFormat_.Get(),
                            valueRect, textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+
+        // Same transform the bar below uses, so the hover inflation and the
+        // nudge offset are carried along. Opened up a little vertically: the
+        // drawn text is only sixteen units tall and this has to be clickable.
+        {
+            const float vcx = (rect.left + rect.right) * 0.5f;
+            const float vcy = (rect.top + rect.bottom) * 0.5f;
+            g_volumeValueRectPx.Set(vcx + (valueRect.left - vcx) * sizeScale_,
+                                    vcy + (valueRect.top - 5.0f - vcy) * sizeScale_,
+                                    vcx + (valueRect.right - vcx) * sizeScale_,
+                                    vcy + (valueRect.bottom + 5.0f - vcy) * sizeScale_);
+            g_volumeValueHitValid = true;
+        }
         textBrush_->SetOpacity(0.90f);
 
         // The bar can be dragged, so it gets the timeline's treatment:
@@ -12239,6 +12305,45 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             }
         }
 
+        // Typing a level into the volume pill. Same shape as the timer's
+        // number: only the keys this uses are swallowed, and only while the
+        // field is open for editing.
+        if (g_volumeEditing.load() && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
+            const DWORD vk = kbd->vkCode;
+            int digit = -1;
+            if (vk >= '0' && vk <= '9') {
+                digit = static_cast<int>(vk - '0');
+            } else if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) {
+                digit = static_cast<int>(vk - VK_NUMPAD0);
+            }
+
+            if (digit >= 0) {
+                const int typed = g_volumeEditTyped.load() ? g_volumeEditValue.load() : 0;
+                const int next = typed * 10 + digit;
+                // A level stops at 100, so anything past it is a typo rather
+                // than a number. Start again from the digit just pressed.
+                g_volumeEditValue = next > 100 ? digit : next;
+                g_volumeEditTyped = true;
+                g_volumeEditIdleSince = GetTickCount64();
+                return 1;
+            }
+            if (vk == VK_BACK) {
+                const int typed = g_volumeEditValue.load() / 10;
+                g_volumeEditValue = typed;
+                if (typed == 0) {
+                    g_volumeEditTyped = false;
+                }
+                g_volumeEditIdleSince = GetTickCount64();
+                return 1;
+            }
+            if (vk == VK_RETURN || vk == VK_ESCAPE) {
+                if (HWND target = g_hwnd) {
+                    PostMessageW(target, WM_APP_VOLUME_EDIT, vk == VK_RETURN ? 0 : 1, 0);
+                }
+                return 1;
+            }
+        }
+
         if (kbd->vkCode == VK_CAPITAL || kbd->vkCode == VK_NUMLOCK) {
             // Arm the sweep that hides the laptop maker's own lock-key card.
             // Armed on the way down, before the key reaches the utility that
@@ -12695,6 +12800,19 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
         }
 
+        case WM_APP_VOLUME_EDIT: {
+            const bool commit = wParam == 0;
+            const int typed = g_volumeEditValue.exchange(0);
+            const bool hadDigits = g_volumeEditTyped.exchange(false);
+            g_volumeEditing = false;
+            if (commit && hadDigits) {
+                ApplyVolumeFraction(ClampInt(typed, 0, 100) / 100.0f);
+                TriggerNudge();
+            }
+            g_layoutDirty = true;
+            return 0;
+        }
+
         case WM_APP_CAPSLOCK: {
             bool isNum = (wParam == VK_NUMLOCK);
             bool capsOn = (GetKeyState(VK_CAPITAL) & 0x0001) != 0;
@@ -12845,6 +12963,24 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     }
                 }
 
+                // The level readout is a field. Clicking it opens it for
+                // typing, the same way the timer's clock does; clicking it
+                // again commits whatever is in it.
+                if (g_volumeValueHitValid.load() &&
+                    g_volumeValueRectPx.Contains(static_cast<float>(xPos),
+                                                 static_cast<float>(yPos))) {
+                    if (g_volumeEditing.load()) {
+                        PostMessageW(hwnd, WM_APP_VOLUME_EDIT, 0, 0);
+                    } else {
+                        g_volumeEditValue = 0;
+                        g_volumeEditTyped = false;
+                        g_volumeEditIdleSince = GetTickCount64();
+                        g_volumeEditing = true;
+                    }
+                    g_layoutDirty = true;
+                    return 0;
+                }
+
                 // The volume pill's bar works like the timeline: pressing
                 // anywhere along it sets the level there, and the level then
                 // follows the pointer until the button comes back up.
@@ -12858,6 +12994,14 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                         g_layoutDirty = true;
                         return 0;
                     }
+                }
+
+                // A press that lands anywhere else puts the level field away
+                // without applying what was half typed into it.
+                if (g_volumeEditing.exchange(false)) {
+                    g_volumeEditValue = 0;
+                    g_volumeEditTyped = false;
+                    g_layoutDirty = true;
                 }
 
                 // Nothing else claimed the press, so it may be the start of a
@@ -13491,7 +13635,7 @@ DWORD WINAPI RenderThreadProc(void*) {
                     snapshot.notification.active = false;
                 }
                 if (g_state.volume.active && now >= g_state.volume.expiresAt &&
-                    !g_volumeDragging.load()) {
+                    !g_volumeDragging.load() && !g_volumeEditing.load()) {
                     g_state.volume.active = false;
                     snapshot.volume.active = false;
                 }
@@ -13815,7 +13959,7 @@ DWORD WINAPI RenderThreadProc(void*) {
                 // Pointing at the bar holds the pill up. It is only draggable
                 // while it is showing, and the 1.8 seconds a volume change
                 // buys is not long enough to reach for it.
-                if (overVolume) {
+                if (overVolume || g_volumeEditing.load()) {
                     std::lock_guard lock(g_stateMutex);
                     const double keepUntil = now + 1.0;
                     if (g_state.volume.active && g_state.volume.expiresAt < keepUntil) {
@@ -13963,6 +14107,17 @@ DWORD WINAPI RenderThreadProc(void*) {
                     if (!hover || idleFor > 15000) {
                         g_timerEditing = false;
                         g_timerEditValue = 0;
+                        needsRender = true;
+                    }
+                }
+                // Same for a level left half typed: the hook stops swallowing
+                // digits once the pointer leaves or the pause gets long.
+                if (g_volumeEditing.load()) {
+                    const uint64_t idleFor = GetTickCount64() - g_volumeEditIdleSince.load();
+                    if (!hover || idleFor > 15000) {
+                        g_volumeEditing = false;
+                        g_volumeEditValue = 0;
+                        g_volumeEditTyped = false;
                         needsRender = true;
                     }
                 }
