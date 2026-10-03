@@ -206,7 +206,7 @@ controlStyles:
 themeResourceVariables: [""]
 
 # The screen either side of the dock behaves like bare desktop, the way it does
-# next to the Dock. Set this to false if you want to keep right-clicking the
+# next to the Dock. Set this to 0 if you want to keep right-clicking the
 # empty taskbar for Task Manager and taskbar settings. Windhawk writes booleans
 # as 1 and 0 in textual mode, so this is 1, not true.
 clickThroughTaskbar: 1
