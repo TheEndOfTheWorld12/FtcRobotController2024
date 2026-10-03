@@ -1,15 +1,17 @@
 # ============================================================================
 # Mac Dock for Windows 11  —  settings for "Windows 11 Taskbar Styler" v1.10
 #
-# Paste this whole file into the mod's settings in text mode:
-#   Windhawk -> Windows 11 Taskbar Styler -> Settings -> Advanced -> "Edit as text"
-#   (select all, delete, paste, Save)
+# THIS FILE ASSUMES A 72px TASKBAR. Install the mod "Taskbar height and icon
+# size" first and set:
+#     TaskbarHeight       = 72
+#     IconSize            = 46
+#     TaskbarButtonWidth  = 54
+# The Styler cannot resize the taskbar window, so without that mod the dock is
+# stuck at 48px tall and the icons stay small. The numbers below are matched to
+# those three, so the two mods agree instead of fighting.
 #
-# What it does: removes everything the macOS Dock does not have (Start, Search,
-# Task View, Widgets, Copilot, the whole system tray and Show Desktop), then
-# turns what is left into a centered, shrink-to-fit, blurred rounded slab with
-# large icons and macOS running dots. No base theme, so nothing else is layered
-# on top of it.
+# Then: Windhawk -> Windows 11 Taskbar Styler -> Settings -> Textual mode ->
+# Ctrl+A, Delete, paste this, Save settings.
 # ============================================================================
 
 theme: ""
@@ -20,8 +22,8 @@ controlStyles:
 
   # -- 1. Lay the taskbar out as a centered, shrink-to-fit dock -------------
   # Three columns: filler | dock | filler. The dock sits in the middle one and
-  # is sized to its contents, so it grows and shrinks as apps open and close,
-  # staying centered, exactly like the Dock does.
+  # is sized to its contents, so it grows and shrinks as apps open and close
+  # while staying centered, the way the Dock does.
   - target: ':root > ScrollViewer > ScrollContentPresenter > Border > Grid'
     styles:
       - 'ColumnDefinitions:=<ColumnDefinitionCollection><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></ColumnDefinitionCollection>'
@@ -41,53 +43,57 @@ controlStyles:
     styles:
       - 'Grid.Column=1'
       - 'HorizontalAlignment=Center'
+      - 'VerticalAlignment=Bottom'
       - 'Width={{taskbarDock==`vertical`?skip():`Auto`}}'
       - 'MinWidth=64'
       - 'MaxWidth={{containerGridWidth>0?containerGridWidth:`Infinity`}}'
       - 'Transitions:=<TransitionCollection><RepositionThemeTransition IsStaggeringEnabled="False"/></TransitionCollection>'
 
-  # -- 2. The dock slab itself ---------------------------------------------
+  # -- 2. The dock slab ----------------------------------------------------
   # Drop the full-width taskbar background and put the glass, border and
   # corner radius directly on the dock's own grid.
+  # Vertical budget on a 72px taskbar:
+  #   4 top margin + 1 border + 58 button + 1 border + 6 bottom margin = 70
   - target: 'Taskbar.TaskbarBackground#BackgroundControl'
     styles:
       - 'Visibility=Collapsed'
 
   - target: 'Taskbar.TaskbarFrame > Grid#RootGrid'
     styles:
-      - 'Background:=<WindhawkBlur BlurAmount="30" TintColor="#B01C1C1E" NoiseOpacity="0" FallbackColor="#D81C1C1E"/>'
-      - 'BorderBrush=#26FFFFFF'
+      - 'Background:=<WindhawkBlur BlurAmount="40" TintColor="#2C2C2E" TintOpacity="0.45" TintLuminosityOpacity="0.5" NoiseOpacity="0" FallbackColor="#BF2C2C2E"/>'
+      - 'BorderBrush=#33FFFFFF'
       - 'BorderThickness=1'
-      - 'CornerRadius=16'
-      - 'Padding=6,0,6,0'
-      - 'Margin=0,2,0,4'
+      - 'CornerRadius=18'
+      - 'Padding=7,0,7,0'
+      - 'Margin=0,4,0,6'
 
   - target: 'Rectangle#BackgroundStroke'
     styles:
       - 'Visibility=Collapsed'
 
   # -- 3. Icon size and spacing -------------------------------------------
-  # Tuned for the default 48px taskbar. If you raise the taskbar height with
-  # the "Taskbar height and icon size" mod, scale these to match.
+  # 46px icon on a 54px pitch gives the Dock's 8px gaps. The icon is lifted 7px
+  # so the running dot has its own lane underneath instead of touching it.
   - target: 'Grid#IconPanel > Image#Icon, Taskbar.TaskListLabeledButtonPanel#IconPanel > Image#Icon'
     styles:
-      - 'Height=30'
-      - 'Width=30'
-      - 'Margin=0,0,0,8'
+      - 'Height=46'
+      - 'Width=46'
+      - 'Margin=0,0,0,7'
 
   - target: 'Taskbar.TaskListButtonPanel'
     styles:
-      - 'Width=44'
-      - 'Height=42'
+      - 'Width=54'
+      - 'Height=58'
 
   - target: 'Grid#IconPanel, Taskbar.TaskListLabeledButtonPanel'
     styles:
-      - 'Width=44'
-      - 'Height=42'
+      - 'Width=54'
+      - 'Height=58'
 
   - target: 'Taskbar.TaskListButton'
     styles:
-      - 'Padding=1,0,1,0'
+      - 'Padding=0'
+      - 'MinWidth=0'
 
   # No names under the icons — the Dock shows a name only as a tooltip.
   - target: 'Grid#IconPanel > TextBlock#LabelControl, Taskbar.TaskListLabeledButtonPanel > TextBlock#LabelControl'
@@ -119,24 +125,24 @@ controlStyles:
       - 'Background@InactiveRunningIndicatorPointerOver=Transparent'
 
   # -- 5. macOS running dots ----------------------------------------------
-  # One small dot centered under every running app; nothing under a pinned
-  # app that is not running. Same dot whether the app is focused or not.
+  # One small dot centered under every running app; nothing under a pinned app
+  # that is not running. Same dot whether the app is focused or not.
   - target: 'Rectangle#RunningIndicator'
     styles:
-      - 'Width=4'
-      - 'Height=4'
-      - 'RadiusX=2'
-      - 'RadiusY=2'
+      - 'Width=5'
+      - 'Height=5'
+      - 'RadiusX=2.5'
+      - 'RadiusY=2.5'
       - 'StrokeThickness=0'
       - 'HorizontalAlignment=Center'
       - 'VerticalAlignment=Bottom'
-      - 'Margin=0,0,0,4'
+      - 'Margin=0,0,0,3'
 
   - target: 'Grid#IconPanel@RunningIndicatorStates > Rectangle#RunningIndicator, Taskbar.TaskListLabeledButtonPanel@RunningIndicatorStates > Rectangle#RunningIndicator'
     styles:
-      - 'Width@NoRunningIndicator=4'
-      - 'Width@InactiveRunningIndicator=4'
-      - 'Width@ActiveRunningIndicator=4'
+      - 'Width@NoRunningIndicator=5'
+      - 'Width@InactiveRunningIndicator=5'
+      - 'Width@ActiveRunningIndicator=5'
       - 'Fill@NoRunningIndicator=Transparent'
       - 'Fill@InactiveRunningIndicator=#E6FFFFFF'
       - 'Fill@InactiveRunningIndicatorPointerOver=#E6FFFFFF'
@@ -206,9 +212,9 @@ controlStyles:
 themeResourceVariables: [""]
 
 # The screen either side of the dock behaves like bare desktop, the way it does
-# next to the Dock. Set this to 0 if you want to keep right-clicking the
-# empty taskbar for Task Manager and taskbar settings. Windhawk writes booleans
-# as 1 and 0 in textual mode, so this is 1, not true.
+# next to the Dock. Set this to 0 if you want to keep right-clicking the empty
+# taskbar for Task Manager and taskbar settings. Windhawk writes booleans as
+# 1 and 0 in textual mode, so this is 1, not true.
 clickThroughTaskbar: 1
 
 xamlDiagnosticsHandling: alert
