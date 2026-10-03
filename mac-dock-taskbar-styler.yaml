@@ -14,7 +14,7 @@
 
 theme: ""
 
-styleConstants: []
+styleConstants: [""]
 
 controlStyles:
 
@@ -203,11 +203,12 @@ controlStyles:
     styles:
       - 'Visibility=Collapsed'
 
-themeResourceVariables: []
+themeResourceVariables: [""]
 
 # The screen either side of the dock behaves like bare desktop, the way it does
 # next to the Dock. Set this to false if you want to keep right-clicking the
-# empty taskbar for Task Manager and taskbar settings.
-clickThroughTaskbar: true
+# empty taskbar for Task Manager and taskbar settings. Windhawk writes booleans
+# as 1 and 0 in textual mode, so this is 1, not true.
+clickThroughTaskbar: 1
 
 xamlDiagnosticsHandling: alert
