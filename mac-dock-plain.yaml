@@ -1,0 +1,144 @@
+theme: ''
+styleConstants:
+  - ''
+controlStyles:
+  - target: ':root > ScrollViewer > ScrollContentPresenter > Border > Grid'
+    styles:
+      - 'ColumnDefinitions:=<ColumnDefinitionCollection><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></ColumnDefinitionCollection>'
+      - 'HorizontalAlignment=Stretch'
+      - 'ActualWidth=>containerGridWidth'
+  - target: 'Taskbar.TaskbarFrame > Grid#RootGrid@DockingStates'
+    styles:
+      - 'Tag=horizontal'
+      - 'Tag@DockedLeft=vertical'
+      - 'Tag@DockedRight=vertical'
+      - 'Tag=>taskbarDock'
+  - target: 'Taskbar.TaskbarFrame'
+    styles:
+      - 'Grid.Column=1'
+      - 'HorizontalAlignment=Center'
+      - 'VerticalAlignment=Bottom'
+      - 'Width={{taskbarDock==`vertical`?skip():`Auto`}}'
+      - 'MinWidth=64'
+      - 'MaxWidth={{containerGridWidth>0?containerGridWidth:`Infinity`}}'
+      - 'Transitions:=<TransitionCollection><RepositionThemeTransition IsStaggeringEnabled="False"/></TransitionCollection>'
+  - target: 'Taskbar.TaskbarBackground#BackgroundControl'
+    styles:
+      - 'Visibility=Collapsed'
+  - target: 'Taskbar.TaskbarFrame > Grid#RootGrid'
+    styles:
+      - 'Background:=<WindhawkBlur BlurAmount="40" TintColor="#2C2C2E" TintOpacity="0.45" TintLuminosityOpacity="0.5" NoiseOpacity="0" FallbackColor="#BF2C2C2E"/>'
+      - 'BorderBrush=#33FFFFFF'
+      - 'BorderThickness=1'
+      - 'CornerRadius=12'
+      - 'Padding=14,0,14,0'
+      - 'Margin=0,1,0,2'
+  - target: 'Rectangle#BackgroundStroke'
+    styles:
+      - 'Visibility=Collapsed'
+  - target: 'Grid#IconPanel > Image#Icon, Taskbar.TaskListLabeledButtonPanel#IconPanel > Image#Icon'
+    styles:
+      - 'Height=30'
+      - 'Width=30'
+      - 'Margin=0,0,0,10'
+  - target: 'Taskbar.TaskListButtonPanel'
+    styles:
+      - 'Width=40'
+      - 'Height=42'
+  - target: 'Grid#IconPanel, Taskbar.TaskListLabeledButtonPanel'
+    styles:
+      - 'Width=40'
+      - 'Height=42'
+  - target: 'Taskbar.TaskListButton'
+    styles:
+      - 'Padding=0'
+      - 'MinWidth=0'
+  - target: 'Grid#IconPanel > TextBlock#LabelControl, Taskbar.TaskListLabeledButtonPanel > TextBlock#LabelControl'
+    styles:
+      - 'Visibility=Collapsed'
+  - target: 'Grid#IconPanel@CommonStates > Border#BackgroundElement, Taskbar.TaskListLabeledButtonPanel@CommonStates > Border#BackgroundElement'
+    styles:
+      - 'BorderThickness=0'
+      - 'Background=Transparent'
+      - 'Background@InactiveNormal=Transparent'
+      - 'Background@ActiveNormal=Transparent'
+      - 'Background@InactivePointerOver=Transparent'
+      - 'Background@ActivePointerOver=Transparent'
+      - 'Background@InactivePressed=Transparent'
+      - 'Background@ActivePressed=Transparent'
+      - '//Background@InactivePointerOver=#18FFFFFF'
+  - target: 'Grid#IconPanel@RunningIndicatorStates > Border#BackgroundElement, Taskbar.TaskListLabeledButtonPanel@RunningIndicatorStates > Border#BackgroundElement'
+    styles:
+      - 'BorderThickness=0'
+      - 'Background@NoRunningIndicator=Transparent'
+      - 'Background@InactiveRunningIndicator=Transparent'
+      - 'Background@ActiveRunningIndicator=Transparent'
+      - 'Background@InactiveRunningIndicatorPointerOver=Transparent'
+  - target: 'Rectangle#RunningIndicator'
+    styles:
+      - 'Width=4'
+      - 'Height=4'
+      - 'RadiusX=2'
+      - 'RadiusY=2'
+      - 'StrokeThickness=0'
+      - 'HorizontalAlignment=Center'
+      - 'VerticalAlignment=Bottom'
+      - 'Margin=0,0,0,3'
+  - target: 'Grid#IconPanel@RunningIndicatorStates > Rectangle#RunningIndicator, Taskbar.TaskListLabeledButtonPanel@RunningIndicatorStates > Rectangle#RunningIndicator'
+    styles:
+      - 'Width@NoRunningIndicator=4'
+      - 'Width@InactiveRunningIndicator=4'
+      - 'Width@ActiveRunningIndicator=4'
+      - 'Fill@NoRunningIndicator=Transparent'
+      - 'Fill@InactiveRunningIndicator=#E6FFFFFF'
+      - 'Fill@InactiveRunningIndicatorPointerOver=#E6FFFFFF'
+      - 'Fill@ActiveRunningIndicator=#E6FFFFFF'
+  - target: 'Taskbar.ExperienceToggleButton#LaunchListButton[AutomationProperties.AutomationId=StartButton]'
+    styles:
+      - 'Visibility=Collapsed'
+  - target: 'Taskbar.ExperienceToggleButton#LaunchListButton[AutomationProperties.Name=Start]'
+    styles:
+      - 'Visibility=Collapsed'
+  - target: 'Taskbar.SearchBoxButton'
+    styles:
+      - 'Visibility=Collapsed'
+  - target: 'SearchUx.SearchUI.SearchBoxButton'
+    styles:
+      - 'Visibility=Collapsed'
+  - target: 'SearchUx.SearchUI.SearchButtonControl'
+    styles:
+      - 'Visibility=Collapsed'
+  - target: 'Taskbar.ExperienceToggleButton#LaunchListButton[AutomationProperties.AutomationId=SearchButton]'
+    styles:
+      - 'Visibility=Collapsed'
+  - target: 'Grid#DynamicSearchBoxGleamContainer'
+    styles:
+      - 'Visibility=Collapsed'
+  - target: 'Taskbar.ExperienceToggleButton#LaunchListButton[AutomationProperties.AutomationId=TaskViewButton]'
+    styles:
+      - 'Visibility=Collapsed'
+  - target: 'Taskbar.ExperienceToggleButton#LaunchListButton[AutomationProperties.Name=Task View]'
+    styles:
+      - 'Visibility=Collapsed'
+  - target: 'Taskbar.AugmentedEntryPointButton#AugmentedEntryPointButton'
+    styles:
+      - 'Visibility=Collapsed'
+  - target: 'Taskbar.ExperienceToggleButton#LaunchListButton[AutomationProperties.AutomationId=WidgetsButton]'
+    styles:
+      - 'Visibility=Collapsed'
+  - target: 'Taskbar.TaskListButton#TaskListButton[AutomationProperties.Name=Copilot]'
+    styles:
+      - 'Visibility=Collapsed'
+  - target: 'SystemTray.SystemTrayFrame'
+    styles:
+      - 'Visibility=Collapsed'
+  - target: 'SystemTray.Stack#ShowDesktopStack'
+    styles:
+      - 'Visibility=Collapsed'
+  - target: 'SystemTray.OmniButton#ControlCenterButton[AutomationProperties.AutomationId=ShowDesktop]'
+    styles:
+      - 'Visibility=Collapsed'
+themeResourceVariables:
+  - ''
+clickThroughTaskbar: 1
+xamlDiagnosticsHandling: alert
