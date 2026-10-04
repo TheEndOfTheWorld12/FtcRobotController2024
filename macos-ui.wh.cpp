@@ -23,8 +23,12 @@ One mod, two halves.
 its own dock, so there is no Windows furniture left to hide and nothing to
 configure in another mod. Blurred rounded slab, large crisp icons pulled from
 the shell at 256px, hover magnification with the real Dock falloff curve,
-running dots, click to launch or switch, and a Trash at the end that opens and
-empties the Recycle Bin.
+running dots, and a divider with your folders and the Trash after it, the way
+the Dock groups them.
+
+Drops are real shell operations, not a visual: drop files on a folder and they
+move into it (hold Ctrl to copy), on the Trash and they go to the Recycle Bin
+with undo intact, on an app and that app opens them.
 
 The slab is a translucent panel rather than a live blur. A real acrylic backdrop
 has to live in its own region-clipped window, and that window cannot be resized
@@ -89,6 +93,18 @@ registry.
     Full paths, one per line, in the order you want them. A .exe, a .lnk, a
     folder, or a shell: location such as shell:RecycleBinFolder. Leave empty to
     mirror the apps pinned to your taskbar.
+- dockRightItems: [""]
+  $name: Dock items on the right
+  $description: >-
+    Folders and the Trash, one per line, shown after a divider at the right end
+    the way the Dock arranges them. Full paths, or shell: locations. Trash is
+    always placed last whatever order you list things in. Example:
+    C:\\Users\\you\\Downloads
+- dockAcceptDrops: true
+  $name: Accept dropped files
+  $description: >-
+    Drop files on a folder to move them into it (hold Ctrl to copy), on the
+    Trash to send them to the Recycle Bin, or on an app to open them with it.
 - dockIconSize: 48
   $name: Icon size (px)
   $description: Resting size of a dock icon, from 24 to 128. macOS defaults to about 48.
@@ -831,7 +847,8 @@ namespace macdock {
 
 struct DockSettings {
     bool enabled = true;
-    std::vector<std::wstring> items;  // empty => mirror the taskbar pins
+    std::vector<std::wstring> items;       // empty => mirror the taskbar pins
+    std::vector<std::wstring> rightItems;  // folders and Trash, after the divider
     int iconSize = 48;
     bool magnify = true;
     int maxScalePct = 170;
@@ -843,6 +860,7 @@ struct DockSettings {
     bool reserveSpace = true;
     bool runningDots = true;
     bool showTrash = true;
+    bool acceptDrops = true;
 };
 
 struct DockItem {
@@ -851,6 +869,8 @@ struct DockItem {
     std::wstring matchExe;     // lowercased exe path used to spot running windows
     std::shared_ptr<Gdiplus::Bitmap> icon;
     bool isTrash = false;
+    bool isFolder = false;
+    bool isRightSection = false;  // after the separator, where macOS puts these
     bool running = false;
     HWND firstWindow = nullptr;
 
@@ -872,6 +892,7 @@ bool g_taskbarHidden = false;
 
 int g_mouseX = -100000;  // dock-client coordinates; far away means "no hover"
 bool g_hovering = false;
+int g_dropHot = -1;      // item a drag is currently over, -1 for none
 
 constexpr PCWSTR kDockClass = L"MacOSUI.Dock";
 constexpr UINT WM_DOCK_SHUTDOWN = WM_APP + 11;
@@ -1063,6 +1084,40 @@ std::vector<std::wstring> PinnedTaskbarShortcuts() {
     return paths;
 }
 
+// One dock entry from a path, a .lnk or a shell: location.
+DockItem MakeItem(const std::wstring& entry, bool rightSection) {
+    DockItem item;
+    item.target = entry;
+    item.displayName = DisplayNameOf(entry);
+    item.icon = LoadShellIcon(entry);
+    item.isRightSection = rightSection;
+    item.isTrash = ToLower(entry).find(L"recyclebin") != std::wstring::npos;
+
+    if (!item.isTrash) {
+        const DWORD attrs = GetFileAttributesW(entry.c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES &&
+            (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+            item.isFolder = true;
+        } else if (entry.rfind(L"shell:", 0) == 0) {
+            item.isFolder = true;  // a shell location is a folder for our purposes
+        } else if (PathMatchSpecW(entry.c_str(), L"*.lnk")) {
+            const std::wstring resolved = ResolveShortcut(entry);
+            if (!resolved.empty()) {
+                const DWORD a = GetFileAttributesW(resolved.c_str());
+                if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) {
+                    item.isFolder = true;
+                    item.target = resolved;  // drop straight into the real folder
+                } else {
+                    item.matchExe = ToLower(resolved);
+                }
+            }
+        } else if (PathMatchSpecW(entry.c_str(), L"*.exe")) {
+            item.matchExe = ToLower(entry);
+        }
+    }
+    return item;
+}
+
 void BuildItems() {
     DockSettings cfg;
     {
@@ -1072,36 +1127,35 @@ void BuildItems() {
 
     std::vector<DockItem> built;
 
+    // Left group: your apps.
     if (!cfg.items.empty()) {
         for (const auto& entry : cfg.items) {
-            DockItem item;
-            item.target = entry;
-            item.displayName = DisplayNameOf(entry);
-            item.icon = LoadShellIcon(entry);
-            item.isTrash = ToLower(entry).find(L"recyclebin") != std::wstring::npos;
-            if (!item.isTrash && PathMatchSpecW(entry.c_str(), L"*.exe")) {
-                item.matchExe = ToLower(entry);
-            }
+            DockItem item = MakeItem(entry, /*rightSection=*/false);
             if (item.icon) built.push_back(std::move(item));
         }
     } else {
         for (const auto& lnk : PinnedTaskbarShortcuts()) {
-            DockItem item;
-            item.target = lnk;
-            item.displayName = DisplayNameOf(lnk);
-            item.icon = LoadShellIcon(lnk);
-            std::wstring resolved = ResolveShortcut(lnk);
-            if (!resolved.empty()) item.matchExe = ToLower(resolved);
+            DockItem item = MakeItem(lnk, /*rightSection=*/false);
             if (item.icon) built.push_back(std::move(item));
         }
-        if (cfg.showTrash) {
-            DockItem trash;
-            trash.target = L"shell:RecycleBinFolder";
-            trash.displayName = L"Trash";
-            trash.isTrash = true;
-            trash.icon = LoadShellIcon(L"shell:RecycleBinFolder");
-            if (trash.icon) built.push_back(std::move(trash));
-        }
+    }
+
+    // Right group: folders, then Trash last, the way the Dock orders them.
+    for (const auto& entry : cfg.rightItems) {
+        DockItem item = MakeItem(entry, /*rightSection=*/true);
+        if (item.icon && !item.isTrash) built.push_back(std::move(item));
+    }
+    for (const auto& entry : cfg.rightItems) {
+        DockItem item = MakeItem(entry, /*rightSection=*/true);
+        if (item.icon && item.isTrash) built.push_back(std::move(item));
+    }
+    const bool haveTrash =
+        std::any_of(built.begin(), built.end(),
+                    [](const DockItem& i) { return i.isTrash; });
+    if (cfg.showTrash && !haveTrash) {
+        DockItem trash = MakeItem(L"shell:RecycleBinFolder", /*rightSection=*/true);
+        trash.displayName = L"Trash";
+        if (trash.icon) built.push_back(std::move(trash));
     }
 
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -1224,21 +1278,34 @@ float ScaleAt(float distance, float radius, float maxScale) {
 // spreads outward from whatever the pointer is nearest.
 void LayOutItems(std::vector<DockItem>& items, const Layout& lay,
                  const DockSettings& cfg, int mouseX, bool hovering,
-                 float* slabLeftOut, float* slabRightOut) {
+                 float* slabLeftOut, float* slabRightOut, float* separatorXOut) {
+    *separatorXOut = -1.0f;
     const int n = static_cast<int>(items.size());
     if (n == 0) {
         *slabLeftOut = *slabRightOut = lay.windowW * 0.5f;
         return;
     }
 
+    // Where the divider goes: before the first item of the right-hand group.
+    int firstRight = -1;
+    for (int i = 0; i < n; ++i) {
+        if (items[i].isRightSection) {
+            firstRight = i;
+            break;
+        }
+    }
+    const float sepExtra =
+        (firstRight > 0) ? static_cast<float>(lay.gap) : 0.0f;
+
     const float restContent =
-        static_cast<float>(n * lay.iconSize + (n - 1) * lay.gap);
+        static_cast<float>(n * lay.iconSize + (n - 1) * lay.gap) + sepExtra;
     const float restStart = (lay.windowW - restContent) * 0.5f;
 
     float total = 0.0f;
     for (int i = 0; i < n; ++i) {
-        const float restCenter =
+        float restCenter =
             restStart + i * (lay.iconSize + lay.gap) + lay.iconSize * 0.5f;
+        if (firstRight >= 0 && i >= firstRight) restCenter += sepExtra;
         const float scale =
             (hovering && cfg.magnify)
                 ? ScaleAt(mouseX - restCenter,
@@ -1247,11 +1314,16 @@ void LayOutItems(std::vector<DockItem>& items, const Layout& lay,
         items[i].size = lay.iconSize * scale;
         total += items[i].size;
     }
-    total += (n - 1) * lay.gap;
+    total += (n - 1) * lay.gap + sepExtra;
 
     float x = (lay.windowW - total) * 0.5f;
     *slabLeftOut = x - lay.padX;
     for (int i = 0; i < n; ++i) {
+        if (i == firstRight && sepExtra > 0.0f) {
+            // The empty run is [x - gap, x + sepExtra]; centre the rule in it.
+            *separatorXOut = x + (sepExtra - lay.gap) * 0.5f;
+            x += sepExtra;
+        }
         items[i].centerX = x + items[i].size * 0.5f;
         x += items[i].size + lay.gap;
     }
@@ -1348,8 +1420,9 @@ void PaintDock(HWND hWnd, const Layout& lay, const DockSettings& cfg,
         g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
         g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
 
-        float slabLeft = 0.0f, slabRight = 0.0f;
-        LayOutItems(items, lay, cfg, mouseX, hovering, &slabLeft, &slabRight);
+        float slabLeft = 0.0f, slabRight = 0.0f, separatorX = -1.0f;
+        LayOutItems(items, lay, cfg, mouseX, hovering, &slabLeft, &slabRight,
+                    &separatorX);
 
         // The slab.
         const float slabTop = lay.slabBottom - lay.slabHeight;
@@ -1378,6 +1451,13 @@ void PaintDock(HWND hWnd, const Layout& lay, const DockSettings& cfg,
         Gdiplus::Pen edge(Gdiplus::Color(56, 255, 255, 255), 1.0f);
         g.DrawPath(&edge, &slab);
 
+        // The divider between your apps and the folders/Trash group.
+        if (separatorX > 0.0f) {
+            Gdiplus::Pen rule(Gdiplus::Color(64, 255, 255, 255), 1.0f);
+            g.DrawLine(&rule, separatorX, slabTop + 6.0f, separatorX,
+                       lay.slabBottom - 6.0f);
+        }
+
         // Icons, bottom-aligned so magnification lifts them off the slab.
         const int hovered =
             hovering ? HitTestItem(items, lay, mouseX, mouseY) : -1;
@@ -1388,6 +1468,14 @@ void PaintDock(HWND hWnd, const Layout& lay, const DockSettings& cfg,
             const float size = item.size;
             const Gdiplus::RectF dest(item.centerX - size * 0.5f,
                                       lay.iconBaseline - size, size, size);
+
+            // Something is being dragged onto this one.
+            if (i == g_dropHot) {
+                Gdiplus::SolidBrush glow(Gdiplus::Color(70, 255, 255, 255));
+                const float pad = 5.0f;
+                g.FillEllipse(&glow, dest.X - pad, dest.Y - pad,
+                              dest.Width + pad * 2, dest.Height + pad * 2);
+            }
             g.DrawImage(item.icon.get(), dest, 0.0f, 0.0f,
                         static_cast<float>(item.icon->GetWidth()),
                         static_cast<float>(item.icon->GetHeight()),
@@ -1626,6 +1714,207 @@ bool ForegroundIsFullscreen() {
            wr.right >= info.rcMonitor.right && wr.bottom >= info.rcMonitor.bottom;
 }
 
+// -------------------------------------------------------------- drag drop --
+// What the Dock does: drop files on a folder and they move into it, drop them
+// on Trash and they go to the Recycle Bin, drop them on an app and that app
+// opens them. All three are real shell operations, not a visual.
+
+// SHFileOperation wants a double-null-terminated list, not an array.
+std::vector<wchar_t> PackPathList(const std::vector<std::wstring>& paths) {
+    std::vector<wchar_t> packed;
+    for (const auto& path : paths) {
+        packed.insert(packed.end(), path.begin(), path.end());
+        packed.push_back(L'\0');
+    }
+    packed.push_back(L'\0');
+    return packed;
+}
+
+std::vector<std::wstring> PathsFromDataObject(IDataObject* data) {
+    std::vector<std::wstring> paths;
+    if (!data) return paths;
+
+    FORMATETC fmt = {};
+    fmt.cfFormat = CF_HDROP;
+    fmt.dwAspect = DVASPECT_CONTENT;
+    fmt.lindex = -1;
+    fmt.tymed = TYMED_HGLOBAL;
+
+    STGMEDIUM stg = {};
+    if (FAILED(data->GetData(&fmt, &stg))) return paths;
+
+    HDROP drop = static_cast<HDROP>(GlobalLock(stg.hGlobal));
+    if (drop) {
+        const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+        for (UINT i = 0; i < count; ++i) {
+            const UINT len = DragQueryFileW(drop, i, nullptr, 0);
+            if (!len) continue;
+            std::wstring path(len + 1, L'\0');
+            if (DragQueryFileW(drop, i, &path[0], len + 1)) {
+                path.resize(len);
+                paths.push_back(std::move(path));
+            }
+        }
+        GlobalUnlock(stg.hGlobal);
+    }
+    ReleaseStgMedium(&stg);
+    return paths;
+}
+
+void PerformDrop(int index, const std::vector<std::wstring>& paths, bool copy) {
+    if (paths.empty()) return;
+
+    DockItem item;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (index < 0 || index >= static_cast<int>(g_items.size())) return;
+        item = g_items[index];
+    }
+
+    std::vector<wchar_t> from = PackPathList(paths);
+
+    if (item.isTrash) {
+        SHFILEOPSTRUCTW op = {};
+        op.wFunc = FO_DELETE;
+        op.pFrom = from.data();
+        op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT;
+        SHFileOperationW(&op);
+        return;
+    }
+
+    if (item.isFolder) {
+        // A shell: location has no filesystem path to copy into, so just open it.
+        if (item.target.rfind(L"shell:", 0) == 0) {
+            ActivateItem(index);
+            return;
+        }
+        std::wstring to = item.target;
+        to.push_back(L'\0');
+        to.push_back(L'\0');
+        SHFILEOPSTRUCTW op = {};
+        op.wFunc = copy ? FO_COPY : FO_MOVE;
+        op.pFrom = from.data();
+        op.pTo = to.c_str();
+        op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMMKDIR;
+        SHFileOperationW(&op);
+        return;
+    }
+
+    // An app: hand it the files, which is "open with" - what macOS does.
+    std::wstring args;
+    for (const auto& path : paths) {
+        if (!args.empty()) args += L' ';
+        args += L'"';
+        args += path;
+        args += L'"';
+    }
+    ShellExecuteW(nullptr, L"open", item.target.c_str(), args.c_str(), nullptr,
+                  SW_SHOWNORMAL);
+}
+
+class DockDropTarget : public IDropTarget {
+   public:
+    // IUnknown
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IDropTarget) {
+            *ppv = static_cast<IDropTarget*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return static_cast<ULONG>(InterlockedIncrement(&ref_));
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const LONG n = InterlockedDecrement(&ref_);
+        if (n == 0) delete this;
+        return static_cast<ULONG>(n);
+    }
+
+    // IDropTarget
+    HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* data, DWORD keyState,
+                                        POINTL pt, DWORD* effect) override {
+        hasFiles_ = !PathsFromDataObject(data).empty();
+        return DragOver(keyState, pt, effect);
+    }
+
+    HRESULT STDMETHODCALLTYPE DragOver(DWORD keyState, POINTL pt,
+                                       DWORD* effect) override {
+        if (!effect) return E_POINTER;
+        if (!hasFiles_) {
+            *effect = DROPEFFECT_NONE;
+            return S_OK;
+        }
+        const int index = IndexAt(pt);
+        if (index != g_dropHot) {
+            g_dropHot = index;
+            Repaint();
+        }
+        *effect = EffectFor(index, keyState);
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragLeave() override {
+        if (g_dropHot != -1) {
+            g_dropHot = -1;
+            Repaint();
+        }
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE Drop(IDataObject* data, DWORD keyState, POINTL pt,
+                                   DWORD* effect) override {
+        const int index = IndexAt(pt);
+        if (g_dropHot != -1) {
+            g_dropHot = -1;
+            Repaint();
+        }
+        if (index >= 0) {
+            PerformDrop(index, PathsFromDataObject(data),
+                        (keyState & MK_CONTROL) != 0);
+        }
+        if (effect) *effect = EffectFor(index, keyState);
+        return S_OK;
+    }
+
+   private:
+    static int IndexAt(POINTL pt) {
+        if (!g_hDock) return -1;
+        POINT client = {pt.x, pt.y};
+        ScreenToClient(g_hDock, &client);
+        const Layout lay = CurrentLayout();
+        std::vector<DockItem> items;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            items = g_items;
+        }
+        return HitTestItem(items, lay, client.x, client.y);
+    }
+
+    static DWORD EffectFor(int index, DWORD keyState) {
+        if (index < 0) return DROPEFFECT_NONE;
+        DockItem item;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            if (index >= static_cast<int>(g_items.size())) return DROPEFFECT_NONE;
+            item = g_items[index];
+        }
+        if (item.isTrash) return DROPEFFECT_MOVE;
+        if (item.isFolder) {
+            return (keyState & MK_CONTROL) ? DROPEFFECT_COPY : DROPEFFECT_MOVE;
+        }
+        return DROPEFFECT_LINK;  // hand the files to the app
+    }
+
+    LONG ref_ = 1;
+    bool hasFiles_ = false;
+};
+
+IDropTarget* g_dropTarget = nullptr;
+
 LRESULT CALLBACK DockProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_MOUSEMOVE: {
@@ -1723,7 +2012,7 @@ LRESULT CALLBACK DockProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 DWORD WINAPI DockThread(LPVOID) {
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    OleInitialize(nullptr);  // RegisterDragDrop needs OLE, not bare COM
 
     WNDCLASSEXW wc = {sizeof(wc)};
     wc.lpfnWndProc = DockProc;
@@ -1755,6 +2044,22 @@ DWORD WINAPI DockThread(LPVOID) {
     ShowWindow(g_hDock, SW_SHOWNOACTIVATE);
     Repaint();
 
+    {
+        bool wantDrops = false;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            wantDrops = g_cfg.acceptDrops;
+        }
+        if (wantDrops) {
+            g_dropTarget = new DockDropTarget();
+            if (FAILED(RegisterDragDrop(g_hDock, g_dropTarget))) {
+                g_dropTarget->Release();
+                g_dropTarget = nullptr;
+                Wh_Log(L"RegisterDragDrop failed; drops are off");
+            }
+        }
+    }
+
     SetTimer(g_hDock, kTimerRunning, 900, nullptr);
     SetTimer(g_hDock, kTimerTaskbar, 2500, nullptr);
 
@@ -1783,10 +2088,16 @@ DWORD WINAPI DockThread(LPVOID) {
     }
     if (g_taskbarHidden) SetTaskbarHidden(false);
 
+    if (g_dropTarget) {
+        RevokeDragDrop(g_hDock);
+        g_dropTarget->Release();
+        g_dropTarget = nullptr;
+    }
+
     DestroyWindow(g_hDock);
     g_hDock = nullptr;
     UnregisterClassW(kDockClass, wc.hInstance);
-    CoUninitialize();
+    OleUninitialize();
     return 0;
 }
 
@@ -2445,6 +2756,7 @@ void LoadSettings() {
     dock.reserveSpace = Wh_GetIntSetting(L"dockReserveSpace") != 0;
     dock.runningDots = Wh_GetIntSetting(L"dockRunningDots") != 0;
     dock.showTrash = Wh_GetIntSetting(L"dockShowTrash") != 0;
+    dock.acceptDrops = Wh_GetIntSetting(L"dockAcceptDrops") != 0;
 
     PCWSTR tint = Wh_GetStringSetting(L"dockTint");
     dock.tint = ParseHexColor(tint, RGB(0x1C, 0x1C, 0x1E));
@@ -2454,6 +2766,14 @@ void LoadSettings() {
         PCWSTR value = Wh_GetStringSetting(L"dockItems[%d]", i);
         const bool empty = !value || !*value;
         if (!empty) dock.items.emplace_back(value);
+        Wh_FreeStringSetting(value);
+        if (empty) break;
+    }
+
+    for (int i = 0;; ++i) {
+        PCWSTR value = Wh_GetStringSetting(L"dockRightItems[%d]", i);
+        const bool empty = !value || !*value;
+        if (!empty) dock.rightItems.emplace_back(value);
         Wh_FreeStringSetting(value);
         if (empty) break;
     }
