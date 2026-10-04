@@ -1,0 +1,190 @@
+// ==WindhawkMod==
+// @id              macos-ui
+// @name            macOS UI for Windows
+// @description     Replaces the Windows taskbar with a real macOS Dock and puts traffic-light buttons on every window
+// @version         1.0.0
+// @author          aariv
+// @include         *
+// @exclude         dwm.exe
+// @exclude         TextInputHost.exe
+// @exclude         ShellExperienceHost.exe
+// @exclude         StartMenuExperienceHost.exe
+// @exclude         SearchHost.exe
+// @compilerOptions -ldwmapi -lgdi32 -lgdiplus -luser32 -lole32 -loleaut32 -lshell32 -lshlwapi -luuid
+// ==/WindhawkMod==
+
+// ==WindhawkModReadme==
+/*
+# macOS UI for Windows
+
+One mod, two halves.
+
+**The Dock.** This does not restyle the Windows taskbar — it hides it and draws
+its own dock, so there is no Windows furniture left to hide and nothing to
+configure in another mod. Blurred rounded slab, large crisp icons pulled from
+the shell at 256px, hover magnification with the real Dock falloff curve,
+running dots, click to launch or switch, and a Trash at the end that opens and
+empties the Recycle Bin.
+
+The slab is a translucent panel rather than a live blur. A real acrylic backdrop
+has to live in its own region-clipped window, and that window cannot be resized
+smoothly while magnification is spreading the icons, so it would judder on every
+pointer move. Over a wallpaper the difference is small; the judder is not.
+
+**Traffic lights.** The three macOS circles on the left of every standard title
+bar, with the Windows caption buttons taken off the right.
+
+## What it does not do
+
+* **Apps that draw their own title bar** — Chrome, Edge, Firefox, VS Code,
+  Office, Discord, Steam — keep their own buttons. Their title bar is their own
+  UI and nothing outside the app can reach it.
+* **No menu bar.** A top strip with the Apple menu is a separate problem; the
+  Dynamic Island mod already shows the clock and battery.
+* **Dock icons cannot be dragged to reorder.** Set the order in `Dock items`.
+
+## Getting the dock you want
+
+Leave `Dock items` empty and the dock mirrors whatever is pinned to your
+taskbar, in alphabetical order. To curate it the way macOS does, list full paths
+one per line, in the order you want them:
+
+```
+C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe
+C:\Windows\explorer.exe
+shell:RecycleBinFolder
+```
+
+`shell:` targets work, so `shell:RecycleBinFolder` gives you a real Trash
+anywhere in the dock, not only at the end.
+
+## Undo
+
+Disabling the mod unhides the Windows taskbar, gives every window its caption
+buttons back and restores the desktop work area. Nothing is written to the
+registry.
+*/
+// ==/WindhawkModReadme==
+
+// ==WindhawkModSettings==
+/*
+- dockEnabled: true
+  $name: Enable the Dock
+  $description: >-
+    Hides the Windows taskbar and draws a macOS Dock in its place. Turn this off
+    to keep the Windows taskbar and use only the traffic-light buttons.
+- dockItems: [""]
+  $name: Dock items
+  $description: >-
+    Full paths, one per line, in the order you want them. A .exe, a .lnk, a
+    folder, or a shell: location such as shell:RecycleBinFolder. Leave empty to
+    mirror the apps pinned to your taskbar.
+- dockIconSize: 48
+  $name: Icon size (px)
+  $description: Resting size of a dock icon, from 24 to 128. macOS defaults to about 48.
+- dockMagnify: true
+  $name: Magnification
+  $description: Icons grow as the pointer passes over them, the way the Dock does.
+- dockMaxScale: 170
+  $name: Magnification amount (%)
+  $description: How large the icon under the pointer becomes, from 100 to 300.
+- dockEffectRadius: 180
+  $name: Magnification spread (px)
+  $description: >-
+    How far either side of the pointer the magnification reaches, from 60 to 400.
+    Larger spreads lift more neighbours.
+- dockTint: "1C1C1E"
+  $name: Dock colour (RRGGBB)
+  $description: The slab tint, as six hex digits with no leading hash.
+- dockOpacity: 55
+  $name: Dock opacity (%)
+  $description: From 10 (nearly clear) to 100 (solid).
+- dockCornerRadius: 20
+  $name: Corner radius (px)
+  $description: From 0 to 40.
+- dockBottomGap: 6
+  $name: Gap below the dock (px)
+  $description: Distance from the dock to the bottom of the screen, from 0 to 40.
+- dockReserveSpace: true
+  $name: Keep windows clear of the dock
+  $description: >-
+    Reserves the dock's strip so maximised windows stop above it, the way the
+    Dock does. Turn this off to let windows go full height behind it.
+- dockRunningDots: true
+  $name: Running dots
+  $description: A small dot under each app that has a window open.
+- dockShowTrash: true
+  $name: Trash at the end
+  $description: >-
+    Puts the Recycle Bin at the right end of the dock, after a separator. Ignored
+    when you have listed your own dock items.
+- trafficLightsEnabled: true
+  $name: Enable traffic-light buttons
+  $description: >-
+    The three macOS circles on the left of every standard title bar. Turn this
+    off to keep the Windows caption buttons.
+- buttonDiameter: 12
+  $name: Circle size (px)
+  $description: Diameter of each circle at 100% scale, from 8 to 24.
+- buttonSpacing: 8
+  $name: Gap between circles (px)
+  $description: From 2 to 20.
+- leftMargin: 10
+  $name: Distance from the left edge (px)
+  $description: From 0 to 60.
+- verticalOffset: 0
+  $name: Vertical nudge (px)
+  $description: >-
+    Circles sit centred in the title bar. Positive moves them down, negative up.
+- showGlyphs: true
+  $name: Show symbols on hover
+  $description: Draw the x, minus and plus marks when the pointer is over the circles.
+- dimWhenInactive: true
+  $name: Grey out inactive windows
+  $description: macOS greys the circles on every window but the active one.
+- keepSystemMenu: false
+  $name: Keep the system menu
+  $description: >-
+    Leaves WS_SYSMENU alone, so Alt+Space and the title bar right-click menu keep
+    working - but the Windows caption buttons stay on the right as well.
+- excludedClasses: ["Chrome_WidgetWin_1", "Chrome_WidgetWin_0", "MozillaWindowClass"]
+  $name: Excluded window classes
+  $description: >-
+    Windows of these classes are never given traffic lights. The defaults are the
+    browsers, which draw their own title bars.
+*/
+// ==/WindhawkModSettings==
+
+#include <windhawk_api.h>
+#include <windhawk_utils.h>
+
+#include <dwmapi.h>
+#include <shlobj.h>
+#include <shlwapi.h>
+#include <shobjidl.h>
+#include <windowsx.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <cwctype>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+#include <objidl.h>
+#include <gdiplus.h>
+
+#ifndef DWMWA_EXTENDED_FRAME_BOUNDS
+#define DWMWA_EXTENDED_FRAME_BOUNDS 9
+#endif
+
+#ifndef DWMWA_CLOAKED
+#define DWMWA_CLOAKED 14
+#endif
+

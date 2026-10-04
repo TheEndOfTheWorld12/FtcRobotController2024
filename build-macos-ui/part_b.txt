@@ -1,0 +1,578 @@
+// =====================  PART 1 of 2 : traffic-light window buttons  ========
+// Runs in every process. Each tracked window gets a small owned, layered
+// window over the left of its title bar; DWM paints the caption, so drawing
+// into it from inside the process is not reliable.
+
+struct Settings {
+    int diameter = 12;
+    int spacing = 8;
+    int leftMargin = 10;
+    int verticalOffset = 0;
+    bool showGlyphs = true;
+    bool dimWhenInactive = true;
+    bool keepSystemMenu = false;
+    std::vector<std::wstring> excludedClasses;
+};
+
+std::mutex g_settingsMutex;
+Settings g_settings;
+std::atomic<bool> g_unloading = false;
+
+int Clamp(int v, int lo, int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+// ------------------------------------------------------------ tracked state --
+
+// One of these per window we have taken over. The original style is kept so
+// the window can be handed back exactly as it was found.
+struct TrackedWindow {
+    HWND overlay = nullptr;
+    LONG_PTR originalStyle = 0;
+    bool styleChanged = false;
+};
+
+std::mutex g_trackedMutex;
+std::unordered_map<HWND, TrackedWindow> g_tracked;
+
+// The overlay's own thread owns every overlay window and pumps their messages.
+HANDLE g_overlayThread = nullptr;
+DWORD g_overlayThreadId = 0;
+std::atomic<bool> g_overlayThreadReady = false;
+
+ULONG_PTR g_gdiplusToken = 0;
+
+constexpr PCWSTR kOverlayClass = L"MacTrafficLights.Overlay";
+constexpr UINT WM_APP_ATTACH = WM_APP + 1;  // wParam: target HWND
+constexpr UINT WM_APP_DETACH = WM_APP + 2;  // wParam: target HWND
+constexpr UINT WM_APP_REFLOW = WM_APP + 3;  // wParam: target HWND
+constexpr UINT WM_APP_SHUTDOWN = WM_APP + 4;
+
+enum ButtonIndex { kClose = 0, kMinimise = 1, kZoom = 2, kButtonCount = 3 };
+
+// --------------------------------------------------------------- geometry ---
+
+UINT DpiForWindow(HWND hWnd) {
+    using GetDpiForWindow_t = UINT(WINAPI*)(HWND);
+    static const auto fn = reinterpret_cast<GetDpiForWindow_t>(
+        GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow"));
+    const UINT dpi = (fn && hWnd) ? fn(hWnd) : 0;
+    return dpi ? dpi : 96;
+}
+
+int MetricForDpi(int index, UINT dpi) {
+    using GetSystemMetricsForDpi_t = int(WINAPI*)(int, UINT);
+    static const auto fn = reinterpret_cast<GetSystemMetricsForDpi_t>(
+        GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetSystemMetricsForDpi"));
+    if (fn) return fn(index, dpi);
+    return MulDiv(GetSystemMetrics(index), dpi, 96);
+}
+
+// The strip of screen the circles live in: the visible title bar. The window
+// rect includes the invisible resize border, so the DWM frame bounds are used
+// where available.
+bool CaptionRect(HWND hWnd, RECT* out) {
+    RECT frame{};
+    if (FAILED(DwmGetWindowAttribute(hWnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame,
+                                     sizeof(frame))) ||
+        IsRectEmpty(&frame)) {
+        if (!GetWindowRect(hWnd, &frame)) return false;
+    }
+    const UINT dpi = DpiForWindow(hWnd);
+    const int captionHeight = MetricForDpi(SM_CYCAPTION, dpi) +
+                              MetricForDpi(SM_CXPADDEDBORDER, dpi);
+    if (captionHeight <= 0) return false;
+    out->left = frame.left;
+    out->top = frame.top;
+    out->right = frame.right;
+    out->bottom = frame.top + captionHeight;
+    return out->right > out->left && out->bottom > out->top;
+}
+
+struct OverlayMetrics {
+    int diameter;
+    int spacing;
+    int width;
+    int height;
+};
+
+OverlayMetrics MetricsFor(HWND hWnd, const Settings& settings) {
+    const UINT dpi = DpiForWindow(hWnd);
+    OverlayMetrics m{};
+    m.diameter = MulDiv(Clamp(settings.diameter, 8, 24), dpi, 96);
+    m.spacing = MulDiv(Clamp(settings.spacing, 2, 20), dpi, 96);
+    m.width = m.diameter * kButtonCount + m.spacing * (kButtonCount - 1);
+    m.height = m.diameter;
+    return m;
+}
+
+// ---------------------------------------------------------------- painting --
+
+struct OverlayState {
+    HWND target = nullptr;
+    int hovered = -1;     // index under the pointer, -1 for none
+    bool tracking = false;
+};
+
+Gdiplus::Color FaceColour(int index, bool active) {
+    if (!active) {
+        // macOS flattens all three to the same grey when the window is not
+        // frontmost.
+        return Gdiplus::Color(255, 206, 206, 206);
+    }
+    switch (index) {
+        case kClose:    return Gdiplus::Color(255, 255, 95, 87);   // #FF5F57
+        case kMinimise: return Gdiplus::Color(255, 254, 188, 46);  // #FEBC2E
+        default:        return Gdiplus::Color(255, 40, 200, 64);   // #28C840
+    }
+}
+
+void DrawGlyph(Gdiplus::Graphics& g, int index, const Gdiplus::RectF& circle) {
+    // The marks only appear on hover, and are drawn dark against the face.
+    Gdiplus::Pen pen(Gdiplus::Color(190, 40, 20, 10), std::max(1.0f, circle.Width / 10.0f));
+    pen.SetStartCap(Gdiplus::LineCapRound);
+    pen.SetEndCap(Gdiplus::LineCapRound);
+
+    const float cx = circle.X + circle.Width / 2.0f;
+    const float cy = circle.Y + circle.Height / 2.0f;
+    const float r = circle.Width * 0.24f;
+
+    switch (index) {
+        case kClose:
+            g.DrawLine(&pen, cx - r, cy - r, cx + r, cy + r);
+            g.DrawLine(&pen, cx - r, cy + r, cx + r, cy - r);
+            break;
+        case kMinimise:
+            g.DrawLine(&pen, cx - r, cy, cx + r, cy);
+            break;
+        default:
+            g.DrawLine(&pen, cx - r, cy, cx + r, cy);
+            g.DrawLine(&pen, cx, cy - r, cx, cy + r);
+            break;
+    }
+}
+
+void RepaintOverlay(HWND overlay, OverlayState* state) {
+    if (!state || !state->target || !IsWindow(state->target)) return;
+
+    Settings settings;
+    {
+        std::lock_guard<std::mutex> lock(g_settingsMutex);
+        settings = g_settings;
+    }
+
+    const OverlayMetrics m = MetricsFor(state->target, settings);
+    if (m.width <= 0 || m.height <= 0) return;
+
+    const bool active =
+        !settings.dimWhenInactive || GetForegroundWindow() == state->target;
+
+    HDC screenDC = GetDC(nullptr);
+    if (!screenDC) return;
+    HDC memDC = CreateCompatibleDC(screenDC);
+    if (!memDC) {
+        ReleaseDC(nullptr, screenDC);
+        return;
+    }
+
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = m.width;
+    bmi.bmiHeader.biHeight = -m.height;  // top-down
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(screenDC, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!bitmap || !bits) {
+        if (bitmap) DeleteObject(bitmap);
+        DeleteDC(memDC);
+        ReleaseDC(nullptr, screenDC);
+        return;
+    }
+    HGDIOBJ oldBitmap = SelectObject(memDC, bitmap);
+    memset(bits, 0, static_cast<size_t>(m.width) * m.height * 4);
+
+    {
+        Gdiplus::Graphics g(memDC);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
+
+        for (int i = 0; i < kButtonCount; ++i) {
+            const float x = static_cast<float>(i * (m.diameter + m.spacing));
+            Gdiplus::RectF circle(x, 0.0f, static_cast<float>(m.diameter),
+                                  static_cast<float>(m.diameter));
+            Gdiplus::SolidBrush face(FaceColour(i, active));
+            g.FillEllipse(&face, circle);
+            // A faint inner edge, which is what stops them reading as flat
+            // stickers against a light title bar.
+            Gdiplus::Pen rim(Gdiplus::Color(40, 0, 0, 0), 1.0f);
+            g.DrawEllipse(&rim, circle);
+
+            if (settings.showGlyphs && active && state->hovered >= 0) {
+                DrawGlyph(g, i, circle);
+            }
+        }
+    }
+
+    // Premultiply: UpdateLayeredWindow wants premultiplied BGRA, and GDI+ has
+    // written straight alpha.
+    auto* pixels = static_cast<DWORD*>(bits);
+    const size_t count = static_cast<size_t>(m.width) * m.height;
+    for (size_t i = 0; i < count; ++i) {
+        const DWORD c = pixels[i];
+        const DWORD a = (c >> 24) & 0xFF;
+        if (a == 0) {
+            pixels[i] = 0;
+            continue;
+        }
+        if (a == 255) continue;
+        const DWORD r = (((c >> 16) & 0xFF) * a) / 255;
+        const DWORD gr = (((c >> 8) & 0xFF) * a) / 255;
+        const DWORD b = ((c & 0xFF) * a) / 255;
+        pixels[i] = (a << 24) | (r << 16) | (gr << 8) | b;
+    }
+
+    RECT caption{};
+    if (CaptionRect(state->target, &caption)) {
+        const UINT dpi = DpiForWindow(state->target);
+        const int left = caption.left + MulDiv(Clamp(settings.leftMargin, 0, 60), dpi, 96);
+        const int top = caption.top + (caption.bottom - caption.top - m.height) / 2 +
+                        MulDiv(settings.verticalOffset, dpi, 96);
+
+        POINT origin = {left, top};
+        SIZE size = {m.width, m.height};
+        POINT src = {0, 0};
+        BLENDFUNCTION blend{};
+        blend.BlendOp = AC_SRC_OVER;
+        blend.SourceConstantAlpha = 255;
+        blend.AlphaFormat = AC_SRC_ALPHA;
+        UpdateLayeredWindow(overlay, screenDC, &origin, &size, memDC, &src, 0,
+                            &blend, ULW_ALPHA);
+    }
+
+    SelectObject(memDC, oldBitmap);
+    DeleteObject(bitmap);
+    DeleteDC(memDC);
+    ReleaseDC(nullptr, screenDC);
+}
+
+// ------------------------------------------------------------ overlay proc --
+
+int HitTestOverlay(HWND overlay, OverlayState* state, int x) {
+    if (!state || !state->target) return -1;
+    Settings settings;
+    {
+        std::lock_guard<std::mutex> lock(g_settingsMutex);
+        settings = g_settings;
+    }
+    const OverlayMetrics m = MetricsFor(state->target, settings);
+    const int stride = m.diameter + m.spacing;
+    if (stride <= 0) return -1;
+    const int index = x / stride;
+    if (index < 0 || index >= kButtonCount) return -1;
+    if (x - index * stride > m.diameter) return -1;  // in the gap
+    return index;
+}
+
+LRESULT CALLBACK OverlayProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* state = reinterpret_cast<OverlayState*>(GetWindowLongPtrW(hWnd, GWLP_USERDATA));
+
+    switch (msg) {
+        case WM_NCHITTEST:
+            return HTCLIENT;
+
+        case WM_MOUSEMOVE: {
+            if (!state) break;
+            if (!state->tracking) {
+                TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hWnd, 0};
+                TrackMouseEvent(&tme);
+                state->tracking = true;
+            }
+            const int hit = HitTestOverlay(hWnd, state, GET_X_LPARAM(lParam));
+            if (hit != state->hovered) {
+                state->hovered = hit;
+                RepaintOverlay(hWnd, state);
+            }
+            return 0;
+        }
+
+        case WM_MOUSELEAVE: {
+            if (!state) break;
+            state->tracking = false;
+            if (state->hovered != -1) {
+                state->hovered = -1;
+                RepaintOverlay(hWnd, state);
+            }
+            return 0;
+        }
+
+        case WM_LBUTTONUP: {
+            if (!state || !state->target || !IsWindow(state->target)) break;
+            const int hit = HitTestOverlay(hWnd, state, GET_X_LPARAM(lParam));
+            if (hit < 0) return 0;
+            // Posted, not sent: the target may put up a "save changes?" dialog
+            // and this thread must not be the one waiting on it.
+            switch (hit) {
+                case kClose:
+                    PostMessageW(state->target, WM_SYSCOMMAND, SC_CLOSE, 0);
+                    break;
+                case kMinimise:
+                    PostMessageW(state->target, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+                    break;
+                default:
+                    PostMessageW(state->target, WM_SYSCOMMAND,
+                                 IsZoomed(state->target) ? SC_RESTORE : SC_MAXIMIZE, 0);
+                    break;
+            }
+            return 0;
+        }
+
+        case WM_DESTROY: {
+            if (state) {
+                SetWindowLongPtrW(hWnd, GWLP_USERDATA, 0);
+                delete state;
+            }
+            return 0;
+        }
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+// --------------------------------------------------------- attach / detach --
+
+bool IsExcludedClass(HWND hWnd, const Settings& settings) {
+    WCHAR cls[256]{};
+    if (!GetClassNameW(hWnd, cls, ARRAYSIZE(cls))) return true;
+    for (const std::wstring& excluded : settings.excludedClasses) {
+        if (!excluded.empty() && _wcsicmp(cls, excluded.c_str()) == 0) return true;
+    }
+    return false;
+}
+
+// Only ordinary framed top-level windows. Anything that draws its own title
+// bar, or has no title bar at all, is left alone.
+bool IsEligible(HWND hWnd) {
+    if (!hWnd || !IsWindow(hWnd)) return false;
+    if (GetAncestor(hWnd, GA_ROOT) != hWnd) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hWnd, &pid);
+    if (pid != GetCurrentProcessId()) return false;
+
+    const LONG_PTR style = GetWindowLongPtrW(hWnd, GWL_STYLE);
+    const LONG_PTR exStyle = GetWindowLongPtrW(hWnd, GWL_EXSTYLE);
+    if (style & WS_CHILD) return false;
+    if (!(style & WS_CAPTION)) return false;
+    if (exStyle & WS_EX_TOOLWINDOW) return false;
+
+    Settings settings;
+    {
+        std::lock_guard<std::mutex> lock(g_settingsMutex);
+        settings = g_settings;
+    }
+    if (IsExcludedClass(hWnd, settings)) return false;
+
+    RECT r{};
+    if (!GetWindowRect(hWnd, &r)) return false;
+    return (r.right - r.left) >= 200 && (r.bottom - r.top) >= 120;
+}
+
+void AttachToWindow(HWND target) {
+    if (g_unloading.load(std::memory_order_relaxed)) return;
+    {
+        std::lock_guard<std::mutex> lock(g_trackedMutex);
+        if (g_tracked.count(target)) return;
+    }
+    if (!IsEligible(target)) return;
+
+    Settings settings;
+    {
+        std::lock_guard<std::mutex> lock(g_settingsMutex);
+        settings = g_settings;
+    }
+
+    TrackedWindow tracked;
+    tracked.originalStyle = GetWindowLongPtrW(target, GWL_STYLE);
+
+    if (!settings.keepSystemMenu && (tracked.originalStyle & WS_SYSMENU)) {
+        SetWindowLongPtrW(target, GWL_STYLE, tracked.originalStyle & ~WS_SYSMENU);
+        SetWindowPos(target, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
+                         SWP_FRAMECHANGED);
+        tracked.styleChanged = true;
+    }
+
+    auto* state = new (std::nothrow) OverlayState{target, -1, false};
+    if (!state) return;
+
+    HWND overlay = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kOverlayClass, nullptr,
+        WS_POPUP, 0, 0, 1, 1, target, nullptr, nullptr, nullptr);
+    if (!overlay) {
+        delete state;
+        if (tracked.styleChanged) {
+            SetWindowLongPtrW(target, GWL_STYLE, tracked.originalStyle);
+            SetWindowPos(target, nullptr, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
+                             SWP_FRAMECHANGED);
+        }
+        return;
+    }
+    SetWindowLongPtrW(overlay, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+    tracked.overlay = overlay;
+
+    {
+        std::lock_guard<std::mutex> lock(g_trackedMutex);
+        g_tracked[target] = tracked;
+    }
+
+    RepaintOverlay(overlay, state);
+    ShowWindow(overlay, SW_SHOWNOACTIVATE);
+}
+
+void DetachFromWindow(HWND target, bool restoreStyle) {
+    TrackedWindow tracked;
+    {
+        std::lock_guard<std::mutex> lock(g_trackedMutex);
+        auto it = g_tracked.find(target);
+        if (it == g_tracked.end()) return;
+        tracked = it->second;
+        g_tracked.erase(it);
+    }
+    if (tracked.overlay && IsWindow(tracked.overlay)) {
+        DestroyWindow(tracked.overlay);
+    }
+    if (restoreStyle && tracked.styleChanged && IsWindow(target)) {
+        SetWindowLongPtrW(target, GWL_STYLE, tracked.originalStyle);
+        SetWindowPos(target, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
+                         SWP_FRAMECHANGED);
+    }
+}
+
+void ReflowWindow(HWND target) {
+    HWND overlay = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_trackedMutex);
+        auto it = g_tracked.find(target);
+        if (it == g_tracked.end()) return;
+        overlay = it->second.overlay;
+    }
+    if (!overlay || !IsWindow(overlay)) return;
+    auto* state = reinterpret_cast<OverlayState*>(GetWindowLongPtrW(overlay, GWLP_USERDATA));
+    if (!state) return;
+
+    // A minimised or hidden window has no title bar to sit on.
+    if (!IsWindowVisible(target) || IsIconic(target)) {
+        ShowWindow(overlay, SW_HIDE);
+        return;
+    }
+    RepaintOverlay(overlay, state);
+    if (!IsWindowVisible(overlay)) ShowWindow(overlay, SW_SHOWNOACTIVATE);
+}
+
+// ------------------------------------------------------------- win events ---
+
+HWINEVENTHOOK g_hookShow = nullptr;
+HWINEVENTHOOK g_hookLocation = nullptr;
+HWINEVENTHOOK g_hookForeground = nullptr;
+
+void CALLBACK WinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hWnd, LONG idObject,
+                           LONG idChild, DWORD thread, DWORD time) {
+    (void)hook;
+    (void)thread;
+    (void)time;
+    if (!hWnd || idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
+    if (g_unloading.load(std::memory_order_relaxed)) return;
+    if (!g_overlayThreadId) return;
+
+    switch (event) {
+        case EVENT_OBJECT_SHOW:
+            PostThreadMessageW(g_overlayThreadId, WM_APP_ATTACH,
+                               reinterpret_cast<WPARAM>(hWnd), 0);
+            break;
+        case EVENT_OBJECT_HIDE:
+        case EVENT_OBJECT_DESTROY:
+            PostThreadMessageW(g_overlayThreadId, WM_APP_DETACH,
+                               reinterpret_cast<WPARAM>(hWnd), 0);
+            break;
+        case EVENT_OBJECT_LOCATIONCHANGE:
+        case EVENT_SYSTEM_FOREGROUND:
+            PostThreadMessageW(g_overlayThreadId, WM_APP_REFLOW,
+                               reinterpret_cast<WPARAM>(hWnd), 0);
+            break;
+    }
+}
+
+// --------------------------------------------------------- overlay thread ---
+
+DWORD WINAPI OverlayThread(LPVOID) {
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = OverlayProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.lpszClassName = kOverlayClass;
+    RegisterClassExW(&wc);
+
+    g_hookShow = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE, nullptr,
+                                 WinEventProc, GetCurrentProcessId(), 0,
+                                 WINEVENT_OUTOFCONTEXT);
+    g_hookLocation = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE,
+                                     EVENT_OBJECT_LOCATIONCHANGE, nullptr, WinEventProc,
+                                     GetCurrentProcessId(), 0, WINEVENT_OUTOFCONTEXT);
+    g_hookForeground = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+                                       nullptr, WinEventProc, GetCurrentProcessId(), 0,
+                                       WINEVENT_OUTOFCONTEXT);
+
+    // Windows that already existed when the mod loaded.
+    EnumWindows(
+        [](HWND hWnd, LPARAM) -> BOOL {
+            if (IsWindowVisible(hWnd)) AttachToWindow(hWnd);
+            return TRUE;
+        },
+        0);
+
+    g_overlayThreadReady = true;
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.hwnd == nullptr) {
+            const HWND target = reinterpret_cast<HWND>(msg.wParam);
+            switch (msg.message) {
+                case WM_APP_ATTACH:
+                    AttachToWindow(target);
+                    continue;
+                case WM_APP_DETACH:
+                    DetachFromWindow(target, /*restoreStyle=*/true);
+                    continue;
+                case WM_APP_REFLOW:
+                    ReflowWindow(target);
+                    continue;
+                case WM_APP_SHUTDOWN:
+                    PostQuitMessage(0);
+                    continue;
+            }
+        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    if (g_hookShow) UnhookWinEvent(g_hookShow);
+    if (g_hookLocation) UnhookWinEvent(g_hookLocation);
+    if (g_hookForeground) UnhookWinEvent(g_hookForeground);
+    g_hookShow = g_hookLocation = g_hookForeground = nullptr;
+
+    // Hand every window back exactly as it was found.
+    std::vector<HWND> targets;
+    {
+        std::lock_guard<std::mutex> lock(g_trackedMutex);
+        targets.reserve(g_tracked.size());
+        for (const auto& entry : g_tracked) targets.push_back(entry.first);
+    }
+    for (HWND target : targets) DetachFromWindow(target, /*restoreStyle=*/true);
+
+    UnregisterClassW(kOverlayClass, GetModuleHandleW(nullptr));
+    return 0;
+}

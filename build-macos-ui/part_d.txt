@@ -1,0 +1,182 @@
+
+// ============================  mod plumbing  ===============================
+
+COLORREF ParseHexColor(PCWSTR text, COLORREF fallback) {
+    if (!text) return fallback;
+    while (*text == L'#' || *text == L' ') ++text;
+    unsigned value = 0;
+    int digits = 0;
+    for (; text[digits] && digits < 6; ++digits) {
+        const wchar_t c = text[digits];
+        unsigned nibble;
+        if (c >= L'0' && c <= L'9') {
+            nibble = static_cast<unsigned>(c - L'0');
+        } else if (c >= L'a' && c <= L'f') {
+            nibble = static_cast<unsigned>(c - L'a') + 10u;
+        } else if (c >= L'A' && c <= L'F') {
+            nibble = static_cast<unsigned>(c - L'A') + 10u;
+        } else {
+            return fallback;
+        }
+        value = (value << 4) | nibble;
+    }
+    if (digits != 6) return fallback;
+    return RGB((value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF);
+}
+
+bool g_trafficLightsEnabled = true;
+
+void LoadSettings() {
+    // --- traffic lights -----------------------------------------------------
+    Settings settings;
+    settings.diameter = Clamp(Wh_GetIntSetting(L"buttonDiameter"), 8, 24);
+    settings.spacing = Clamp(Wh_GetIntSetting(L"buttonSpacing"), 2, 20);
+    settings.leftMargin = Clamp(Wh_GetIntSetting(L"leftMargin"), 0, 60);
+    settings.verticalOffset = Clamp(Wh_GetIntSetting(L"verticalOffset"), -20, 20);
+    settings.showGlyphs = Wh_GetIntSetting(L"showGlyphs") != 0;
+    settings.dimWhenInactive = Wh_GetIntSetting(L"dimWhenInactive") != 0;
+    settings.keepSystemMenu = Wh_GetIntSetting(L"keepSystemMenu") != 0;
+
+    for (int i = 0;; ++i) {
+        PCWSTR value = Wh_GetStringSetting(L"excludedClasses[%d]", i);
+        const bool empty = !value || !*value;
+        if (!empty) settings.excludedClasses.emplace_back(value);
+        Wh_FreeStringSetting(value);
+        if (empty) break;
+    }
+
+    g_trafficLightsEnabled = Wh_GetIntSetting(L"trafficLightsEnabled") != 0;
+
+    {
+        std::lock_guard<std::mutex> lock(g_settingsMutex);
+        g_settings = std::move(settings);
+    }
+
+    // --- dock ---------------------------------------------------------------
+    macdock::DockSettings dock;
+    dock.enabled = Wh_GetIntSetting(L"dockEnabled") != 0;
+    dock.iconSize = macdock::ClampI(Wh_GetIntSetting(L"dockIconSize"), 24, 128);
+    dock.magnify = Wh_GetIntSetting(L"dockMagnify") != 0;
+    dock.maxScalePct = macdock::ClampI(Wh_GetIntSetting(L"dockMaxScale"), 100, 300);
+    dock.effectRadius =
+        macdock::ClampI(Wh_GetIntSetting(L"dockEffectRadius"), 60, 400);
+    dock.opacityPct = macdock::ClampI(Wh_GetIntSetting(L"dockOpacity"), 10, 100);
+    dock.cornerRadius =
+        macdock::ClampI(Wh_GetIntSetting(L"dockCornerRadius"), 0, 40);
+    dock.bottomGap = macdock::ClampI(Wh_GetIntSetting(L"dockBottomGap"), 0, 40);
+    dock.reserveSpace = Wh_GetIntSetting(L"dockReserveSpace") != 0;
+    dock.runningDots = Wh_GetIntSetting(L"dockRunningDots") != 0;
+    dock.showTrash = Wh_GetIntSetting(L"dockShowTrash") != 0;
+
+    PCWSTR tint = Wh_GetStringSetting(L"dockTint");
+    dock.tint = ParseHexColor(tint, RGB(0x1C, 0x1C, 0x1E));
+    Wh_FreeStringSetting(tint);
+
+    for (int i = 0;; ++i) {
+        PCWSTR value = Wh_GetStringSetting(L"dockItems[%d]", i);
+        const bool empty = !value || !*value;
+        if (!empty) dock.items.emplace_back(value);
+        Wh_FreeStringSetting(value);
+        if (empty) break;
+    }
+
+    std::lock_guard<std::mutex> lock(macdock::g_mutex);
+    macdock::g_cfg = std::move(dock);
+}
+
+BOOL Wh_ModInit() {
+    LoadSettings();
+
+    Gdiplus::GdiplusStartupInput gdiplusStartupInput;
+    if (Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput, nullptr) !=
+        Gdiplus::Ok) {
+        Wh_Log(L"GDI+ startup failed");
+        return FALSE;
+    }
+
+    if (g_trafficLightsEnabled) {
+        g_overlayThread =
+            CreateThread(nullptr, 0, OverlayThread, nullptr, 0, &g_overlayThreadId);
+        if (!g_overlayThread) {
+            Wh_Log(L"Traffic-light thread failed to start");
+        }
+    }
+
+    bool dockEnabled = false;
+    {
+        std::lock_guard<std::mutex> lock(macdock::g_mutex);
+        dockEnabled = macdock::g_cfg.enabled;
+    }
+    if (dockEnabled && macdock::ThisProcessHostsTheDock()) {
+        macdock::g_thread = CreateThread(nullptr, 0, macdock::DockThread, nullptr,
+                                         0, &macdock::g_threadId);
+        if (!macdock::g_thread) Wh_Log(L"Dock thread failed to start");
+    }
+
+    Wh_Log(L"Init ok");
+    return TRUE;
+}
+
+void Wh_ModSettingsChanged() {
+    LoadSettings();
+
+    std::vector<HWND> targets;
+    {
+        std::lock_guard<std::mutex> lock(g_trackedMutex);
+        targets.reserve(g_tracked.size());
+        for (const auto& entry : g_tracked) targets.push_back(entry.first);
+    }
+    if (g_overlayThreadId) {
+        for (HWND target : targets) {
+            PostThreadMessageW(g_overlayThreadId, WM_APP_REFLOW,
+                               reinterpret_cast<WPARAM>(target), 0);
+        }
+    }
+
+    if (macdock::g_threadId) {
+        PostThreadMessageW(macdock::g_threadId, macdock::WM_DOCK_REBUILD, 0, 0);
+    }
+}
+
+void Wh_ModUninit() {
+    g_unloading = true;
+    macdock::g_unloading = true;
+
+    if (macdock::g_threadId) {
+        PostThreadMessageW(macdock::g_threadId, macdock::WM_DOCK_SHUTDOWN, 0, 0);
+    }
+    if (macdock::g_thread) {
+        WaitForSingleObject(macdock::g_thread, 5000);
+        CloseHandle(macdock::g_thread);
+        macdock::g_thread = nullptr;
+    }
+    macdock::g_threadId = 0;
+
+    // If the dock thread did not get there, make sure the taskbar comes back.
+    if (macdock::g_taskbarHidden) macdock::SetTaskbarHidden(false);
+
+    if (g_overlayThreadId) {
+        PostThreadMessageW(g_overlayThreadId, WM_APP_SHUTDOWN, 0, 0);
+    }
+    if (g_overlayThread) {
+        WaitForSingleObject(g_overlayThread, 5000);
+        CloseHandle(g_overlayThread);
+        g_overlayThread = nullptr;
+    }
+    g_overlayThreadId = 0;
+
+    std::vector<HWND> targets;
+    {
+        std::lock_guard<std::mutex> lock(g_trackedMutex);
+        targets.reserve(g_tracked.size());
+        for (const auto& entry : g_tracked) targets.push_back(entry.first);
+    }
+    for (HWND target : targets) DetachFromWindow(target, /*restoreStyle=*/true);
+
+    if (g_gdiplusToken) {
+        Gdiplus::GdiplusShutdown(g_gdiplusToken);
+        g_gdiplusToken = 0;
+    }
+
+    Wh_Log(L"Uninit");
+}

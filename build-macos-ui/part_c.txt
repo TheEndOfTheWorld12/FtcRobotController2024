@@ -1,0 +1,982 @@
+// =====================  PART 2 of 2 : the Dock  ============================
+// This does not restyle the Windows taskbar. It hides it and draws its own
+// window: a layered, per-pixel-alpha surface pushed with UpdateLayeredWindow,
+// which gives true rounded corners, translucency and - because ULW hit-testing
+// follows the alpha channel - click-through everywhere the dock is not drawn.
+// Nothing here hooks the shell, so nothing here breaks on a Windows update.
+
+namespace macdock {
+
+// ------------------------------------------------------------------ state --
+
+struct DockSettings {
+    bool enabled = true;
+    std::vector<std::wstring> items;  // empty => mirror the taskbar pins
+    int iconSize = 48;
+    bool magnify = true;
+    int maxScalePct = 170;
+    int effectRadius = 180;
+    COLORREF tint = RGB(0x1C, 0x1C, 0x1E);
+    int opacityPct = 55;
+    int cornerRadius = 20;
+    int bottomGap = 6;
+    bool reserveSpace = true;
+    bool runningDots = true;
+    bool showTrash = true;
+};
+
+struct DockItem {
+    std::wstring target;       // what to launch
+    std::wstring displayName;  // tooltip / context menu
+    std::wstring matchExe;     // lowercased exe path used to spot running windows
+    std::shared_ptr<Gdiplus::Bitmap> icon;
+    bool isTrash = false;
+    bool running = false;
+    HWND firstWindow = nullptr;
+
+    // Recomputed on every paint.
+    float centerX = 0.0f;
+    float size = 0.0f;
+};
+
+std::mutex g_mutex;
+DockSettings g_cfg;
+std::vector<DockItem> g_items;
+
+std::atomic<bool> g_unloading = false;
+HANDLE g_thread = nullptr;
+DWORD g_threadId = 0;
+HWND g_hDock = nullptr;
+bool g_appBarRegistered = false;
+bool g_taskbarHidden = false;
+
+int g_mouseX = -100000;  // dock-client coordinates; far away means "no hover"
+bool g_hovering = false;
+
+constexpr PCWSTR kDockClass = L"MacOSUI.Dock";
+constexpr UINT WM_DOCK_SHUTDOWN = WM_APP + 11;
+constexpr UINT WM_DOCK_REBUILD = WM_APP + 12;
+constexpr UINT WM_DOCK_APPBAR = WM_APP + 13;
+constexpr UINT_PTR kTimerRunning = 1;
+constexpr UINT_PTR kTimerTaskbar = 2;
+
+// Icons are fetched once at this size and scaled down for drawing, so they stay
+// crisp all the way through magnification.
+constexpr int kIconSourcePx = 256;
+
+int ClampI(int v, int lo, int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+// ------------------------------------------------------------ icon loading --
+
+// Builds a GDI+ bitmap from a shell item. IShellItemImageFactory gives the real
+// high-resolution asset where the app ships one, which is what keeps a 48px
+// dock icon from looking like an upscaled 32px toolbar icon.
+std::shared_ptr<Gdiplus::Bitmap> BitmapFromHBITMAP(HBITMAP hBmp) {
+    DIBSECTION ds = {};
+    if (GetObjectW(hBmp, sizeof(ds), &ds) != sizeof(ds)) return nullptr;
+    if (ds.dsBm.bmBitsPixel != 32 || !ds.dsBm.bmBits) return nullptr;
+
+    const int w = ds.dsBm.bmWidth;
+    const int h = std::abs(ds.dsBm.bmHeight);
+    if (w <= 0 || h <= 0) return nullptr;
+
+    // GetImage hands back a top-down DIB; biHeight is negative in that case.
+    const bool topDown = ds.dsBmih.biHeight < 0;
+    const int stride = ds.dsBm.bmWidthBytes;
+    auto* src = static_cast<BYTE*>(ds.dsBm.bmBits);
+
+    auto bmp = std::make_shared<Gdiplus::Bitmap>(w, h, PixelFormat32bppARGB);
+    if (!bmp || bmp->GetLastStatus() != Gdiplus::Ok) return nullptr;
+
+    Gdiplus::BitmapData data = {};
+    Gdiplus::Rect rect(0, 0, w, h);
+    if (bmp->LockBits(&rect, Gdiplus::ImageLockModeWrite, PixelFormat32bppARGB,
+                      &data) != Gdiplus::Ok) {
+        return nullptr;
+    }
+
+    bool anyAlpha = false;
+    for (int y = 0; y < h; ++y) {
+        const BYTE* s = src + (topDown ? y : (h - 1 - y)) * stride;
+        auto* d = static_cast<BYTE*>(data.Scan0) + y * data.Stride;
+        std::memcpy(d, s, static_cast<size_t>(w) * 4);
+        for (int x = 0; x < w; ++x) {
+            if (d[x * 4 + 3] != 0) anyAlpha = true;
+        }
+    }
+    // Some shell handlers return a 32bpp bitmap with the alpha channel left at
+    // zero, which would draw as nothing at all. Treat that as fully opaque.
+    if (!anyAlpha) {
+        for (int y = 0; y < h; ++y) {
+            auto* d = static_cast<BYTE*>(data.Scan0) + y * data.Stride;
+            for (int x = 0; x < w; ++x) d[x * 4 + 3] = 255;
+        }
+    }
+    bmp->UnlockBits(&data);
+    return bmp;
+}
+
+std::shared_ptr<Gdiplus::Bitmap> LoadShellIcon(const std::wstring& target) {
+    std::shared_ptr<Gdiplus::Bitmap> result;
+
+    IShellItem* item = nullptr;
+    if (SUCCEEDED(SHCreateItemFromParsingName(target.c_str(), nullptr,
+                                              IID_PPV_ARGS(&item))) &&
+        item) {
+        IShellItemImageFactory* factory = nullptr;
+        if (SUCCEEDED(item->QueryInterface(IID_PPV_ARGS(&factory))) && factory) {
+            SIZE size = {kIconSourcePx, kIconSourcePx};
+            HBITMAP hBmp = nullptr;
+            if (SUCCEEDED(factory->GetImage(
+                    size, static_cast<SIIGBF>(SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK),
+                    &hBmp)) &&
+                hBmp) {
+                result = BitmapFromHBITMAP(hBmp);
+                DeleteObject(hBmp);
+            }
+            factory->Release();
+        }
+        item->Release();
+    }
+
+    if (result) return result;
+
+    // Fallback for anything the image factory cannot parse.
+    SHFILEINFOW sfi = {};
+    if (SHGetFileInfoW(target.c_str(), 0, &sfi, sizeof(sfi),
+                       SHGFI_ICON | SHGFI_LARGEICON) &&
+        sfi.hIcon) {
+        auto bmp = std::shared_ptr<Gdiplus::Bitmap>(
+            Gdiplus::Bitmap::FromHICON(sfi.hIcon));
+        DestroyIcon(sfi.hIcon);
+        if (bmp && bmp->GetLastStatus() == Gdiplus::Ok) result = std::move(bmp);
+    }
+    return result;
+}
+
+// ---------------------------------------------------------- item discovery --
+
+std::wstring ToLower(std::wstring s) {
+    for (auto& c : s) c = static_cast<wchar_t>(towlower(c));
+    return s;
+}
+
+std::wstring DisplayNameOf(const std::wstring& target) {
+    IShellItem* item = nullptr;
+    std::wstring name;
+    if (SUCCEEDED(SHCreateItemFromParsingName(target.c_str(), nullptr,
+                                              IID_PPV_ARGS(&item))) &&
+        item) {
+        LPWSTR raw = nullptr;
+        if (SUCCEEDED(item->GetDisplayName(SIGDN_NORMALDISPLAY, &raw)) && raw) {
+            name.assign(raw);
+            CoTaskMemFree(raw);
+        }
+        item->Release();
+    }
+    if (name.empty()) {
+        PCWSTR leaf = PathFindFileNameW(target.c_str());
+        if (leaf) name.assign(leaf);
+    }
+    return name;
+}
+
+// Follows a .lnk to the thing it points at, so a pinned shortcut can be matched
+// against the running process that it started.
+std::wstring ResolveShortcut(const std::wstring& lnkPath) {
+    std::wstring result;
+    IShellLinkW* link = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&link))) ||
+        !link) {
+        return result;
+    }
+    IPersistFile* file = nullptr;
+    if (SUCCEEDED(link->QueryInterface(IID_PPV_ARGS(&file))) && file) {
+        if (SUCCEEDED(file->Load(lnkPath.c_str(), STGM_READ))) {
+            wchar_t buffer[MAX_PATH] = {};
+            if (SUCCEEDED(link->GetPath(buffer, MAX_PATH, nullptr, SLGP_RAWPATH)) &&
+                buffer[0]) {
+                wchar_t expanded[MAX_PATH] = {};
+                if (ExpandEnvironmentStringsW(buffer, expanded, MAX_PATH)) {
+                    result.assign(expanded);
+                } else {
+                    result.assign(buffer);
+                }
+            }
+        }
+        file->Release();
+    }
+    link->Release();
+    return result;
+}
+
+std::vector<std::wstring> PinnedTaskbarShortcuts() {
+    std::vector<std::wstring> paths;
+    PWSTR appData = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr,
+                                    &appData)) ||
+        !appData) {
+        return paths;
+    }
+    std::wstring dir(appData);
+    CoTaskMemFree(appData);
+    dir += L"\\Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\TaskBar";
+
+    std::wstring pattern = dir + L"\\*.lnk";
+    WIN32_FIND_DATAW find = {};
+    HANDLE h = FindFirstFileW(pattern.c_str(), &find);
+    if (h == INVALID_HANDLE_VALUE) return paths;
+    do {
+        if (find.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        paths.push_back(dir + L"\\" + find.cFileName);
+    } while (FindNextFileW(h, &find));
+    FindClose(h);
+
+    std::sort(paths.begin(), paths.end(), [](const std::wstring& a,
+                                             const std::wstring& b) {
+        return _wcsicmp(PathFindFileNameW(a.c_str()),
+                        PathFindFileNameW(b.c_str())) < 0;
+    });
+    return paths;
+}
+
+void BuildItems() {
+    DockSettings cfg;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        cfg = g_cfg;
+    }
+
+    std::vector<DockItem> built;
+
+    if (!cfg.items.empty()) {
+        for (const auto& entry : cfg.items) {
+            DockItem item;
+            item.target = entry;
+            item.displayName = DisplayNameOf(entry);
+            item.icon = LoadShellIcon(entry);
+            item.isTrash = ToLower(entry).find(L"recyclebin") != std::wstring::npos;
+            if (!item.isTrash && PathMatchSpecW(entry.c_str(), L"*.exe")) {
+                item.matchExe = ToLower(entry);
+            }
+            if (item.icon) built.push_back(std::move(item));
+        }
+    } else {
+        for (const auto& lnk : PinnedTaskbarShortcuts()) {
+            DockItem item;
+            item.target = lnk;
+            item.displayName = DisplayNameOf(lnk);
+            item.icon = LoadShellIcon(lnk);
+            std::wstring resolved = ResolveShortcut(lnk);
+            if (!resolved.empty()) item.matchExe = ToLower(resolved);
+            if (item.icon) built.push_back(std::move(item));
+        }
+        if (cfg.showTrash) {
+            DockItem trash;
+            trash.target = L"shell:RecycleBinFolder";
+            trash.displayName = L"Trash";
+            trash.isTrash = true;
+            trash.icon = LoadShellIcon(L"shell:RecycleBinFolder");
+            if (trash.icon) built.push_back(std::move(trash));
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_items = std::move(built);
+}
+
+// ------------------------------------------------------- running app scan --
+
+std::wstring ProcessPathOf(HWND hWnd) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hWnd, &pid);
+    if (!pid) return {};
+    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!proc) return {};
+    wchar_t buffer[MAX_PATH] = {};
+    DWORD size = MAX_PATH;
+    std::wstring result;
+    if (QueryFullProcessImageNameW(proc, 0, buffer, &size)) result.assign(buffer, size);
+    CloseHandle(proc);
+    return result;
+}
+
+struct RunningScan {
+    std::unordered_map<std::wstring, HWND> byExe;
+};
+
+BOOL CALLBACK RunningEnumProc(HWND hWnd, LPARAM lParam) {
+    auto* scan = reinterpret_cast<RunningScan*>(lParam);
+    if (!IsWindowVisible(hWnd) || GetWindow(hWnd, GW_OWNER)) return TRUE;
+
+    const LONG_PTR exStyle = GetWindowLongPtrW(hWnd, GWL_EXSTYLE);
+    if (exStyle & WS_EX_TOOLWINDOW) return TRUE;
+    if (GetWindowTextLengthW(hWnd) == 0) return TRUE;
+
+    int cloaked = 0;
+    if (SUCCEEDED(DwmGetWindowAttribute(hWnd, DWMWA_CLOAKED, &cloaked,
+                                        sizeof(cloaked))) &&
+        cloaked) {
+        return TRUE;  // a suspended UWP window, not a running app
+    }
+
+    std::wstring path = ToLower(ProcessPathOf(hWnd));
+    if (path.empty()) return TRUE;
+    scan->byExe.emplace(std::move(path), hWnd);
+    return TRUE;
+}
+
+void RefreshRunningState() {
+    RunningScan scan;
+    EnumWindows(RunningEnumProc, reinterpret_cast<LPARAM>(&scan));
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for (auto& item : g_items) {
+        item.running = false;
+        item.firstWindow = nullptr;
+        if (item.matchExe.empty()) continue;
+        auto it = scan.byExe.find(item.matchExe);
+        if (it != scan.byExe.end()) {
+            item.running = true;
+            item.firstWindow = it->second;
+        }
+    }
+}
+
+// ---------------------------------------------------------------- geometry --
+
+struct Layout {
+    int count = 0;
+    int iconSize = 48;
+    int gap = 8;
+    int padX = 8;
+    int padY = 5;
+    int dotLane = 9;      // the strip under the icons that holds the dots
+    int slabHeight = 0;
+    int windowW = 0;
+    int windowH = 0;
+    int bottomGap = 6;
+    float slabBottom = 0.0f;
+    float iconBaseline = 0.0f;
+    float maxScale = 1.7f;
+};
+
+Layout ComputeLayout(const DockSettings& cfg, int count) {
+    Layout lay;
+    lay.count = count;
+    lay.iconSize = cfg.iconSize;
+    lay.gap = (std::max)(6, cfg.iconSize * 18 / 100);
+    lay.padX = lay.gap;
+    lay.bottomGap = cfg.bottomGap;
+    lay.maxScale = cfg.magnify ? (cfg.maxScalePct / 100.0f) : 1.0f;
+
+    lay.slabHeight = lay.padY + cfg.iconSize + 4 + lay.dotLane;
+
+    const float content =
+        static_cast<float>(count * cfg.iconSize + (std::max)(0, count - 1) * lay.gap);
+    const float widest = content * lay.maxScale;
+
+    lay.windowW = static_cast<int>(widest) + 2 * lay.padX + 80;
+    const int rise = static_cast<int>(cfg.iconSize * (lay.maxScale - 1.0f)) + 28;
+    lay.windowH = lay.slabHeight + rise + lay.bottomGap;
+
+    lay.slabBottom = static_cast<float>(lay.windowH - lay.bottomGap);
+    lay.iconBaseline = lay.slabBottom - lay.dotLane - 4.0f;
+    return lay;
+}
+
+// macOS raises an icon by how close the pointer is to it, with a smooth
+// shoulder rather than a linear ramp. A raised cosine over the effect radius is
+// the curve that matches it.
+float ScaleAt(float distance, float radius, float maxScale) {
+    if (maxScale <= 1.0f || radius <= 1.0f) return 1.0f;
+    const float t = 1.0f - (std::min)(1.0f, std::fabs(distance) / radius);
+    if (t <= 0.0f) return 1.0f;
+    const float eased = 0.5f - 0.5f * std::cos(3.14159265f * t);
+    return 1.0f + (maxScale - 1.0f) * eased;
+}
+
+// Fills in each item's centre and drawn size for the current pointer position.
+// Items keep their order and their gaps; only their widths change, so the run
+// spreads outward from whatever the pointer is nearest.
+void LayOutItems(std::vector<DockItem>& items, const Layout& lay,
+                 const DockSettings& cfg, int mouseX, bool hovering,
+                 float* slabLeftOut, float* slabRightOut) {
+    const int n = static_cast<int>(items.size());
+    if (n == 0) {
+        *slabLeftOut = *slabRightOut = lay.windowW * 0.5f;
+        return;
+    }
+
+    const float restContent =
+        static_cast<float>(n * lay.iconSize + (n - 1) * lay.gap);
+    const float restStart = (lay.windowW - restContent) * 0.5f;
+
+    float total = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        const float restCenter =
+            restStart + i * (lay.iconSize + lay.gap) + lay.iconSize * 0.5f;
+        const float scale =
+            (hovering && cfg.magnify)
+                ? ScaleAt(mouseX - restCenter,
+                          static_cast<float>(cfg.effectRadius), lay.maxScale)
+                : 1.0f;
+        items[i].size = lay.iconSize * scale;
+        total += items[i].size;
+    }
+    total += (n - 1) * lay.gap;
+
+    float x = (lay.windowW - total) * 0.5f;
+    *slabLeftOut = x - lay.padX;
+    for (int i = 0; i < n; ++i) {
+        items[i].centerX = x + items[i].size * 0.5f;
+        x += items[i].size + lay.gap;
+    }
+    *slabRightOut = x - lay.gap + lay.padX;
+}
+
+int HitTestItem(const std::vector<DockItem>& items, const Layout& lay, int x,
+                int y) {
+    for (int i = 0; i < static_cast<int>(items.size()); ++i) {
+        const float half = items[i].size * 0.5f;
+        if (x < items[i].centerX - half || x > items[i].centerX + half) continue;
+        if (y > lay.slabBottom || y < lay.iconBaseline - items[i].size) continue;
+        return i;
+    }
+    return -1;
+}
+
+// ----------------------------------------------------------------- drawing --
+
+void DrawTooltip(Gdiplus::Graphics& g, const std::wstring& text, float centerX,
+                 float bottomY, int windowW) {
+    if (text.empty()) return;
+
+    Gdiplus::FontFamily family(L"Segoe UI");
+    if (!family.IsAvailable()) return;
+    Gdiplus::Font font(&family, 12.0f, Gdiplus::FontStyleRegular,
+                       Gdiplus::UnitPixel);
+
+    Gdiplus::RectF bounds;
+    Gdiplus::StringFormat format;
+    format.SetAlignment(Gdiplus::StringAlignmentCenter);
+    g.MeasureString(text.c_str(), -1, &font, Gdiplus::PointF(0, 0), &format,
+                    &bounds);
+
+    const float padX = 8.0f;
+    const float padY = 4.0f;
+    const float w = bounds.Width + padX * 2;
+    const float h = bounds.Height + padY * 2;
+    float left = centerX - w * 0.5f;
+    left = (std::max)(2.0f, (std::min)(left, windowW - w - 2.0f));
+    const float top = bottomY - h;
+
+    Gdiplus::GraphicsPath path;
+    const float r = 6.0f;
+    path.AddArc(left, top, r * 2, r * 2, 180.0f, 90.0f);
+    path.AddArc(left + w - r * 2, top, r * 2, r * 2, 270.0f, 90.0f);
+    path.AddArc(left + w - r * 2, top + h - r * 2, r * 2, r * 2, 0.0f, 90.0f);
+    path.AddArc(left, top + h - r * 2, r * 2, r * 2, 90.0f, 90.0f);
+    path.CloseFigure();
+
+    Gdiplus::SolidBrush back(Gdiplus::Color(225, 40, 40, 44));
+    g.FillPath(&back, &path);
+    Gdiplus::Pen edge(Gdiplus::Color(60, 255, 255, 255), 1.0f);
+    g.DrawPath(&edge, &path);
+
+    Gdiplus::SolidBrush ink(Gdiplus::Color(245, 255, 255, 255));
+    Gdiplus::RectF textRect(left, top + padY, w, bounds.Height);
+    g.DrawString(text.c_str(), -1, &font, textRect, &format, &ink);
+}
+
+void PaintDock(HWND hWnd, const Layout& lay, const DockSettings& cfg,
+               std::vector<DockItem>& items, int mouseX, int mouseY,
+               bool hovering) {
+    const int w = lay.windowW;
+    const int h = lay.windowH;
+    if (w <= 0 || h <= 0) return;
+
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;  // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    void* bits = nullptr;
+    HDC screen = GetDC(nullptr);
+    HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!dib) {
+        ReleaseDC(nullptr, screen);
+        return;
+    }
+    HDC mem = CreateCompatibleDC(screen);
+    HGDIOBJ oldBmp = SelectObject(mem, dib);
+
+    {
+        // UpdateLayeredWindow wants premultiplied alpha, so compose straight
+        // into a PARGB surface and let GDI+ do the conversion for each source.
+        Gdiplus::Bitmap surface(w, h, w * 4, PixelFormat32bppPARGB,
+                                static_cast<BYTE*>(bits));
+        Gdiplus::Graphics g(&surface);
+        g.Clear(Gdiplus::Color(0, 0, 0, 0));
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+
+        float slabLeft = 0.0f, slabRight = 0.0f;
+        LayOutItems(items, lay, cfg, mouseX, hovering, &slabLeft, &slabRight);
+
+        // The slab.
+        const float slabTop = lay.slabBottom - lay.slabHeight;
+        const float radius = static_cast<float>(
+            ClampI(cfg.cornerRadius, 0, lay.slabHeight / 2));
+        Gdiplus::GraphicsPath slab;
+        if (radius > 0.5f) {
+            const float d = radius * 2.0f;
+            slab.AddArc(slabLeft, slabTop, d, d, 180.0f, 90.0f);
+            slab.AddArc(slabRight - d, slabTop, d, d, 270.0f, 90.0f);
+            slab.AddArc(slabRight - d, lay.slabBottom - d, d, d, 0.0f, 90.0f);
+            slab.AddArc(slabLeft, lay.slabBottom - d, d, d, 90.0f, 90.0f);
+            slab.CloseFigure();
+        } else {
+            slab.AddRectangle(Gdiplus::RectF(slabLeft, slabTop,
+                                             slabRight - slabLeft,
+                                             lay.slabBottom - slabTop));
+        }
+
+        const BYTE alpha =
+            static_cast<BYTE>(ClampI(cfg.opacityPct, 10, 100) * 255 / 100);
+        Gdiplus::SolidBrush fill(Gdiplus::Color(alpha, GetRValue(cfg.tint),
+                                                GetGValue(cfg.tint),
+                                                GetBValue(cfg.tint)));
+        g.FillPath(&fill, &slab);
+        Gdiplus::Pen edge(Gdiplus::Color(56, 255, 255, 255), 1.0f);
+        g.DrawPath(&edge, &slab);
+
+        // Icons, bottom-aligned so magnification lifts them off the slab.
+        const int hovered =
+            hovering ? HitTestItem(items, lay, mouseX, mouseY) : -1;
+
+        for (int i = 0; i < static_cast<int>(items.size()); ++i) {
+            DockItem& item = items[i];
+            if (!item.icon) continue;
+            const float size = item.size;
+            const Gdiplus::RectF dest(item.centerX - size * 0.5f,
+                                      lay.iconBaseline - size, size, size);
+            g.DrawImage(item.icon.get(), dest, 0.0f, 0.0f,
+                        static_cast<float>(item.icon->GetWidth()),
+                        static_cast<float>(item.icon->GetHeight()),
+                        Gdiplus::UnitPixel);
+
+            if (cfg.runningDots && item.running) {
+                const float dotSize = 5.0f;
+                const float cx = item.centerX - dotSize * 0.5f;
+                const float cy = lay.slabBottom - lay.padY - dotSize;
+                Gdiplus::SolidBrush dot(Gdiplus::Color(230, 255, 255, 255));
+                g.FillEllipse(&dot, cx, cy, dotSize, dotSize);
+            }
+        }
+
+        if (hovered >= 0) {
+            DrawTooltip(g, items[hovered].displayName, items[hovered].centerX,
+                        lay.iconBaseline - items[hovered].size - 8.0f, w);
+        }
+    }
+
+    POINT src = {0, 0};
+    SIZE size = {w, h};
+    RECT wr = {};
+    GetWindowRect(hWnd, &wr);
+    POINT dst = {wr.left, wr.top};
+    BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    UpdateLayeredWindow(hWnd, screen, &dst, &size, mem, &src, 0, &blend,
+                        ULW_ALPHA);
+
+    SelectObject(mem, oldBmp);
+    DeleteDC(mem);
+    DeleteObject(dib);
+    ReleaseDC(nullptr, screen);
+}
+
+// --------------------------------------------------- window and behaviour --
+
+Layout CurrentLayout() {
+    DockSettings cfg;
+    int count = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        cfg = g_cfg;
+        count = static_cast<int>(g_items.size());
+    }
+    return ComputeLayout(cfg, count);
+}
+
+void Repaint() {
+    if (!g_hDock || g_unloading) return;
+    DockSettings cfg;
+    std::vector<DockItem> items;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        cfg = g_cfg;
+        items = g_items;
+    }
+    const Layout lay = ComputeLayout(cfg, static_cast<int>(items.size()));
+    POINT cursor = {};
+    GetCursorPos(&cursor);
+    ScreenToClient(g_hDock, &cursor);
+    PaintDock(g_hDock, lay, cfg, items, g_mouseX, cursor.y, g_hovering);
+
+    // Hand the laid-out geometry back so hit-testing agrees with what is drawn.
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_items.size() == items.size()) {
+        for (size_t i = 0; i < items.size(); ++i) {
+            g_items[i].centerX = items[i].centerX;
+            g_items[i].size = items[i].size;
+        }
+    }
+}
+
+bool PrimaryMonitorRect(RECT* out) {
+    POINT origin = {0, 0};
+    HMONITOR monitor = MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO info = {sizeof(info)};
+    if (!GetMonitorInfoW(monitor, &info)) return false;
+    *out = info.rcMonitor;
+    return true;
+}
+
+void UpdateAppBar(const Layout& lay) {
+    DockSettings cfg;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        cfg = g_cfg;
+    }
+
+    APPBARDATA abd = {};
+    abd.cbSize = sizeof(abd);
+    abd.hWnd = g_hDock;
+
+    if (!cfg.reserveSpace) {
+        if (g_appBarRegistered) {
+            SHAppBarMessage(ABM_REMOVE, &abd);
+            g_appBarRegistered = false;
+        }
+        return;
+    }
+
+    if (!g_appBarRegistered) {
+        abd.uCallbackMessage = WM_DOCK_APPBAR;
+        if (!SHAppBarMessage(ABM_NEW, &abd)) return;
+        g_appBarRegistered = true;
+    }
+
+    RECT monitor = {};
+    if (!PrimaryMonitorRect(&monitor)) return;
+
+    const int reserve = lay.slabHeight + lay.bottomGap;
+    abd.uEdge = ABE_BOTTOM;
+    abd.rc.left = monitor.left;
+    abd.rc.right = monitor.right;
+    abd.rc.top = monitor.bottom - reserve;
+    abd.rc.bottom = monitor.bottom;
+    SHAppBarMessage(ABM_QUERYPOS, &abd);
+    abd.rc.top = abd.rc.bottom - reserve;
+    SHAppBarMessage(ABM_SETPOS, &abd);
+}
+
+void PositionDock() {
+    if (!g_hDock) return;
+    const Layout lay = CurrentLayout();
+    RECT monitor = {};
+    if (!PrimaryMonitorRect(&monitor)) return;
+
+    const int x = monitor.left + ((monitor.right - monitor.left) - lay.windowW) / 2;
+    const int y = monitor.bottom - lay.windowH;
+    SetWindowPos(g_hDock, HWND_TOPMOST, x, y, lay.windowW, lay.windowH,
+                 SWP_NOACTIVATE);
+    UpdateAppBar(lay);
+    Repaint();
+}
+
+void ActivateItem(int index) {
+    DockItem item;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (index < 0 || index >= static_cast<int>(g_items.size())) return;
+        item = g_items[index];
+    }
+
+    if (item.running && item.firstWindow && IsWindow(item.firstWindow)) {
+        if (GetForegroundWindow() == item.firstWindow) {
+            ShowWindow(item.firstWindow, SW_MINIMIZE);
+        } else {
+            if (IsIconic(item.firstWindow)) ShowWindow(item.firstWindow, SW_RESTORE);
+            SetForegroundWindow(item.firstWindow);
+        }
+        return;
+    }
+
+    if (item.target.rfind(L"shell:", 0) == 0) {
+        ShellExecuteW(nullptr, L"open", L"explorer.exe", item.target.c_str(),
+                      nullptr, SW_SHOWNORMAL);
+    } else {
+        ShellExecuteW(nullptr, L"open", item.target.c_str(), nullptr, nullptr,
+                      SW_SHOWNORMAL);
+    }
+}
+
+void ShowItemMenu(int index, POINT screenPt) {
+    DockItem item;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (index < 0 || index >= static_cast<int>(g_items.size())) return;
+        item = g_items[index];
+    }
+
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    AppendMenuW(menu, MF_STRING, 1, item.isTrash ? L"Open Trash" : L"Open");
+    if (item.isTrash) {
+        AppendMenuW(menu, MF_STRING, 2, L"Empty Trash");
+    } else if (item.running && item.firstWindow) {
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, 3, L"Quit");
+    }
+
+    SetForegroundWindow(g_hDock);
+    const int choice =
+        TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+                       screenPt.x, screenPt.y, 0, g_hDock, nullptr);
+    DestroyMenu(menu);
+
+    switch (choice) {
+        case 1:
+            ActivateItem(index);
+            break;
+        case 2:
+            SHEmptyRecycleBinW(nullptr, nullptr, 0);
+            break;
+        case 3:
+            if (IsWindow(item.firstWindow)) {
+                PostMessageW(item.firstWindow, WM_CLOSE, 0, 0);
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+BOOL CALLBACK HideSecondaryTrayProc(HWND hWnd, LPARAM lParam) {
+    wchar_t cls[64] = {};
+    if (GetClassNameW(hWnd, cls, 64) &&
+        _wcsicmp(cls, L"Shell_SecondaryTrayWnd") == 0) {
+        ShowWindow(hWnd, lParam ? SW_HIDE : SW_SHOW);
+    }
+    return TRUE;
+}
+
+void SetTaskbarHidden(bool hide) {
+    HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (tray) ShowWindow(tray, hide ? SW_HIDE : SW_SHOW);
+    EnumWindows(HideSecondaryTrayProc, hide ? 1 : 0);
+    g_taskbarHidden = hide;
+}
+
+// macOS gets out of the way for a fullscreen window; so does this.
+bool ForegroundIsFullscreen() {
+    HWND fg = GetForegroundWindow();
+    if (!fg || fg == g_hDock) return false;
+    wchar_t cls[64] = {};
+    if (GetClassNameW(fg, cls, 64)) {
+        if (_wcsicmp(cls, L"Progman") == 0 || _wcsicmp(cls, L"WorkerW") == 0) {
+            return false;
+        }
+    }
+    RECT wr = {};
+    if (!GetWindowRect(fg, &wr)) return false;
+    HMONITOR monitor = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info = {sizeof(info)};
+    if (!GetMonitorInfoW(monitor, &info)) return false;
+    return wr.left <= info.rcMonitor.left && wr.top <= info.rcMonitor.top &&
+           wr.right >= info.rcMonitor.right && wr.bottom >= info.rcMonitor.bottom;
+}
+
+LRESULT CALLBACK DockProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_MOUSEMOVE: {
+            g_mouseX = GET_X_LPARAM(lParam);
+            if (!g_hovering) {
+                g_hovering = true;
+                TRACKMOUSEEVENT track = {sizeof(track)};
+                track.dwFlags = TME_LEAVE;
+                track.hwndTrack = hWnd;
+                TrackMouseEvent(&track);
+            }
+            Repaint();
+            return 0;
+        }
+        case WM_MOUSELEAVE: {
+            g_hovering = false;
+            g_mouseX = -100000;
+            Repaint();
+            return 0;
+        }
+        case WM_LBUTTONUP: {
+            const Layout lay = CurrentLayout();
+            std::vector<DockItem> items;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                items = g_items;
+            }
+            const int index = HitTestItem(items, lay, GET_X_LPARAM(lParam),
+                                          GET_Y_LPARAM(lParam));
+            if (index >= 0) ActivateItem(index);
+            return 0;
+        }
+        case WM_RBUTTONUP: {
+            const Layout lay = CurrentLayout();
+            std::vector<DockItem> items;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                items = g_items;
+            }
+            const int index = HitTestItem(items, lay, GET_X_LPARAM(lParam),
+                                          GET_Y_LPARAM(lParam));
+            if (index >= 0) {
+                POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+                ClientToScreen(hWnd, &pt);
+                ShowItemMenu(index, pt);
+            }
+            return 0;
+        }
+        case WM_TIMER: {
+            if (wParam == kTimerRunning) {
+                RefreshRunningState();
+                const bool hide = ForegroundIsFullscreen();
+                ShowWindow(hWnd, hide ? SW_HIDE : SW_SHOWNOACTIVATE);
+                if (!hide) Repaint();
+            } else if (wParam == kTimerTaskbar) {
+                DockSettings cfg;
+                {
+                    std::lock_guard<std::mutex> lock(g_mutex);
+                    cfg = g_cfg;
+                }
+                // explorer puts the taskbar back after a resolution change or a
+                // shell restart, so keep putting it away again.
+                if (cfg.enabled) {
+                    HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
+                    if (tray && IsWindowVisible(tray)) SetTaskbarHidden(true);
+                    SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
+            }
+            return 0;
+        }
+        case WM_DISPLAYCHANGE:
+        case WM_SETTINGCHANGE: {
+            PositionDock();
+            return 0;
+        }
+        case WM_DOCK_REBUILD: {
+            BuildItems();
+            RefreshRunningState();
+            PositionDock();
+            return 0;
+        }
+        case WM_DOCK_APPBAR: {
+            if (wParam == ABN_POSCHANGED) PositionDock();
+            return 0;
+        }
+        case WM_DOCK_SHUTDOWN: {
+            PostQuitMessage(0);
+            return 0;
+        }
+        default:
+            break;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+DWORD WINAPI DockThread(LPVOID) {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+    WNDCLASSEXW wc = {sizeof(wc)};
+    wc.lpfnWndProc = DockProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = kDockClass;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    RegisterClassExW(&wc);
+
+    g_hDock = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        kDockClass, L"Dock", WS_POPUP, 0, 0, 10, 10, nullptr, nullptr,
+        wc.hInstance, nullptr);
+    if (!g_hDock) {
+        CoUninitialize();
+        return 0;
+    }
+
+    BuildItems();
+    RefreshRunningState();
+
+    DockSettings cfg;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        cfg = g_cfg;
+    }
+    if (cfg.enabled) SetTaskbarHidden(true);
+
+    PositionDock();
+    ShowWindow(g_hDock, SW_SHOWNOACTIVATE);
+    Repaint();
+
+    SetTimer(g_hDock, kTimerRunning, 900, nullptr);
+    SetTimer(g_hDock, kTimerTaskbar, 2500, nullptr);
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.hwnd == nullptr) {
+            if (msg.message == WM_DOCK_SHUTDOWN) break;
+            if (msg.message == WM_DOCK_REBUILD) {
+                SendMessageW(g_hDock, WM_DOCK_REBUILD, 0, 0);
+                continue;
+            }
+        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    KillTimer(g_hDock, kTimerRunning);
+    KillTimer(g_hDock, kTimerTaskbar);
+
+    if (g_appBarRegistered) {
+        APPBARDATA abd = {};
+        abd.cbSize = sizeof(abd);
+        abd.hWnd = g_hDock;
+        SHAppBarMessage(ABM_REMOVE, &abd);
+        g_appBarRegistered = false;
+    }
+    if (g_taskbarHidden) SetTaskbarHidden(false);
+
+    DestroyWindow(g_hDock);
+    g_hDock = nullptr;
+    UnregisterClassW(kDockClass, wc.hInstance);
+    CoUninitialize();
+    return 0;
+}
+
+// Only one process may own the dock, and explorer is the one that lives as long
+// as the session does.
+bool ThisProcessHostsTheDock() {
+    wchar_t path[MAX_PATH] = {};
+    if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return false;
+    PCWSTR leaf = PathFindFileNameW(path);
+    return leaf && _wcsicmp(leaf, L"explorer.exe") == 0;
+}
+
+}  // namespace macdock
