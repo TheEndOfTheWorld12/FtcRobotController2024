@@ -1,17 +1,15 @@
 # ============================================================================
 # Mac Dock for Windows 11  —  settings for "Windows 11 Taskbar Styler" v1.10
 #
-# THIS FILE ASSUMES A 72px TASKBAR. Install the mod "Taskbar height and icon
-# size" first and set:
-#     TaskbarHeight       = 72
-#     IconSize            = 46
-#     TaskbarButtonWidth  = 54
-# The Styler cannot resize the taskbar window, so without that mod the dock is
-# stuck at 48px tall and the icons stay small. The numbers below are matched to
-# those three, so the two mods agree instead of fighting.
+# Self-contained: the dock sets its own height. Do NOT also install the
+# "Taskbar height and icon size" mod — the OS26 theme authors warn that it
+# fights this kind of config and pins the bar to the screen edge.
 #
-# Then: Windhawk -> Windows 11 Taskbar Styler -> Settings -> Textual mode ->
-# Ctrl+A, Delete, paste this, Save settings.
+# Windhawk -> Windows 11 Taskbar Styler -> Settings -> Textual mode ->
+# Ctrl+A, Delete, paste this, Save settings. Theme must read "(none)".
+#
+# Vertical budget on the 76px frame:
+#   4 top margin + 1 border + 62 button + 1 border + 6 bottom margin = 74
 # ============================================================================
 
 theme: ""
@@ -47,13 +45,13 @@ controlStyles:
       - 'Width={{taskbarDock==`vertical`?skip():`Auto`}}'
       - 'MinWidth=64'
       - 'MaxWidth={{containerGridWidth>0?containerGridWidth:`Infinity`}}'
+      - 'Height={{taskbarDock==`vertical`?skip():76}}'
+      - 'MaxHeight={{taskbarDock==`vertical`?skip():76}}'
       - 'Transitions:=<TransitionCollection><RepositionThemeTransition IsStaggeringEnabled="False"/></TransitionCollection>'
 
   # -- 2. The dock slab ----------------------------------------------------
   # Drop the full-width taskbar background and put the glass, border and
   # corner radius directly on the dock's own grid.
-  # Vertical budget on a 72px taskbar:
-  #   4 top margin + 1 border + 58 button + 1 border + 6 bottom margin = 70
   - target: 'Taskbar.TaskbarBackground#BackgroundControl'
     styles:
       - 'Visibility=Collapsed'
@@ -63,8 +61,8 @@ controlStyles:
       - 'Background:=<WindhawkBlur BlurAmount="40" TintColor="#2C2C2E" TintOpacity="0.45" TintLuminosityOpacity="0.5" NoiseOpacity="0" FallbackColor="#BF2C2C2E"/>'
       - 'BorderBrush=#33FFFFFF'
       - 'BorderThickness=1'
-      - 'CornerRadius=18'
-      - 'Padding=7,0,7,0'
+      - 'CornerRadius=20'
+      - 'Padding=8,0,8,0'
       - 'Margin=0,4,0,6'
 
   - target: 'Rectangle#BackgroundStroke'
@@ -72,23 +70,23 @@ controlStyles:
       - 'Visibility=Collapsed'
 
   # -- 3. Icon size and spacing -------------------------------------------
-  # 46px icon on a 54px pitch gives the Dock's 8px gaps. The icon is lifted 7px
-  # so the running dot has its own lane underneath instead of touching it.
+  # 48px icon on a 56px pitch gives the Dock's 8px gaps. The icon is lifted so
+  # the running dot has its own lane underneath instead of touching it.
   - target: 'Grid#IconPanel > Image#Icon, Taskbar.TaskListLabeledButtonPanel#IconPanel > Image#Icon'
     styles:
-      - 'Height=46'
-      - 'Width=46'
-      - 'Margin=0,0,0,7'
+      - 'Height=48'
+      - 'Width=48'
+      - 'Margin=0,0,0,12'
 
   - target: 'Taskbar.TaskListButtonPanel'
     styles:
-      - 'Width=54'
-      - 'Height=58'
+      - 'Width=56'
+      - 'Height=62'
 
   - target: 'Grid#IconPanel, Taskbar.TaskListLabeledButtonPanel'
     styles:
-      - 'Width=54'
-      - 'Height=58'
+      - 'Width=56'
+      - 'Height=62'
 
   - target: 'Taskbar.TaskListButton'
     styles:
