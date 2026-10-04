@@ -371,7 +371,7 @@ Gdiplus::Color FaceColour(int index, bool active) {
 
 void DrawGlyph(Gdiplus::Graphics& g, int index, const Gdiplus::RectF& circle) {
     // The marks only appear on hover, and are drawn dark against the face.
-    Gdiplus::Pen pen(Gdiplus::Color(190, 40, 20, 10), std::max(1.0f, circle.Width / 10.0f));
+    Gdiplus::Pen pen(Gdiplus::Color(190, 40, 20, 10), (std::max)(1.0f, circle.Width / 10.0f));
     pen.SetStartCap(Gdiplus::LineCapRound);
     pen.SetEndCap(Gdiplus::LineCapRound);
 
