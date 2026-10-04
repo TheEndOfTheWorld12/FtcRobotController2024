@@ -1,15 +1,23 @@
 # ============================================================================
 # Mac Dock for Windows 11  —  settings for "Windows 11 Taskbar Styler" v1.10
 #
-# Self-contained: the dock sets its own height. Do NOT also install the
-# "Taskbar height and icon size" mod — the OS26 theme authors warn that it
-# fights this kind of config and pins the bar to the screen edge.
+# Sized for the stock 48px taskbar. The Styler cannot make the taskbar WINDOW
+# taller - setting Taskbar.TaskbarFrame.Height only makes the frame overflow
+# the window and clip - so every number below fits inside 48px:
+#
+#   1 top margin + 1 border + 42 button + 1 border + 2 bottom margin = 47
+#
+# WANT CHUNKIER, MAC-SIZED ICONS?
+#   Install "Taskbar height and icon size" and set TaskbarHeight 72,
+#   IconSize 46, TaskbarButtonWidth 56. Then change four numbers here:
+#     - Grid#IconPanel / Taskbar.TaskListButtonPanel : Width 56, Height 62
+#     - Image#Icon                                   : Height/Width 46,
+#                                                      Margin 0,0,0,12
+#   That mod conflicts with themes that set their own frame height. This
+#   config deliberately sets none, so the two do not fight.
 #
 # Windhawk -> Windows 11 Taskbar Styler -> Settings -> Textual mode ->
 # Ctrl+A, Delete, paste this, Save settings. Theme must read "(none)".
-#
-# Vertical budget on the 76px frame:
-#   4 top margin + 1 border + 62 button + 1 border + 6 bottom margin = 74
 # ============================================================================
 
 theme: ""
@@ -45,8 +53,6 @@ controlStyles:
       - 'Width={{taskbarDock==`vertical`?skip():`Auto`}}'
       - 'MinWidth=64'
       - 'MaxWidth={{containerGridWidth>0?containerGridWidth:`Infinity`}}'
-      - 'Height={{taskbarDock==`vertical`?skip():76}}'
-      - 'MaxHeight={{taskbarDock==`vertical`?skip():76}}'
       - 'Transitions:=<TransitionCollection><RepositionThemeTransition IsStaggeringEnabled="False"/></TransitionCollection>'
 
   # -- 2. The dock slab ----------------------------------------------------
@@ -61,32 +67,32 @@ controlStyles:
       - 'Background:=<WindhawkBlur BlurAmount="40" TintColor="#2C2C2E" TintOpacity="0.45" TintLuminosityOpacity="0.5" NoiseOpacity="0" FallbackColor="#BF2C2C2E"/>'
       - 'BorderBrush=#33FFFFFF'
       - 'BorderThickness=1'
-      - 'CornerRadius=20'
-      - 'Padding=8,0,8,0'
-      - 'Margin=0,4,0,6'
+      - 'CornerRadius=12'
+      - 'Padding=14,0,14,0'
+      - 'Margin=0,1,0,2'
 
   - target: 'Rectangle#BackgroundStroke'
     styles:
       - 'Visibility=Collapsed'
 
   # -- 3. Icon size and spacing -------------------------------------------
-  # 48px icon on a 56px pitch gives the Dock's 8px gaps. The icon is lifted so
-  # the running dot has its own lane underneath instead of touching it.
+  # 30px icon on a 40px pitch gives 10px gaps. The icon is lifted 10px so the
+  # running dot has its own lane underneath instead of touching it.
   - target: 'Grid#IconPanel > Image#Icon, Taskbar.TaskListLabeledButtonPanel#IconPanel > Image#Icon'
     styles:
-      - 'Height=48'
-      - 'Width=48'
-      - 'Margin=0,0,0,12'
+      - 'Height=30'
+      - 'Width=30'
+      - 'Margin=0,0,0,10'
 
   - target: 'Taskbar.TaskListButtonPanel'
     styles:
-      - 'Width=56'
-      - 'Height=62'
+      - 'Width=40'
+      - 'Height=42'
 
   - target: 'Grid#IconPanel, Taskbar.TaskListLabeledButtonPanel'
     styles:
-      - 'Width=56'
-      - 'Height=62'
+      - 'Width=40'
+      - 'Height=42'
 
   - target: 'Taskbar.TaskListButton'
     styles:
@@ -127,10 +133,10 @@ controlStyles:
   # that is not running. Same dot whether the app is focused or not.
   - target: 'Rectangle#RunningIndicator'
     styles:
-      - 'Width=5'
-      - 'Height=5'
-      - 'RadiusX=2.5'
-      - 'RadiusY=2.5'
+      - 'Width=4'
+      - 'Height=4'
+      - 'RadiusX=2'
+      - 'RadiusY=2'
       - 'StrokeThickness=0'
       - 'HorizontalAlignment=Center'
       - 'VerticalAlignment=Bottom'
@@ -138,9 +144,9 @@ controlStyles:
 
   - target: 'Grid#IconPanel@RunningIndicatorStates > Rectangle#RunningIndicator, Taskbar.TaskListLabeledButtonPanel@RunningIndicatorStates > Rectangle#RunningIndicator'
     styles:
-      - 'Width@NoRunningIndicator=5'
-      - 'Width@InactiveRunningIndicator=5'
-      - 'Width@ActiveRunningIndicator=5'
+      - 'Width@NoRunningIndicator=4'
+      - 'Width@InactiveRunningIndicator=4'
+      - 'Width@ActiveRunningIndicator=4'
       - 'Fill@NoRunningIndicator=Transparent'
       - 'Fill@InactiveRunningIndicator=#E6FFFFFF'
       - 'Fill@InactiveRunningIndicatorPointerOver=#E6FFFFFF'

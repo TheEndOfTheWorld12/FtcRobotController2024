@@ -21,13 +21,16 @@ This hides Start, Search, Task View, Widgets, Copilot and the entire system
 tray, then turns what is left into a centred, shrink-to-fit blurred slab with
 48px icons and macOS running dots.
 
-**Check:** the taskbar should now be a floating rounded bar about 66px tall,
-centred, with only app icons on it.
+**Check:** the taskbar should now be a floating rounded bar, centred, with only
+app icons on it and nothing clipped.
 
-**If the bar did not get taller** — if it is still a thin 48px strip and the
-icons look clipped — the config is asking for a frame height that your build
-will not grant. Tell me and I will rework it; do not install the "Taskbar
-height and icon size" mod to compensate, it fights this config.
+The config is sized for the stock 48px taskbar, because the Styler cannot make
+the taskbar *window* taller — setting a frame height only makes the frame
+overflow the window and clip. For chunkier, Mac-sized icons, install **Taskbar
+height and icon size** (`TaskbarHeight` 72, `IconSize` 46, `TaskbarButtonWidth`
+56) and change the four numbers listed at the top of the config file. That mod
+only conflicts with themes that set their own frame height; this config
+deliberately sets none.
 
 > **What you lose here:** the clock, date, battery, network and volume
 > indicators all live in the system tray, and the tray is gone. On macOS those
