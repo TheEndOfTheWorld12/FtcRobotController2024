@@ -118,6 +118,48 @@ registry.
   $description: >-
     Puts the Recycle Bin at the right end of the dock, after a separator. Ignored
     when you have listed your own dock items.
+- menuBarEnabled: true
+  $name: Enable the menu bar
+  $description: >-
+    A strip across the top of the screen with the Apple-menu button, the active
+    app's name and its menus on the left, and the clock and battery on the right.
+- menuBarHeight: 26
+  $name: Menu bar height (px)
+  $description: From 18 to 48.
+- menuBarTint: "1C1C1E"
+  $name: Menu bar colour (RRGGBB)
+  $description: Six hex digits with no leading hash.
+- menuBarOpacity: 70
+  $name: Menu bar opacity (%)
+  $description: From 10 to 100.
+- menuBarLogo: "\u2318"
+  $name: Apple-menu symbol
+  $description: >-
+    Drawn at the far left; clicking it opens the Start menu. The Apple logo is
+    not in any Windows font, so this defaults to the command symbol. Paste
+    whatever you like here.
+- menuBarAppName: true
+  $name: Show the active app's name
+  $description: In bold, next to the symbol, the way macOS does.
+- menuBarAppMenus: true
+  $name: Show the active app's menus
+  $description: >-
+    Lifts File, Edit, View and the rest out of the window and onto the top bar,
+    and they work. Only apps that use a real Windows menu bar have menus to
+    lift; anything that draws its own shows its name only.
+- menuBarClock: true
+  $name: Show the clock
+  $description: Date and time at the right-hand end.
+- menuBar24Hour: false
+  $name: 24-hour clock
+- menuBarBattery: true
+  $name: Show the battery
+  $description: Percentage, with a bolt when it is charging. Hidden on a desktop.
+- menuBarReserveSpace: true
+  $name: Keep windows clear of the menu bar
+  $description: >-
+    Reserves the strip so maximised windows start below it. Turn this off to let
+    windows go full height behind it.
 - trafficLightsEnabled: true
   $name: Enable traffic-light buttons
   $description: >-

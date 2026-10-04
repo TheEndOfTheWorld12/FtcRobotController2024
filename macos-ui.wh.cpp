@@ -31,6 +31,14 @@ has to live in its own region-clipped window, and that window cannot be resized
 smoothly while magnification is spreading the icons, so it would judder on every
 pointer move. Over a wallpaper the difference is small; the judder is not.
 
+**The menu bar.** A strip across the top: the Apple-menu button (it opens the
+Start menu), the active app's name in bold, that app's menus lifted out of its
+window, and the clock and battery on the right. Menu handles are USER objects,
+so another process's menu bar can be read and its submenus dropped from up
+here - which means the menus genuinely work for apps that use a real Windows
+menu bar. Apps that draw their own menus show their name only, which is what
+macOS shows for a menu-less app too.
+
 **Traffic lights.** The three macOS circles on the left of every standard title
 bar, with the Windows caption buttons taken off the right.
 
@@ -39,9 +47,11 @@ bar, with the Windows caption buttons taken off the right.
 * **Apps that draw their own title bar** — Chrome, Edge, Firefox, VS Code,
   Office, Discord, Steam — keep their own buttons. Their title bar is their own
   UI and nothing outside the app can reach it.
-* **No menu bar.** A top strip with the Apple menu is a separate problem; the
-  Dynamic Island mod already shows the clock and battery.
 * **Dock icons cannot be dragged to reorder.** Set the order in `Dock items`.
+* **No window animations.** Opening, closing and minimising still use the
+  Windows ones. Those are a different kind of problem - they need the window
+  hidden and a snapshot animated in its place - and two mature mods already do
+  it: *MacOS Minimize Animation* and *Windows Animations*.
 
 ## Getting the dock you want
 
@@ -118,6 +128,48 @@ registry.
   $description: >-
     Puts the Recycle Bin at the right end of the dock, after a separator. Ignored
     when you have listed your own dock items.
+- menuBarEnabled: true
+  $name: Enable the menu bar
+  $description: >-
+    A strip across the top of the screen with the Apple-menu button, the active
+    app's name and its menus on the left, and the clock and battery on the right.
+- menuBarHeight: 26
+  $name: Menu bar height (px)
+  $description: From 18 to 48.
+- menuBarTint: "1C1C1E"
+  $name: Menu bar colour (RRGGBB)
+  $description: Six hex digits with no leading hash.
+- menuBarOpacity: 70
+  $name: Menu bar opacity (%)
+  $description: From 10 to 100.
+- menuBarLogo: "⌘"
+  $name: Apple-menu symbol
+  $description: >-
+    Drawn at the far left; clicking it opens the Start menu. The Apple logo is
+    not in any Windows font, so this defaults to the command symbol. Paste
+    whatever you like here.
+- menuBarAppName: true
+  $name: Show the active app's name
+  $description: In bold, next to the symbol, the way macOS does.
+- menuBarAppMenus: true
+  $name: Show the active app's menus
+  $description: >-
+    Lifts File, Edit, View and the rest out of the window and onto the top bar,
+    and they work. Only apps that use a real Windows menu bar have menus to
+    lift; anything that draws its own shows its name only.
+- menuBarClock: true
+  $name: Show the clock
+  $description: Date and time at the right-hand end.
+- menuBar24Hour: false
+  $name: 24-hour clock
+- menuBarBattery: true
+  $name: Show the battery
+  $description: Percentage, with a bolt when it is charging. Hidden on a desktop.
+- menuBarReserveSpace: true
+  $name: Keep windows clear of the menu bar
+  $description: >-
+    Reserves the strip so maximised windows start below it. Turn this off to let
+    windows go full height behind it.
 - trafficLightsEnabled: true
   $name: Enable traffic-light buttons
   $description: >-
@@ -147,7 +199,7 @@ registry.
   $description: >-
     Leaves WS_SYSMENU alone, so Alt+Space and the title bar right-click menu keep
     working - but the Windows caption buttons stay on the right as well.
-- excludedClasses: ["Chrome_WidgetWin_1", "Chrome_WidgetWin_0", "MozillaWindowClass", "Windhawk.DynamicIslandForWindows"]
+- excludedClasses: ["Chrome_WidgetWin_1", "Chrome_WidgetWin_0", "MozillaWindowClass"]
   $name: Excluded window classes
   $description: >-
     Windows of these classes are never given traffic lights. The defaults are the
@@ -817,7 +869,6 @@ DWORD g_threadId = 0;
 HWND g_hDock = nullptr;
 bool g_appBarRegistered = false;
 bool g_taskbarHidden = false;
-bool g_dockHidden = false;
 
 int g_mouseX = -100000;  // dock-client coordinates; far away means "no hover"
 bool g_hovering = false;
@@ -1521,7 +1572,6 @@ void ShowItemMenu(int index, POINT screenPt) {
     const int choice =
         TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
                        screenPt.x, screenPt.y, 0, g_hDock, nullptr);
-    PostMessageW(g_hDock, WM_NULL, 0, 0);
     DestroyMenu(menu);
 
     switch (choice) {
@@ -1626,35 +1676,23 @@ LRESULT CALLBACK DockProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         case WM_TIMER: {
             if (wParam == kTimerRunning) {
-                bool enabled = false;
-                {
-                    std::lock_guard<std::mutex> lock(g_mutex);
-                    enabled = g_cfg.enabled;
-                }
                 RefreshRunningState();
-                const bool hide = !enabled || ForegroundIsFullscreen();
-                if (hide != g_dockHidden) {
-                    g_dockHidden = hide;
-                    ShowWindow(hWnd, hide ? SW_HIDE : SW_SHOWNOACTIVATE);
-                }
+                const bool hide = ForegroundIsFullscreen();
+                ShowWindow(hWnd, hide ? SW_HIDE : SW_SHOWNOACTIVATE);
                 if (!hide) Repaint();
             } else if (wParam == kTimerTaskbar) {
-                bool enabled = false;
+                DockSettings cfg;
                 {
                     std::lock_guard<std::mutex> lock(g_mutex);
-                    enabled = g_cfg.enabled;
+                    cfg = g_cfg;
                 }
-                if (enabled) {
-                    // explorer puts the taskbar back after a resolution change
-                    // or a shell restart, so keep putting it away again.
+                // explorer puts the taskbar back after a resolution change or a
+                // shell restart, so keep putting it away again.
+                if (cfg.enabled) {
                     HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
                     if (tray && IsWindowVisible(tray)) SetTaskbarHidden(true);
                     SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0,
                                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                } else if (g_taskbarHidden) {
-                    // Switched off in settings: give the taskbar straight back
-                    // rather than leaving the screen with neither bar.
-                    SetTaskbarHidden(false);
                 }
             }
             return 0;
@@ -1763,6 +1801,582 @@ bool ThisProcessHostsTheDock() {
 
 }  // namespace macdock
 
+// =====================  the menu bar  ======================================
+// Same idea as the dock: our own layered window rather than anything hooked.
+// The one borrowed thing is the active window's menu - HMENU handles are USER
+// objects, so GetMenuItemCount and GetMenuStringW read another process's menu
+// bar, and TrackPopupMenu will drop its submenus. Classic Win32 apps therefore
+// get real working menus up top; apps that draw their own menus (anything
+// Electron, Chromium or XAML) show their name only, which is all macOS shows
+// for an app with no menus either.
+
+namespace macmenu {
+
+struct MenuSettings {
+    bool enabled = true;
+    int height = 26;
+    COLORREF tint = RGB(0x1C, 0x1C, 0x1E);
+    int opacityPct = 70;
+    std::wstring logo = L"⌘";
+    bool showAppName = true;
+    bool showAppMenus = true;
+    bool showClock = true;
+    bool use24Hour = false;
+    bool showBattery = true;
+    bool reserveSpace = true;
+};
+
+struct MenuEntry {
+    std::wstring text;
+    int submenuIndex = -1;  // -1 marks the logo
+    float left = 0.0f;
+    float right = 0.0f;
+};
+
+std::mutex g_mutex;
+MenuSettings g_cfg;
+
+std::atomic<bool> g_unloading = false;
+HANDLE g_thread = nullptr;
+DWORD g_threadId = 0;
+HWND g_hBar = nullptr;
+bool g_appBarRegistered = false;
+
+HWND g_activeWindow = nullptr;
+std::wstring g_activeName;
+std::vector<MenuEntry> g_appMenus;  // the active app's menu titles, as read
+std::vector<MenuEntry> g_entries;   // what is actually on the bar, with x spans
+int g_hotEntry = -1;
+
+constexpr PCWSTR kMenuClass = L"MacOSUI.MenuBar";
+constexpr UINT WM_MENU_SHUTDOWN = WM_APP + 21;
+constexpr UINT WM_MENU_REBUILD = WM_APP + 22;
+constexpr UINT WM_MENU_APPBAR = WM_APP + 23;
+constexpr UINT_PTR kTimerTick = 1;
+
+// ------------------------------------------------------------- active app --
+
+std::wstring StripAccelerators(const std::wstring& in) {
+    std::wstring out;
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size(); ++i) {
+        if (in[i] == L'&') {
+            if (i + 1 < in.size() && in[i + 1] == L'&') {
+                out.push_back(L'&');
+                ++i;
+            }
+            continue;
+        }
+        if (in[i] == L'\t') break;  // drop the accelerator column
+        out.push_back(in[i]);
+    }
+    return out;
+}
+
+std::wstring ProductNameOf(HWND hWnd) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hWnd, &pid);
+    if (!pid) return {};
+    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!proc) return {};
+    wchar_t path[MAX_PATH] = {};
+    DWORD size = MAX_PATH;
+    const bool got = QueryFullProcessImageNameW(proc, 0, path, &size) != 0;
+    CloseHandle(proc);
+    if (!got) return {};
+
+    // Prefer the shell's friendly name, which is what macOS shows.
+    SHFILEINFOW sfi = {};
+    if (SHGetFileInfoW(path, 0, &sfi, sizeof(sfi), SHGFI_DISPLAYNAME)) {
+        std::wstring name(sfi.szDisplayName);
+        const size_t dot = name.rfind(L'.');
+        if (dot != std::wstring::npos) name.erase(dot);
+        if (!name.empty()) return name;
+    }
+    PCWSTR leaf = PathFindFileNameW(path);
+    return leaf ? std::wstring(leaf) : std::wstring();
+}
+
+bool IsOurWindow(HWND hWnd) {
+    wchar_t cls[64] = {};
+    if (!GetClassNameW(hWnd, cls, 64)) return false;
+    return _wcsicmp(cls, kMenuClass) == 0 || _wcsicmp(cls, macdock::kDockClass) == 0;
+}
+
+// Rebuilds the name and the menu titles for whatever is in front. Returns true
+// when anything changed, so the bar only repaints when it has to.
+bool RefreshActiveApp() {
+    HWND fg = GetForegroundWindow();
+    if (fg) fg = GetAncestor(fg, GA_ROOT);
+    if (fg && IsOurWindow(fg)) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        fg = g_activeWindow;  // clicking our bar must not blank the app name
+    }
+
+    std::wstring name;
+    std::vector<MenuEntry> entries;
+
+    if (fg && fg != g_hBar) {
+        name = ProductNameOf(fg);
+
+        bool wantMenus = false;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            wantMenus = g_cfg.showAppMenus;
+        }
+        if (wantMenus) {  // lock released before the cross-process menu reads
+            HMENU menu = GetMenu(fg);
+            if (menu) {
+                const int count = GetMenuItemCount(menu);
+                for (int i = 0; i < count && i < 12; ++i) {
+                    wchar_t buffer[128] = {};
+                    if (GetMenuStringW(menu, i, buffer, 128, MF_BYPOSITION) <= 0) {
+                        continue;
+                    }
+                    MenuEntry entry;
+                    entry.text = StripAccelerators(buffer);
+                    entry.submenuIndex = i;
+                    if (!entry.text.empty()) entries.push_back(std::move(entry));
+                }
+            }
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    const bool changed = fg != g_activeWindow || name != g_activeName ||
+                         entries.size() != g_appMenus.size();
+    g_activeWindow = fg;
+    g_activeName = std::move(name);
+    g_appMenus = std::move(entries);
+    return changed;
+}
+
+// --------------------------------------------------------- right-hand side --
+
+std::wstring StatusText(const MenuSettings& cfg) {
+    std::wstring out;
+
+    if (cfg.showBattery) {
+        SYSTEM_POWER_STATUS power = {};
+        if (GetSystemPowerStatus(&power) && power.BatteryLifePercent <= 100) {
+            out += std::to_wstring(power.BatteryLifePercent);
+            out += L"%";
+            if (power.ACLineStatus == 1) out += L" ⚡";
+            out += L"    ";
+        }
+    }
+
+    if (cfg.showClock) {
+        wchar_t date[64] = {};
+        wchar_t time[64] = {};
+        GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, nullptr, L"ddd d MMM", date,
+                        64, nullptr);
+        GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, 0, nullptr,
+                        cfg.use24Hour ? L"HH:mm" : L"h:mm tt", time, 64);
+        out += date;
+        out += L"  ";
+        out += time;
+    }
+    return out;
+}
+
+// ----------------------------------------------------------------- drawing --
+
+void PaintBar(HWND hWnd) {
+    MenuSettings cfg;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        cfg = g_cfg;
+    }
+
+    RECT wr = {};
+    if (!GetWindowRect(hWnd, &wr)) return;
+    const int w = wr.right - wr.left;
+    const int h = wr.bottom - wr.top;
+    if (w <= 0 || h <= 0) return;
+
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    void* bits = nullptr;
+    HDC screen = GetDC(nullptr);
+    HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!dib) {
+        ReleaseDC(nullptr, screen);
+        return;
+    }
+    HDC mem = CreateCompatibleDC(screen);
+    HGDIOBJ oldBmp = SelectObject(mem, dib);
+
+    {
+        Gdiplus::Bitmap surface(w, h, w * 4, PixelFormat32bppPARGB,
+                                static_cast<BYTE*>(bits));
+        Gdiplus::Graphics g(&surface);
+        g.Clear(Gdiplus::Color(0, 0, 0, 0));
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+
+        const BYTE alpha =
+            static_cast<BYTE>(macdock::ClampI(cfg.opacityPct, 10, 100) * 255 / 100);
+        Gdiplus::SolidBrush back(Gdiplus::Color(alpha, GetRValue(cfg.tint),
+                                                GetGValue(cfg.tint),
+                                                GetBValue(cfg.tint)));
+        g.FillRectangle(&back, 0, 0, w, h);
+
+        Gdiplus::FontFamily family(L"Segoe UI");
+        if (!family.IsAvailable()) {
+            SelectObject(mem, oldBmp);
+            DeleteDC(mem);
+            DeleteObject(dib);
+            ReleaseDC(nullptr, screen);
+            return;
+        }
+        Gdiplus::Font regular(&family, 12.0f, Gdiplus::FontStyleRegular,
+                              Gdiplus::UnitPixel);
+        Gdiplus::Font bold(&family, 12.0f, Gdiplus::FontStyleBold,
+                           Gdiplus::UnitPixel);
+        Gdiplus::SolidBrush ink(Gdiplus::Color(240, 255, 255, 255));
+        Gdiplus::SolidBrush hot(Gdiplus::Color(255, 255, 255, 255));
+        Gdiplus::SolidBrush hotBack(Gdiplus::Color(48, 255, 255, 255));
+
+        Gdiplus::StringFormat format;
+        format.SetAlignment(Gdiplus::StringAlignmentNear);
+        format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+
+        auto measure = [&](const std::wstring& text, Gdiplus::Font& font) {
+            Gdiplus::RectF bounds;
+            g.MeasureString(text.c_str(), -1, &font, Gdiplus::PointF(0, 0),
+                            &format, &bounds);
+            return bounds.Width;
+        };
+
+        const float padX = 10.0f;
+        float x = 8.0f;
+
+        // Logo, then app name, then that app's menu titles.
+        std::vector<MenuEntry> entries;
+        std::wstring appName;
+        {
+            std::lock_guard<std::mutex> lock(macmenu::g_mutex);
+            entries = g_appMenus;
+            appName = g_activeName;
+        }
+
+        std::vector<MenuEntry> laid;
+        {
+            MenuEntry logo;
+            logo.text = cfg.logo;
+            logo.submenuIndex = -1;
+            logo.left = x;
+            logo.right = x + measure(logo.text, bold) + padX * 2;
+            laid.push_back(logo);
+            x = logo.right;
+        }
+        if (cfg.showAppName && !appName.empty()) {
+            MenuEntry name;
+            name.text = appName;
+            name.submenuIndex = -2;  // not clickable
+            name.left = x;
+            name.right = x + measure(name.text, bold) + padX * 2;
+            laid.push_back(name);
+            x = name.right;
+        }
+        for (auto& entry : entries) {
+            entry.left = x;
+            entry.right = x + measure(entry.text, regular) + padX * 2;
+            laid.push_back(entry);
+            x = entry.right;
+        }
+
+        for (size_t i = 0; i < laid.size(); ++i) {
+            const MenuEntry& entry = laid[i];
+            const bool isHot = (static_cast<int>(i) == g_hotEntry) &&
+                               entry.submenuIndex != -2;
+            if (isHot) {
+                g.FillRectangle(&hotBack, entry.left, 2.0f,
+                                entry.right - entry.left, h - 4.0f);
+            }
+            Gdiplus::RectF box(entry.left + padX, 0.0f,
+                               entry.right - entry.left - padX, static_cast<float>(h));
+            const bool heavy = entry.submenuIndex < 0;
+            g.DrawString(entry.text.c_str(), -1, heavy ? &bold : &regular, box,
+                         &format, isHot ? &hot : &ink);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(macmenu::g_mutex);
+            g_entries = laid;
+        }
+
+        const std::wstring status = StatusText(cfg);
+        if (!status.empty()) {
+            const float width = measure(status, regular);
+            Gdiplus::RectF box(w - width - 14.0f, 0.0f, width + 6.0f,
+                               static_cast<float>(h));
+            g.DrawString(status.c_str(), -1, &regular, box, &format, &ink);
+        }
+    }
+
+    POINT src = {0, 0};
+    SIZE size = {w, h};
+    POINT dst = {wr.left, wr.top};
+    BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    UpdateLayeredWindow(hWnd, screen, &dst, &size, mem, &src, 0, &blend, ULW_ALPHA);
+
+    SelectObject(mem, oldBmp);
+    DeleteDC(mem);
+    DeleteObject(dib);
+    ReleaseDC(nullptr, screen);
+}
+
+// ------------------------------------------------------ window and layout --
+
+void UpdateAppBar() {
+    MenuSettings cfg;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        cfg = g_cfg;
+    }
+
+    APPBARDATA abd = {};
+    abd.cbSize = sizeof(abd);
+    abd.hWnd = g_hBar;
+
+    if (!cfg.reserveSpace || !cfg.enabled) {
+        if (g_appBarRegistered) {
+            SHAppBarMessage(ABM_REMOVE, &abd);
+            g_appBarRegistered = false;
+        }
+        return;
+    }
+    if (!g_appBarRegistered) {
+        abd.uCallbackMessage = WM_MENU_APPBAR;
+        if (!SHAppBarMessage(ABM_NEW, &abd)) return;
+        g_appBarRegistered = true;
+    }
+
+    RECT monitor = {};
+    if (!macdock::PrimaryMonitorRect(&monitor)) return;
+    abd.uEdge = ABE_TOP;
+    abd.rc.left = monitor.left;
+    abd.rc.right = monitor.right;
+    abd.rc.top = monitor.top;
+    abd.rc.bottom = monitor.top + cfg.height;
+    SHAppBarMessage(ABM_QUERYPOS, &abd);
+    abd.rc.bottom = abd.rc.top + cfg.height;
+    SHAppBarMessage(ABM_SETPOS, &abd);
+}
+
+void PositionBar() {
+    if (!g_hBar) return;
+    MenuSettings cfg;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        cfg = g_cfg;
+    }
+    RECT monitor = {};
+    if (!macdock::PrimaryMonitorRect(&monitor)) return;
+    SetWindowPos(g_hBar, HWND_TOPMOST, monitor.left, monitor.top,
+                 monitor.right - monitor.left, cfg.height, SWP_NOACTIVATE);
+    UpdateAppBar();
+    PaintBar(g_hBar);
+}
+
+int HitTestEntry(int x) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for (size_t i = 0; i < g_entries.size(); ++i) {
+        if (x >= g_entries[i].left && x < g_entries[i].right) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+void OpenStartMenu() {
+    INPUT input[4] = {};
+    for (int i = 0; i < 4; ++i) input[i].type = INPUT_KEYBOARD;
+    input[0].ki.wVk = VK_CONTROL;
+    input[1].ki.wVk = VK_ESCAPE;
+    input[2].ki.wVk = VK_ESCAPE;
+    input[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    input[3].ki.wVk = VK_CONTROL;
+    input[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(4, input, sizeof(INPUT));
+}
+
+void DropEntry(int index) {
+    MenuEntry entry;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (index < 0 || index >= static_cast<int>(g_entries.size())) return;
+        entry = g_entries[index];
+    }
+
+    if (entry.submenuIndex == -1) {
+        OpenStartMenu();
+        return;
+    }
+    if (entry.submenuIndex < 0) return;  // the app name is a label, not a menu
+
+    HWND owner = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        owner = g_activeWindow;
+    }
+    if (!owner || !IsWindow(owner)) return;
+    HMENU menu = GetMenu(owner);
+    if (!menu) return;
+    HMENU submenu = GetSubMenu(menu, entry.submenuIndex);
+    if (!submenu) return;
+
+    MenuSettings cfg;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        cfg = g_cfg;
+    }
+    RECT monitor = {};
+    if (!macdock::PrimaryMonitorRect(&monitor)) return;
+
+    SetForegroundWindow(g_hBar);
+    const int choice = TrackPopupMenu(
+        submenu, TPM_RETURNCMD | TPM_LEFTBUTTON | TPM_NONOTIFY,
+        monitor.left + static_cast<int>(entry.left),
+        monitor.top + cfg.height, 0, g_hBar, nullptr);
+    PostMessageW(g_hBar, WM_NULL, 0, 0);
+    if (choice > 0 && IsWindow(owner)) {
+        PostMessageW(owner, WM_COMMAND, static_cast<WPARAM>(choice), 0);
+    }
+}
+
+LRESULT CALLBACK MenuProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_MOUSEMOVE: {
+            const int hit = HitTestEntry(GET_X_LPARAM(lParam));
+            if (hit != g_hotEntry) {
+                g_hotEntry = hit;
+                PaintBar(hWnd);
+            }
+            TRACKMOUSEEVENT track = {sizeof(track)};
+            track.dwFlags = TME_LEAVE;
+            track.hwndTrack = hWnd;
+            TrackMouseEvent(&track);
+            return 0;
+        }
+        case WM_MOUSELEAVE: {
+            if (g_hotEntry != -1) {
+                g_hotEntry = -1;
+                PaintBar(hWnd);
+            }
+            return 0;
+        }
+        case WM_LBUTTONUP: {
+            DropEntry(HitTestEntry(GET_X_LPARAM(lParam)));
+            return 0;
+        }
+        case WM_TIMER: {
+            if (wParam == kTimerTick) {
+                bool enabled = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_mutex);
+                    enabled = g_cfg.enabled;
+                }
+                if (!enabled) {
+                    ShowWindow(hWnd, SW_HIDE);
+                    UpdateAppBar();
+                    return 0;
+                }
+                if (!IsWindowVisible(hWnd)) ShowWindow(hWnd, SW_SHOWNOACTIVATE);
+                RefreshActiveApp();
+                PaintBar(hWnd);  // the clock moves every minute anyway
+                SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+            return 0;
+        }
+        case WM_DISPLAYCHANGE:
+        case WM_SETTINGCHANGE: {
+            PositionBar();
+            return 0;
+        }
+        case WM_MENU_REBUILD: {
+            RefreshActiveApp();
+            PositionBar();
+            return 0;
+        }
+        case WM_MENU_APPBAR: {
+            if (wParam == ABN_POSCHANGED) PositionBar();
+            return 0;
+        }
+        case WM_MENU_SHUTDOWN: {
+            PostQuitMessage(0);
+            return 0;
+        }
+        default:
+            break;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+DWORD WINAPI MenuThread(LPVOID) {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+    WNDCLASSEXW wc = {sizeof(wc)};
+    wc.lpfnWndProc = MenuProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = kMenuClass;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    RegisterClassExW(&wc);
+
+    g_hBar = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        kMenuClass, L"Menu Bar", WS_POPUP, 0, 0, 10, 10, nullptr, nullptr,
+        wc.hInstance, nullptr);
+    if (!g_hBar) {
+        CoUninitialize();
+        return 0;
+    }
+
+    RefreshActiveApp();
+    PositionBar();
+    ShowWindow(g_hBar, SW_SHOWNOACTIVATE);
+    PaintBar(g_hBar);
+    SetTimer(g_hBar, kTimerTick, 1000, nullptr);
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.hwnd == nullptr) {
+            if (msg.message == WM_MENU_SHUTDOWN) break;
+            if (msg.message == WM_MENU_REBUILD) {
+                SendMessageW(g_hBar, WM_MENU_REBUILD, 0, 0);
+                continue;
+            }
+        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    KillTimer(g_hBar, kTimerTick);
+    if (g_appBarRegistered) {
+        APPBARDATA abd = {};
+        abd.cbSize = sizeof(abd);
+        abd.hWnd = g_hBar;
+        SHAppBarMessage(ABM_REMOVE, &abd);
+        g_appBarRegistered = false;
+    }
+    DestroyWindow(g_hBar);
+    g_hBar = nullptr;
+    UnregisterClassW(kMenuClass, wc.hInstance);
+    CoUninitialize();
+    return 0;
+}
+
+}  // namespace macmenu
+
 // ============================  mod plumbing  ===============================
 
 COLORREF ParseHexColor(PCWSTR text, COLORREF fallback) {
@@ -1844,8 +2458,33 @@ void LoadSettings() {
         if (empty) break;
     }
 
-    std::lock_guard<std::mutex> lock(macdock::g_mutex);
-    macdock::g_cfg = std::move(dock);
+    {
+        std::lock_guard<std::mutex> lock(macdock::g_mutex);
+        macdock::g_cfg = std::move(dock);
+    }
+
+    // --- menu bar -----------------------------------------------------------
+    macmenu::MenuSettings bar;
+    bar.enabled = Wh_GetIntSetting(L"menuBarEnabled") != 0;
+    bar.height = macdock::ClampI(Wh_GetIntSetting(L"menuBarHeight"), 18, 48);
+    bar.opacityPct = macdock::ClampI(Wh_GetIntSetting(L"menuBarOpacity"), 10, 100);
+    bar.showAppName = Wh_GetIntSetting(L"menuBarAppName") != 0;
+    bar.showAppMenus = Wh_GetIntSetting(L"menuBarAppMenus") != 0;
+    bar.showClock = Wh_GetIntSetting(L"menuBarClock") != 0;
+    bar.use24Hour = Wh_GetIntSetting(L"menuBar24Hour") != 0;
+    bar.showBattery = Wh_GetIntSetting(L"menuBarBattery") != 0;
+    bar.reserveSpace = Wh_GetIntSetting(L"menuBarReserveSpace") != 0;
+
+    PCWSTR barTint = Wh_GetStringSetting(L"menuBarTint");
+    bar.tint = ParseHexColor(barTint, RGB(0x1C, 0x1C, 0x1E));
+    Wh_FreeStringSetting(barTint);
+
+    PCWSTR logo = Wh_GetStringSetting(L"menuBarLogo");
+    bar.logo = (logo && *logo) ? std::wstring(logo) : std::wstring(L"\u2318");
+    Wh_FreeStringSetting(logo);
+
+    std::lock_guard<std::mutex> lock(macmenu::g_mutex);
+    macmenu::g_cfg = std::move(bar);
 }
 
 BOOL Wh_ModInit() {
@@ -1871,10 +2510,24 @@ BOOL Wh_ModInit() {
         std::lock_guard<std::mutex> lock(macdock::g_mutex);
         dockEnabled = macdock::g_cfg.enabled;
     }
-    if (dockEnabled && macdock::ThisProcessHostsTheDock()) {
-        macdock::g_thread = CreateThread(nullptr, 0, macdock::DockThread, nullptr,
-                                         0, &macdock::g_threadId);
-        if (!macdock::g_thread) Wh_Log(L"Dock thread failed to start");
+    // The dock and the menu bar are one per session, so they live in explorer.
+    if (macdock::ThisProcessHostsTheDock()) {
+        if (dockEnabled) {
+            macdock::g_thread = CreateThread(nullptr, 0, macdock::DockThread,
+                                             nullptr, 0, &macdock::g_threadId);
+            if (!macdock::g_thread) Wh_Log(L"Dock thread failed to start");
+        }
+
+        bool barEnabled = false;
+        {
+            std::lock_guard<std::mutex> lock(macmenu::g_mutex);
+            barEnabled = macmenu::g_cfg.enabled;
+        }
+        if (barEnabled) {
+            macmenu::g_thread = CreateThread(nullptr, 0, macmenu::MenuThread,
+                                             nullptr, 0, &macmenu::g_threadId);
+            if (!macmenu::g_thread) Wh_Log(L"Menu bar thread failed to start");
+        }
     }
 
     Wh_Log(L"Init ok");
@@ -1900,11 +2553,25 @@ void Wh_ModSettingsChanged() {
     if (macdock::g_threadId) {
         PostThreadMessageW(macdock::g_threadId, macdock::WM_DOCK_REBUILD, 0, 0);
     }
+    if (macmenu::g_threadId) {
+        PostThreadMessageW(macmenu::g_threadId, macmenu::WM_MENU_REBUILD, 0, 0);
+    }
 }
 
 void Wh_ModUninit() {
     g_unloading = true;
     macdock::g_unloading = true;
+    macmenu::g_unloading = true;
+
+    if (macmenu::g_threadId) {
+        PostThreadMessageW(macmenu::g_threadId, macmenu::WM_MENU_SHUTDOWN, 0, 0);
+    }
+    if (macmenu::g_thread) {
+        WaitForSingleObject(macmenu::g_thread, 5000);
+        CloseHandle(macmenu::g_thread);
+        macmenu::g_thread = nullptr;
+    }
+    macmenu::g_threadId = 0;
 
     if (macdock::g_threadId) {
         PostThreadMessageW(macdock::g_threadId, macdock::WM_DOCK_SHUTDOWN, 0, 0);

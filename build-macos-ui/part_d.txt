@@ -80,8 +80,33 @@ void LoadSettings() {
         if (empty) break;
     }
 
-    std::lock_guard<std::mutex> lock(macdock::g_mutex);
-    macdock::g_cfg = std::move(dock);
+    {
+        std::lock_guard<std::mutex> lock(macdock::g_mutex);
+        macdock::g_cfg = std::move(dock);
+    }
+
+    // --- menu bar -----------------------------------------------------------
+    macmenu::MenuSettings bar;
+    bar.enabled = Wh_GetIntSetting(L"menuBarEnabled") != 0;
+    bar.height = macdock::ClampI(Wh_GetIntSetting(L"menuBarHeight"), 18, 48);
+    bar.opacityPct = macdock::ClampI(Wh_GetIntSetting(L"menuBarOpacity"), 10, 100);
+    bar.showAppName = Wh_GetIntSetting(L"menuBarAppName") != 0;
+    bar.showAppMenus = Wh_GetIntSetting(L"menuBarAppMenus") != 0;
+    bar.showClock = Wh_GetIntSetting(L"menuBarClock") != 0;
+    bar.use24Hour = Wh_GetIntSetting(L"menuBar24Hour") != 0;
+    bar.showBattery = Wh_GetIntSetting(L"menuBarBattery") != 0;
+    bar.reserveSpace = Wh_GetIntSetting(L"menuBarReserveSpace") != 0;
+
+    PCWSTR barTint = Wh_GetStringSetting(L"menuBarTint");
+    bar.tint = ParseHexColor(barTint, RGB(0x1C, 0x1C, 0x1E));
+    Wh_FreeStringSetting(barTint);
+
+    PCWSTR logo = Wh_GetStringSetting(L"menuBarLogo");
+    bar.logo = (logo && *logo) ? std::wstring(logo) : std::wstring(L"\u2318");
+    Wh_FreeStringSetting(logo);
+
+    std::lock_guard<std::mutex> lock(macmenu::g_mutex);
+    macmenu::g_cfg = std::move(bar);
 }
 
 BOOL Wh_ModInit() {
@@ -107,10 +132,24 @@ BOOL Wh_ModInit() {
         std::lock_guard<std::mutex> lock(macdock::g_mutex);
         dockEnabled = macdock::g_cfg.enabled;
     }
-    if (dockEnabled && macdock::ThisProcessHostsTheDock()) {
-        macdock::g_thread = CreateThread(nullptr, 0, macdock::DockThread, nullptr,
-                                         0, &macdock::g_threadId);
-        if (!macdock::g_thread) Wh_Log(L"Dock thread failed to start");
+    // The dock and the menu bar are one per session, so they live in explorer.
+    if (macdock::ThisProcessHostsTheDock()) {
+        if (dockEnabled) {
+            macdock::g_thread = CreateThread(nullptr, 0, macdock::DockThread,
+                                             nullptr, 0, &macdock::g_threadId);
+            if (!macdock::g_thread) Wh_Log(L"Dock thread failed to start");
+        }
+
+        bool barEnabled = false;
+        {
+            std::lock_guard<std::mutex> lock(macmenu::g_mutex);
+            barEnabled = macmenu::g_cfg.enabled;
+        }
+        if (barEnabled) {
+            macmenu::g_thread = CreateThread(nullptr, 0, macmenu::MenuThread,
+                                             nullptr, 0, &macmenu::g_threadId);
+            if (!macmenu::g_thread) Wh_Log(L"Menu bar thread failed to start");
+        }
     }
 
     Wh_Log(L"Init ok");
@@ -136,11 +175,25 @@ void Wh_ModSettingsChanged() {
     if (macdock::g_threadId) {
         PostThreadMessageW(macdock::g_threadId, macdock::WM_DOCK_REBUILD, 0, 0);
     }
+    if (macmenu::g_threadId) {
+        PostThreadMessageW(macmenu::g_threadId, macmenu::WM_MENU_REBUILD, 0, 0);
+    }
 }
 
 void Wh_ModUninit() {
     g_unloading = true;
     macdock::g_unloading = true;
+    macmenu::g_unloading = true;
+
+    if (macmenu::g_threadId) {
+        PostThreadMessageW(macmenu::g_threadId, macmenu::WM_MENU_SHUTDOWN, 0, 0);
+    }
+    if (macmenu::g_thread) {
+        WaitForSingleObject(macmenu::g_thread, 5000);
+        CloseHandle(macmenu::g_thread);
+        macmenu::g_thread = nullptr;
+    }
+    macmenu::g_threadId = 0;
 
     if (macdock::g_threadId) {
         PostThreadMessageW(macdock::g_threadId, macdock::WM_DOCK_SHUTDOWN, 0, 0);
