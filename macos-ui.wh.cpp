@@ -749,6 +749,11 @@ void CALLBACK WinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hWnd, LONG idOb
 
 // --------------------------------------------------------- overlay thread ---
 
+BOOL CALLBACK AttachExistingEnumProc(HWND hWnd, LPARAM) {
+    if (IsWindowVisible(hWnd)) AttachToWindow(hWnd);
+    return TRUE;
+}
+
 DWORD WINAPI OverlayThread(LPVOID) {
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -769,12 +774,7 @@ DWORD WINAPI OverlayThread(LPVOID) {
                                        WINEVENT_OUTOFCONTEXT);
 
     // Windows that already existed when the mod loaded.
-    EnumWindows(
-        [](HWND hWnd, LPARAM) -> BOOL {
-            if (IsWindowVisible(hWnd)) AttachToWindow(hWnd);
-            return TRUE;
-        },
-        0);
+    EnumWindows(AttachExistingEnumProc, 0);
 
     g_overlayThreadReady = true;
 
