@@ -315,6 +315,26 @@ bool MatchesChosenButton(
     }
 }
 
+// On release no button is down any more, so IsLeftButtonPressed and friends are
+// all false. PointerUpdateKind is the one that says which button just came up.
+bool ReleaseMatchesChosenButton(
+    winrt::Windows::UI::Input::PointerPointProperties const& props) {
+    using Kind = winrt::Windows::UI::Input::PointerUpdateKind;
+    switch (props.PointerUpdateKind()) {
+        case Kind::LeftButtonReleased:
+            return g_settings.mouseButton == MouseButton::left;
+        case Kind::MiddleButtonReleased:
+            return g_settings.mouseButton == MouseButton::middle;
+        case Kind::RightButtonReleased:
+            return g_settings.mouseButton == MouseButton::right;
+        default:
+            // Touch, pen, or a control that does not report a kind. Treat it as
+            // the configured button rather than doing nothing at all.
+            Wh_Log(L"Release reported no button kind; treating it as a match");
+            return true;
+    }
+}
+
 // The button this sits inside consumes pointer events in its class handler, so
 // the handlers are registered with handledEventsToo and capture the pointer:
 // without a matching release the button never raises its own click, which is
@@ -364,19 +384,22 @@ void AttachToBell(FrameworkElement iconView) {
             }
             element.ReleasePointerCapture(args.Pointer());
 
-            // Only act on a release whose press we accepted. Otherwise a click
-            // with a button the user did not configure would still toggle, and
-            // the tap suppression would never have been armed to go with it.
-            if (!g_pressArmed) {
-                Wh_Log(L"Bell released without a matching press - ignoring");
+            auto props = args.GetCurrentPoint(element).Properties();
+            if (!g_pressArmed && !ReleaseMatchesChosenButton(props)) {
+                Wh_Log(L"Bell released with a button other than the configured "
+                       L"one - ignoring");
                 return;
             }
             g_pressArmed = false;
-            Wh_Log(L"Bell released, toggling");
-            ToggleDoNotDisturb();
+
+            // Tapped is raised after this, so arming here is in time to swallow
+            // it even when the press handler never ran.
             if (!g_settings.alsoOpenCentre) {
+                SuppressNextTap();
                 args.Handled(true);
             }
+            Wh_Log(L"Bell released, toggling");
+            ToggleDoNotDisturb();
         });
 
     auto tappedHandler = input::TappedEventHandler(
