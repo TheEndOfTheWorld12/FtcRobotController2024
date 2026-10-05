@@ -275,6 +275,7 @@ std::list<winrt::event_revoker<IFrameworkElement>> g_loadedRevokers;
 // swallowed - the same approach Separate System Tray Icons uses for its
 // middle-click handling.
 ULONGLONG g_suppressTapUntil = 0;
+bool g_pressArmed = false;  // the press matched the configured button
 
 void SuppressNextTap() {
     g_suppressTapUntil = GetTickCount64() + 750;
@@ -330,9 +331,19 @@ void AttachToBell(FrameworkElement iconView) {
                 return;
             }
             auto point = args.GetCurrentPoint(element);
-            if (!MatchesChosenButton(point.Properties())) {
+            auto props = point.Properties();
+            if (!MatchesChosenButton(props)) {
+                Wh_Log(L"Bell pressed with the wrong button "
+                       L"(left=%d middle=%d right=%d, configured=%s) - ignoring",
+                       (int)props.IsLeftButtonPressed(),
+                       (int)props.IsMiddleButtonPressed(),
+                       (int)props.IsRightButtonPressed(),
+                       g_settings.mouseButton == MouseButton::left     ? L"left"
+                       : g_settings.mouseButton == MouseButton::middle ? L"middle"
+                                                                       : L"right");
                 return;
             }
+            g_pressArmed = true;
             Wh_Log(L"Bell pressed, opening the tap suppression window");
             element.CapturePointer(args.Pointer());
             if (!g_settings.alsoOpenCentre) {
@@ -352,10 +363,16 @@ void AttachToBell(FrameworkElement iconView) {
                 return;
             }
             element.ReleasePointerCapture(args.Pointer());
-            Wh_Log(L"Bell released, toggling (suppression window %s)",
-                   (g_suppressTapUntil && GetTickCount64() <= g_suppressTapUntil)
-                       ? L"still open"
-                       : L"NOT open - the press handler did not run");
+
+            // Only act on a release whose press we accepted. Otherwise a click
+            // with a button the user did not configure would still toggle, and
+            // the tap suppression would never have been armed to go with it.
+            if (!g_pressArmed) {
+                Wh_Log(L"Bell released without a matching press - ignoring");
+                return;
+            }
+            g_pressArmed = false;
+            Wh_Log(L"Bell released, toggling");
             ToggleDoNotDisturb();
             if (!g_settings.alsoOpenCentre) {
                 args.Handled(true);
@@ -386,6 +403,14 @@ void AttachToBell(FrameworkElement iconView) {
             args.Handled(true);
         });
 
+    auto cancelledHandler = input::PointerEventHandler(
+        [](winrt::Windows::Foundation::IInspectable const&,
+           input::PointerRoutedEventArgs const&) { g_pressArmed = false; });
+
+    AddTrackedHandler(iconView, UIElement::PointerCanceledEvent(),
+                      winrt::box_value(cancelledHandler));
+    AddTrackedHandler(iconView, UIElement::PointerCaptureLostEvent(),
+                      winrt::box_value(cancelledHandler));
     AddTrackedHandler(iconView, UIElement::PointerPressedEvent(),
                       winrt::box_value(pressedHandler));
     AddTrackedHandler(iconView, UIElement::PointerReleasedEvent(),
@@ -577,6 +602,12 @@ void LoadSettings() {
     Wh_FreeStringSetting(button);
 
     g_settings.alsoOpenCentre = Wh_GetIntSetting(L"alsoOpenCentre") != 0;
+
+    Wh_Log(L"Settings: button=%s alsoOpenCentre=%d",
+           g_settings.mouseButton == MouseButton::left     ? L"left"
+           : g_settings.mouseButton == MouseButton::middle ? L"middle"
+                                                           : L"right",
+           (int)g_settings.alsoOpenCentre);
 }
 
 BOOL Wh_ModInit() {
