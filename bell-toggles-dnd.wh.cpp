@@ -68,7 +68,9 @@ so the mod never has to guess which way to flip.
 
 #undef GetCurrentTime
 
+#include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.UI.Core.h>
+#include <winrt/Windows.UI.Input.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Input.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
@@ -76,6 +78,8 @@ so the mod never has to guess which way to flip.
 #include <winrt/base.h>
 
 using namespace winrt::Windows::UI::Xaml;
+
+namespace input = winrt::Windows::UI::Xaml::Input;
 
 // ---------------------------------------------------------------- settings --
 
