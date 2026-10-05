@@ -262,12 +262,44 @@ bool LooksLikeTheBell(FrameworkElement iconView) {
 
 struct AttachedHandler {
     FrameworkElement element = nullptr;
-    winrt::Windows::Foundation::IInspectable pressed;
-    winrt::Windows::Foundation::IInspectable released;
+    RoutedEvent routedEvent = nullptr;
+    winrt::Windows::Foundation::IInspectable handler;
 };
 
 std::list<AttachedHandler> g_attached;
 std::list<winrt::event_revoker<IFrameworkElement>> g_loadedRevokers;
+
+// Handling the pointer events is not enough on its own: the tray control
+// raises Tapped separately afterwards, and that is what opens the notification
+// centre. So a press opens a short window during which the next Tapped is
+// swallowed - the same approach Separate System Tray Icons uses for its
+// middle-click handling.
+ULONGLONG g_suppressTapUntil = 0;
+
+void SuppressNextTap() {
+    g_suppressTapUntil = GetTickCount64() + 750;
+}
+
+bool ConsumeSuppressedTap() {
+    if (g_suppressTapUntil && GetTickCount64() <= g_suppressTapUntil) {
+        g_suppressTapUntil = 0;
+        return true;
+    }
+    return false;
+}
+
+FrameworkElement GetParentElementByName(FrameworkElement element, PCWSTR name) {
+    return EnumParentElements(element, [name](FrameworkElement parent) {
+        return parent.Name() == name;
+    });
+}
+
+void AddTrackedHandler(FrameworkElement element,
+                       RoutedEvent routedEvent,
+                       winrt::Windows::Foundation::IInspectable handler) {
+    element.AddHandler(routedEvent, handler, true);
+    g_attached.push_back({element, routedEvent, handler});
+}
 
 bool MatchesChosenButton(
     winrt::Windows::UI::Input::PointerPointProperties const& props) {
@@ -304,6 +336,7 @@ void AttachToBell(FrameworkElement iconView) {
             Wh_Log(L"Bell pressed");
             element.CapturePointer(args.Pointer());
             if (!g_settings.alsoOpenCentre) {
+                SuppressNextTap();
                 args.Handled(true);
             }
         });
@@ -326,26 +359,58 @@ void AttachToBell(FrameworkElement iconView) {
             }
         });
 
-    auto boxedPressed = winrt::box_value(pressedHandler);
-    auto boxedReleased = winrt::box_value(releasedHandler);
+    auto tappedHandler = input::TappedEventHandler(
+        [](winrt::Windows::Foundation::IInspectable const&,
+           input::TappedRoutedEventArgs const& args) {
+            if (g_unloading || g_settings.alsoOpenCentre) {
+                return;
+            }
+            if (ConsumeSuppressedTap()) {
+                Wh_Log(L"Swallowed the tap that would open the centre");
+                args.Handled(true);
+            }
+        });
 
-    iconView.AddHandler(UIElement::PointerPressedEvent(), boxedPressed, true);
-    iconView.AddHandler(UIElement::PointerReleasedEvent(), boxedReleased, true);
+    auto doubleTappedHandler = input::DoubleTappedEventHandler(
+        [](winrt::Windows::Foundation::IInspectable const&,
+           input::DoubleTappedRoutedEventArgs const& args) {
+            if (g_unloading || g_settings.alsoOpenCentre) {
+                return;
+            }
+            Wh_Log(L"Swallowed a double tap");
+            args.Handled(true);
+        });
 
-    g_attached.push_back({iconView, boxedPressed, boxedReleased});
-    Wh_Log(L"Attached to the bell");
+    AddTrackedHandler(iconView, UIElement::PointerPressedEvent(),
+                      winrt::box_value(pressedHandler));
+    AddTrackedHandler(iconView, UIElement::PointerReleasedEvent(),
+                      winrt::box_value(releasedHandler));
+    AddTrackedHandler(iconView, UIElement::TappedEvent(),
+                      winrt::box_value(tappedHandler));
+    AddTrackedHandler(iconView, UIElement::DoubleTappedEvent(),
+                      winrt::box_value(doubleTappedHandler));
+
+    // The tap is raised by the button, not the icon, on some builds.
+    if (auto button =
+            GetParentElementByName(iconView, L"NotificationCenterButton")) {
+        AddTrackedHandler(button, UIElement::TappedEvent(),
+                          winrt::box_value(tappedHandler));
+        AddTrackedHandler(button, UIElement::DoubleTappedEvent(),
+                          winrt::box_value(doubleTappedHandler));
+        Wh_Log(L"Attached to the bell and to the notification centre button");
+    } else {
+        Wh_Log(L"Attached to the bell only; the button was not found above it");
+    }
 }
 
 void DetachAll() {
     for (auto& attached : g_attached) {
-        if (!attached.element) {
+        if (!attached.element || !attached.routedEvent) {
             continue;
         }
         try {
-            attached.element.RemoveHandler(UIElement::PointerPressedEvent(),
-                                           attached.pressed);
-            attached.element.RemoveHandler(UIElement::PointerReleasedEvent(),
-                                           attached.released);
+            attached.element.RemoveHandler(attached.routedEvent,
+                                           attached.handler);
         } catch (...) {
             // The element may already be gone with the taskbar it lived in.
         }
