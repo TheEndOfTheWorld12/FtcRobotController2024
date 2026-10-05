@@ -28,6 +28,17 @@ notification centre goes through an undocumented COM interface,
 `IQuietHoursSettings`, and "on" is simply the priority-only quiet hours
 profile. This mod calls the same interface.
 
+Stopping the notification centre from opening turned out to be the harder half.
+Handling the XAML pointer events does not do it, and neither does swallowing
+the `Tapped` events - with both swallowed, the centre still opened, so it is
+opened by some private path of the tray control's own. So the click is taken
+before the taskbar ever sees it: a low-level mouse hook eats the button down
+and up inside the bell's rectangle, and the toggle happens there. Nothing
+downstream gets a vote.
+
+The bell's rectangle comes from its position in the taskbar's visual tree,
+scaled by the monitor's DPI, and is refreshed as the taskbar moves.
+
 Reading the state is clean - the shell publishes it as a WNF notification -
 so the mod never has to guess which way to flip.
 
@@ -268,6 +279,7 @@ struct AttachedHandler {
 
 std::list<AttachedHandler> g_attached;
 std::list<winrt::event_revoker<IFrameworkElement>> g_loadedRevokers;
+std::list<FrameworkElement::LayoutUpdated_revoker> g_layoutRevokers;
 
 // Handling the pointer events is not enough on its own: the tray control
 // raises Tapped separately afterwards, and that is what opens the notification
@@ -276,6 +288,23 @@ std::list<winrt::event_revoker<IFrameworkElement>> g_loadedRevokers;
 // middle-click handling.
 ULONGLONG g_suppressTapUntil = 0;
 bool g_pressArmed = false;  // the press matched the configured button
+
+// Both taps are swallowed and the centre still opens, so it is not opened by
+// the Tapped event. Rather than keep guessing which private path does open it,
+// the click is taken before the taskbar sees it at all: a low-level mouse hook
+// eats the button down and up inside the bell's rectangle. Nothing downstream
+// - XAML, the tray control, the flyout - gets a vote.
+std::mutex g_bellRectMutex;
+RECT g_bellRect{};
+bool g_bellRectValid = false;
+
+HHOOK g_mouseHook = nullptr;
+HANDLE g_hookThread = nullptr;
+DWORD g_hookThreadId = 0;
+bool g_swallowingClick = false;        // a down was eaten; eat the up too
+std::atomic<ULONGLONG> g_hookActedAt;  // so the XAML path stands down
+
+constexpr UINT WM_HOOK_SHUTDOWN = WM_APP + 1;
 
 // Short, because the taps land within a couple of milliseconds of the release
 // - 13:21:48.862 released, 13:21:48.869 to .870 tapped - and a window any
@@ -296,6 +325,136 @@ FrameworkElement GetParentElementByName(FrameworkElement element, PCWSTR name) {
     return EnumParentElements(element, [name](FrameworkElement parent) {
         return parent.Name() == name;
     });
+}
+
+// The taskbar's XAML content fills its window's client area, so the element's
+// offset within the visual tree plus the window's origin gives screen pixels,
+// once DIPs are scaled by the monitor's DPI.
+void UpdateBellScreenRect(FrameworkElement element) {
+    HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
+    RECT trayRect{};
+    if (!tray || !GetWindowRect(tray, &trayRect)) {
+        return;
+    }
+
+    UINT dpi = GetDpiForWindow(tray);
+    const double scale = dpi ? (dpi / 96.0) : 1.0;
+
+    const double width = element.ActualWidth();
+    const double height = element.ActualHeight();
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+
+    winrt::Windows::Foundation::Point topLeft{0.0f, 0.0f};
+    try {
+        topLeft = element.TransformToVisual(nullptr).TransformPoint(topLeft);
+    } catch (...) {
+        return;
+    }
+
+    RECT rect;
+    rect.left = trayRect.left + (LONG)(topLeft.X * scale);
+    rect.top = trayRect.top + (LONG)(topLeft.Y * scale);
+    rect.right = rect.left + (LONG)(width * scale);
+    rect.bottom = rect.top + (LONG)(height * scale);
+
+    std::lock_guard<std::mutex> lock(g_bellRectMutex);
+    if (!g_bellRectValid || !EqualRect(&g_bellRect, &rect)) {
+        g_bellRect = rect;
+        g_bellRectValid = true;
+        Wh_Log(L"Bell rectangle: %d,%d to %d,%d (dpi %u)", (int)rect.left,
+               (int)rect.top, (int)rect.right, (int)rect.bottom, dpi);
+    }
+}
+
+bool PointIsOnBell(POINT pt) {
+    std::lock_guard<std::mutex> lock(g_bellRectMutex);
+    return g_bellRectValid && PtInRect(&g_bellRect, pt);
+}
+
+bool HookWantsButton(WPARAM message, bool* isDown) {
+    switch (g_settings.mouseButton) {
+        case MouseButton::middle:
+            if (message == WM_MBUTTONDOWN) { *isDown = true;  return true; }
+            if (message == WM_MBUTTONUP)   { *isDown = false; return true; }
+            return false;
+        case MouseButton::right:
+            if (message == WM_RBUTTONDOWN) { *isDown = true;  return true; }
+            if (message == WM_RBUTTONUP)   { *isDown = false; return true; }
+            return false;
+        case MouseButton::left:
+        default:
+            if (message == WM_LBUTTONDOWN) { *isDown = true;  return true; }
+            if (message == WM_LBUTTONUP)   { *isDown = false; return true; }
+            return false;
+    }
+}
+
+LRESULT CALLBACK LowLevelMouseProc(int code, WPARAM wParam, LPARAM lParam) {
+    if (code != HC_ACTION || g_unloading || g_settings.alsoOpenCentre) {
+        return CallNextHookEx(nullptr, code, wParam, lParam);
+    }
+
+    bool isDown = false;
+    if (!HookWantsButton(wParam, &isDown)) {
+        return CallNextHookEx(nullptr, code, wParam, lParam);
+    }
+
+    auto* info = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
+    if (!info) {
+        return CallNextHookEx(nullptr, code, wParam, lParam);
+    }
+
+    if (isDown) {
+        if (!PointIsOnBell(info->pt)) {
+            return CallNextHookEx(nullptr, code, wParam, lParam);
+        }
+        g_swallowingClick = true;
+        Wh_Log(L"Mouse hook: swallowing the press on the bell");
+        return 1;  // the taskbar never sees it
+    }
+
+    if (!g_swallowingClick) {
+        return CallNextHookEx(nullptr, code, wParam, lParam);
+    }
+    g_swallowingClick = false;
+    g_hookActedAt = GetTickCount64();
+    Wh_Log(L"Mouse hook: swallowing the release and toggling");
+    ToggleDoNotDisturb();
+    return 1;
+}
+
+DWORD WINAPI HookThread(LPVOID) {
+    g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc,
+                                    GetModuleHandleW(nullptr), 0);
+    if (!g_mouseHook) {
+        Wh_Log(L"SetWindowsHookEx(WH_MOUSE_LL) failed: %u",
+               (unsigned)GetLastError());
+        return 0;
+    }
+    Wh_Log(L"Mouse hook installed");
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.hwnd == nullptr && msg.message == WM_HOOK_SHUTDOWN) {
+            break;
+        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    UnhookWindowsHookEx(g_mouseHook);
+    g_mouseHook = nullptr;
+    Wh_Log(L"Mouse hook removed");
+    return 0;
+}
+
+// True when the hook has just dealt with this click, so the XAML handlers do
+// not toggle a second time.
+bool HookJustActed() {
+    const ULONGLONG at = g_hookActedAt.load();
+    return at && GetTickCount64() - at < 500;
 }
 
 void AddTrackedHandler(FrameworkElement element,
@@ -387,6 +546,12 @@ void AttachToBell(FrameworkElement iconView) {
             }
             element.ReleasePointerCapture(args.Pointer());
 
+            if (HookJustActed()) {
+                Wh_Log(L"Release ignored; the mouse hook already handled it");
+                g_pressArmed = false;
+                return;
+            }
+
             auto props = args.GetCurrentPoint(element).Properties();
             if (!g_pressArmed && !ReleaseMatchesChosenButton(props)) {
                 Wh_Log(L"Bell released with a button other than the configured "
@@ -433,6 +598,26 @@ void AttachToBell(FrameworkElement iconView) {
         [](winrt::Windows::Foundation::IInspectable const&,
            input::PointerRoutedEventArgs const&) { g_pressArmed = false; });
 
+    UpdateBellScreenRect(iconView);
+    g_layoutRevokers.push_back(iconView.LayoutUpdated(
+        winrt::auto_revoke_t{},
+        [weak = winrt::make_weak(iconView)](auto const&, auto const&) {
+            if (g_unloading) {
+                return;
+            }
+            // LayoutUpdated is a hot path; the rectangle only needs to keep up
+            // with the taskbar moving, not with every layout pass.
+            static ULONGLONG lastCheck = 0;
+            const ULONGLONG now = GetTickCount64();
+            if (now - lastCheck < 500) {
+                return;
+            }
+            lastCheck = now;
+            if (auto element = weak.get()) {
+                UpdateBellScreenRect(element);
+            }
+        }));
+
     AddTrackedHandler(iconView, UIElement::PointerCanceledEvent(),
                       winrt::box_value(cancelledHandler));
     AddTrackedHandler(iconView, UIElement::PointerCaptureLostEvent(),
@@ -473,6 +658,7 @@ void DetachAll() {
     }
     g_attached.clear();
     g_loadedRevokers.clear();
+    g_layoutRevokers.clear();
 }
 
 // ------------------------------------------------------------------- hooks --
@@ -641,6 +827,12 @@ BOOL Wh_ModInit() {
 
     LoadSettings();
 
+    g_hookThread = CreateThread(nullptr, 0, HookThread, nullptr, 0,
+                                &g_hookThreadId);
+    if (!g_hookThread) {
+        Wh_Log(L"Could not start the mouse hook thread");
+    }
+
     if (HMODULE systemTrayModule = GetSystemTrayModuleHandle()) {
         g_systemTrayModuleHooked = true;
         if (!HookSystemTraySymbols(systemTrayModule)) {
@@ -668,5 +860,16 @@ void Wh_ModSettingsChanged() {
 void Wh_ModUninit() {
     Wh_Log(L">");
     g_unloading = true;
+
+    if (g_hookThreadId) {
+        PostThreadMessageW(g_hookThreadId, WM_HOOK_SHUTDOWN, 0, 0);
+    }
+    if (g_hookThread) {
+        WaitForSingleObject(g_hookThread, 5000);
+        CloseHandle(g_hookThread);
+        g_hookThread = nullptr;
+    }
+    g_hookThreadId = 0;
+
     DetachAll();
 }
