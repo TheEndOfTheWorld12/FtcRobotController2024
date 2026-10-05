@@ -151,7 +151,10 @@ bool SetDoNotDisturb(bool on) {
 }
 
 void ToggleDoNotDisturb() {
-    SetDoNotDisturb(!IsDoNotDisturbOn());
+    const bool was = IsDoNotDisturbOn();
+    const bool done = SetDoNotDisturb(!was);
+    Wh_Log(L"Do Not Disturb was %s, set to %s: %s", was ? L"on" : L"off",
+           was ? L"off" : L"on", done ? L"ok" : L"FAILED");
 }
 
 // -------------------------------------------------------------- tree walking --
@@ -214,6 +217,7 @@ bool IsChildOfElementByName(FrameworkElement element, PCWSTR name) {
 bool LooksLikeTheBell(FrameworkElement iconView) {
     FrameworkElement child = FindChildByName(iconView, L"ContainerGrid");
     if (!child) {
+        Wh_Log(L"  no ContainerGrid under the icon view");
         return false;
     }
 
@@ -227,6 +231,7 @@ bool LooksLikeTheBell(FrameworkElement iconView) {
         !(child = FindChildByName(child, L"ContainerGrid")) ||
         !(child = FindChildByName(child, L"Base")) ||
         !(child = FindChildByName(child, L"InnerTextBlock"))) {
+        Wh_Log(L"  the tree under the icon view is not the expected shape");
         return false;
     }
 
@@ -236,6 +241,8 @@ bool LooksLikeTheBell(FrameworkElement iconView) {
     }
 
     auto text = textBlock.Text();
+    Wh_Log(L"  glyph: U+%04X (length %d)", text.size() ? (unsigned)text[0] : 0,
+           (int)text.size());
     if (text.size() != 1) {
         return false;
     }
@@ -294,6 +301,7 @@ void AttachToBell(FrameworkElement iconView) {
             if (!MatchesChosenButton(point.Properties())) {
                 return;
             }
+            Wh_Log(L"Bell pressed");
             element.CapturePointer(args.Pointer());
             if (!g_settings.alsoOpenCentre) {
                 args.Handled(true);
@@ -311,6 +319,7 @@ void AttachToBell(FrameworkElement iconView) {
                 return;
             }
             element.ReleasePointerCapture(args.Pointer());
+            Wh_Log(L"Bell released, toggling");
             ToggleDoNotDisturb();
             if (!g_settings.alsoOpenCentre) {
                 args.Handled(true);
@@ -351,6 +360,7 @@ using IconView_IconView_t = void*(WINAPI*)(void* pThis);
 IconView_IconView_t IconView_IconView_Original;
 
 void* WINAPI IconView_IconView_Hook(void* pThis) {
+    Wh_Log(L"IconView constructed");
     void* ret = IconView_IconView_Original(pThis);
 
     FrameworkElement iconView = nullptr;
@@ -374,15 +384,22 @@ void* WINAPI IconView_IconView_Hook(void* pThis) {
             if (!iconView || g_unloading) {
                 return;
             }
-            if (winrt::get_class_name(iconView) != L"SystemTray.IconView" ||
+
+            auto className = winrt::get_class_name(iconView);
+            Wh_Log(L"Icon view loaded: class=%s name=%s", className.c_str(),
+                   iconView.Name().c_str());
+
+            if (className != L"SystemTray.IconView" ||
                 iconView.Name() != L"SystemTrayIcon") {
                 return;
             }
             if (!IsChildOfElementByName(iconView, L"NotificationCenterButton")) {
+                Wh_Log(L"  not under NotificationCenterButton, skipping");
                 return;
             }
+            Wh_Log(L"  under NotificationCenterButton");
             if (!LooksLikeTheBell(iconView)) {
-                Wh_Log(L"Under the notification centre button, but not the bell");
+                Wh_Log(L"  but the glyph is not one of the four bells, skipping");
                 return;
             }
             AttachToBell(iconView);
@@ -445,9 +462,10 @@ bool HookSystemTraySymbols(HMODULE module) {
 
     if (!WindhawkUtils::HookSymbols(module, symbolHooks,
                                     ARRAYSIZE(symbolHooks))) {
-        Wh_Log(L"HookSymbols failed");
+        Wh_Log(L"HookSymbols failed - the IconView symbol was not found");
         return false;
     }
+    Wh_Log(L"IconView hook installed");
     return true;
 }
 
