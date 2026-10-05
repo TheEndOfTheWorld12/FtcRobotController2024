@@ -277,16 +277,19 @@ std::list<winrt::event_revoker<IFrameworkElement>> g_loadedRevokers;
 ULONGLONG g_suppressTapUntil = 0;
 bool g_pressArmed = false;  // the press matched the configured button
 
-void SuppressNextTap() {
-    g_suppressTapUntil = GetTickCount64() + 750;
+// Short, because the taps land within a couple of milliseconds of the release
+// - 13:21:48.862 released, 13:21:48.869 to .870 tapped - and a window any
+// longer than it needs to be would start eating clicks on the clock beside it.
+constexpr ULONGLONG kTapSuppressionMs = 400;
+
+void SuppressTapsBriefly() {
+    g_suppressTapUntil = GetTickCount64() + kTapSuppressionMs;
 }
 
-bool ConsumeSuppressedTap() {
-    if (g_suppressTapUntil && GetTickCount64() <= g_suppressTapUntil) {
-        g_suppressTapUntil = 0;
-        return true;
-    }
-    return false;
+// Deliberately does not clear the window: every tap inside it is swallowed, not
+// just the first. It expires on time instead.
+bool TapIsSuppressed() {
+    return g_suppressTapUntil && GetTickCount64() <= g_suppressTapUntil;
 }
 
 FrameworkElement GetParentElementByName(FrameworkElement element, PCWSTR name) {
@@ -367,7 +370,7 @@ void AttachToBell(FrameworkElement iconView) {
             Wh_Log(L"Bell pressed, opening the tap suppression window");
             element.CapturePointer(args.Pointer());
             if (!g_settings.alsoOpenCentre) {
-                SuppressNextTap();
+                SuppressTapsBriefly();
                 args.Handled(true);
             }
         });
@@ -395,7 +398,7 @@ void AttachToBell(FrameworkElement iconView) {
             // Tapped is raised after this, so arming here is in time to swallow
             // it even when the press handler never ran.
             if (!g_settings.alsoOpenCentre) {
-                SuppressNextTap();
+                SuppressTapsBriefly();
                 args.Handled(true);
             }
             Wh_Log(L"Bell released, toggling");
@@ -408,7 +411,7 @@ void AttachToBell(FrameworkElement iconView) {
             if (g_unloading || g_settings.alsoOpenCentre) {
                 return;
             }
-            if (ConsumeSuppressedTap()) {
+            if (TapIsSuppressed()) {
                 Wh_Log(L"Tapped seen, suppression window live -> swallowed");
                 args.Handled(true);
             } else {
