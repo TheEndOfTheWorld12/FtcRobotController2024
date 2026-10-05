@@ -333,7 +333,7 @@ void AttachToBell(FrameworkElement iconView) {
             if (!MatchesChosenButton(point.Properties())) {
                 return;
             }
-            Wh_Log(L"Bell pressed");
+            Wh_Log(L"Bell pressed, opening the tap suppression window");
             element.CapturePointer(args.Pointer());
             if (!g_settings.alsoOpenCentre) {
                 SuppressNextTap();
@@ -352,7 +352,10 @@ void AttachToBell(FrameworkElement iconView) {
                 return;
             }
             element.ReleasePointerCapture(args.Pointer());
-            Wh_Log(L"Bell released, toggling");
+            Wh_Log(L"Bell released, toggling (suppression window %s)",
+                   (g_suppressTapUntil && GetTickCount64() <= g_suppressTapUntil)
+                       ? L"still open"
+                       : L"NOT open - the press handler did not run");
             ToggleDoNotDisturb();
             if (!g_settings.alsoOpenCentre) {
                 args.Handled(true);
@@ -366,8 +369,10 @@ void AttachToBell(FrameworkElement iconView) {
                 return;
             }
             if (ConsumeSuppressedTap()) {
-                Wh_Log(L"Swallowed the tap that would open the centre");
+                Wh_Log(L"Tapped seen, suppression window live -> swallowed");
                 args.Handled(true);
+            } else {
+                Wh_Log(L"Tapped seen, but no suppression window was open");
             }
         });
 
