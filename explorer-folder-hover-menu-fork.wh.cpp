@@ -2,7 +2,7 @@
 // @id              explorer-folder-hover-menu-fork
 // @name            Folder Hover Menu - Fork
 // @description     Hover a folder in File Explorer to get an expand button that opens a cascading menu of the folder's contents
-// @version         1.4
+// @version         1.5
 // @author          m417z
 // @github          https://github.com/m417z
 // @twitter         https://twitter.com/m417z
@@ -16,15 +16,22 @@
 # Folder Hover Menu
 
 When you hover the mouse over a folder in File Explorer, a small expand button
-appears in the corner of that folder. Rest the pointer anywhere along that side
-of the row and a cascading menu of the folder's contents pops up - no click
-needed, and you do not have to land on the button itself. Clicking still works,
-and the hover can be turned off or its delay changed in the settings.
+appears in the corner of that folder. Rest the pointer anywhere on the folder -
+or a little past either end of its name - and a cascading menu of the folder's
+contents pops up: no click needed, and you do not have to land on the button
+itself. Move the pointer off both the menu and the folder and the menu closes
+again on its own. Clicking still works, and the hover, its zone, its delay and
+the close-on-leave behaviour can all be changed in the settings.
 
-This works in the file list and in the **navigation pane** on the left, so Quick
-access and the folders pinned to it, This PC, your drives, OneDrive and Network
-all expand the same way. You can navigate into sub-folders
-and launch items straight from the menu, without opening the folder first.
+This works everywhere folders are shown:
+
+* the **file list**, including **search results** and the **Home** page with
+  Quick access and your favourites on it, libraries and the recycle bin;
+* the **navigation pane** on the left, so Quick access and the folders pinned to
+  it, This PC, your drives, OneDrive and Network all expand the same way.
+
+You can navigate into sub-folders and launch items straight from the menu,
+without opening the folder first.
 
 It also works in open and save file dialogs. There, "Open in the current window"
 navigates the dialog into the folder, and clicking a file in the menu puts it
@@ -43,11 +50,22 @@ Inspired by [QTTabBar](https://qttabbar.wikidot.com/).
   $description: >-
     Open the menu by resting the pointer on the expand button, instead of having
     to click it. Clicking still works either way.
-- hoverZoneWidth: 90
-  $name: Hover zone width (px)
+- hoverZonePadding: 20
+  $name: Hover zone padding (px)
   $description: >-
-    How far along the row the hover zone reaches from the button's side, so you
-    do not have to land on the button itself. Set to 0 to require the button.
+    How far beyond the item the hover zone reaches on each side, so the menu
+    opens from anywhere on the item or just past it. Set to 0 to require the
+    button itself.
+- closeOnLeave: true
+  $name: Close when the pointer leaves
+  $description: >-
+    Dismiss the menu as soon as the pointer moves off both it and the item it
+    came from, instead of waiting for a click elsewhere or Escape.
+- closeDelay: 300
+  $name: Close delay (ms)
+  $description: >-
+    How long the pointer may be away before the menu closes, from 0 to 2000. A
+    little slack lets you cross a gap between the item and the menu.
 - hoverDelay: 250
   $name: Hover delay (ms)
   $description: >-
@@ -220,7 +238,9 @@ enum class ShowHidden {
 
 struct {
     bool openOnHover;
-    int hoverZoneWidth;
+    int hoverZonePadding;
+    bool closeOnLeave;
+    int closeDelayMs;
     int hoverDelayMs;
     bool roundedCorners;
     int iconSize;
@@ -252,13 +272,23 @@ FolderAction ParseFolderAction(PCWSTR value) {
 void LoadSettings() {
     g_settings.openOnHover = Wh_GetIntSetting(L"openOnHover");
 
-    int hoverZoneWidth = Wh_GetIntSetting(L"hoverZoneWidth");
-    if (hoverZoneWidth < 0) {
-        hoverZoneWidth = 0;
-    } else if (hoverZoneWidth > 400) {
-        hoverZoneWidth = 400;
+    int hoverZonePadding = Wh_GetIntSetting(L"hoverZonePadding");
+    if (hoverZonePadding < 0) {
+        hoverZonePadding = 0;
+    } else if (hoverZonePadding > 200) {
+        hoverZonePadding = 200;
     }
-    g_settings.hoverZoneWidth = hoverZoneWidth;
+    g_settings.hoverZonePadding = hoverZonePadding;
+
+    g_settings.closeOnLeave = Wh_GetIntSetting(L"closeOnLeave");
+
+    int closeDelay = Wh_GetIntSetting(L"closeDelay");
+    if (closeDelay < 0) {
+        closeDelay = 0;
+    } else if (closeDelay > 2000) {
+        closeDelay = 2000;
+    }
+    g_settings.closeDelayMs = closeDelay;
 
     int hoverDelay = Wh_GetIntSetting(L"hoverDelay");
     if (hoverDelay < 0) {
@@ -385,6 +415,10 @@ bool g_workerContainerIsTree;        // The cached container is the nav pane.
 PIDLIST_ABSOLUTE g_workerFolderAbs;  // Worker thread only: the folder
 bool g_workerFolderIsDesktop;        // the shared children map holds.
 bool g_workerChildrenValid;
+// How many rows the last snapshot of a view-items view (see
+// WorkerBuildViewChildren) had on screen. Such a view fills in over time, so a
+// change here means new items arrived and the map has to be rebuilt.
+size_t g_workerViewItemCount;
 
 // True while a File Explorer window or the desktop is the foreground window.
 // Raw input is ignored otherwise, so the mod does no work for other apps.
@@ -440,6 +474,12 @@ constexpr UINT_PTR kDialogActivateTimerId = 2;
 // not open anything.
 constexpr UINT_PTR kHoverOpenTimerId = 3;
 bool g_hoverOpenPending;
+
+// Closing on leave: while the menu is up, moving the pointer off both it and
+// the item it came from starts this timer; when it fires the menu is dismissed.
+// Moving back onto either cancels it, so crossing the gap between them is fine.
+constexpr UINT_PTR kCloseOnLeaveTimerId = 4;
+bool g_closeOnLeavePending;
 // Set when a menu closes while the pointer is still in the zone, so it does not
 // immediately open again; cleared once the pointer leaves.
 bool g_hoverOpenBlocked;
@@ -1431,6 +1471,25 @@ bool IsFolderPidl(PCIDLIST_ABSOLUTE pidl) {
     return isFolder;
 }
 
+// True if the pidl names something that lives on disk. A view of such a folder
+// shows exactly that folder's children, so a hovered name can be resolved by
+// enumerating it. A view of anything else - search results, Home, a library,
+// the recycle bin - shows items from elsewhere, and is resolved from the view's
+// own items instead (see WorkerBuildViewChildren).
+bool IsFileSystemPidl(PCIDLIST_ABSOLUTE pidl) {
+    if (!pidl) {
+        return false;
+    }
+    winrt::com_ptr<IShellItem> item;
+    if (FAILED(SHCreateItemFromIDList(pidl, IID_PPV_ARGS(item.put()))) ||
+        !item) {
+        return false;
+    }
+    SFGAOF attrs = 0;
+    return SUCCEEDED(item->GetAttributes(SFGAO_FILESYSTEM, &attrs)) &&
+           (attrs & SFGAO_FILESYSTEM);
+}
+
 // If `child` (a shortcut item in `folder`) points to a folder, returns the
 // target's absolute pidl (caller frees); otherwise nullptr. Only stored target
 // data is read (no link resolution / network access), so it cannot stall.
@@ -1560,6 +1619,129 @@ void WorkerBuildChildren(
 
         CoTaskMemFree(child);
         child = nullptr;
+    }
+}
+
+// Upper bound on how many items a view may hold before the view-items path
+// gives up. Asking the view for all of its items costs roughly in proportion
+// to how many there are, and a search over a whole drive can return tens of
+// thousands. Past this point the expand button simply does not appear in such a
+// view, which is better than making every hover slow.
+constexpr int kMaxViewItems = 1000;
+
+// Builds the name -> target-pidl map from the items the view is actually
+// showing, rather than from the folder's children. This is what makes the mod
+// work in views whose rows come from somewhere else: search results, Home and
+// the folders pinned to it, libraries, the recycle bin.
+//
+// The view hands over all of its items as a single data object - one
+// cross-process call - which the shell turns into IShellItems, so everything
+// after that call is in-process. The pidls are the view's own: for a search
+// result that is scoped to the search rather than to the folder on disk, which
+// still binds (the search folder delegates to the real item) and is all the
+// menu needs - what a click inside the menu opens is resolved by the menu band
+// itself, not from here. Existing entries are left alone, so a caller may
+// pre-seed the map. Worker thread only.
+void WorkerBuildViewChildren(
+    HWND tab,
+    std::unordered_map<std::wstring, PIDLIST_ABSOLUTE>& out) {
+    winrt::com_ptr<IShellBrowser> browser = GetShellBrowserForTab(tab);
+    if (!browser) {
+        return;
+    }
+
+    winrt::com_ptr<IShellView> view;
+    if (FAILED(browser->QueryActiveShellView(view.put())) || !view) {
+        return;
+    }
+
+    winrt::com_ptr<IFolderView> folderView;
+    if (SUCCEEDED(view->QueryInterface(IID_PPV_ARGS(folderView.put()))) &&
+        folderView) {
+        int total = 0;
+        if (SUCCEEDED(folderView->ItemCount(SVGIO_ALLVIEW, &total)) &&
+            total > kMaxViewItems) {
+            Wh_Log(L"view holds %d items, skipping the view-items map", total);
+            return;
+        }
+    }
+
+    winrt::com_ptr<IDataObject> dataObject;
+    if (FAILED(view->GetItemObject(SVGIO_ALLVIEW,
+                                   IID_PPV_ARGS(dataObject.put()))) ||
+        !dataObject) {
+        return;
+    }
+
+    winrt::com_ptr<IShellItemArray> itemArray;
+    if (FAILED(SHCreateShellItemArrayFromDataObject(
+            dataObject.get(), IID_PPV_ARGS(itemArray.put()))) ||
+        !itemArray) {
+        return;
+    }
+
+    DWORD count = 0;
+    if (FAILED(itemArray->GetCount(&count))) {
+        return;
+    }
+
+    for (DWORD i = 0; i < count; i++) {
+        winrt::com_ptr<IShellItem> item;
+        if (FAILED(itemArray->GetItemAt(i, item.put())) || !item) {
+            continue;
+        }
+
+        // Only folders are worth a menu; shortcuts are kept so one pointing at
+        // a folder can be expanded, exactly as in the enumeration path.
+        SFGAOF attrs = 0;
+        if (FAILED(item->GetAttributes(SFGAO_FOLDER | SFGAO_LINK, &attrs))) {
+            attrs = 0;
+        }
+        if (!(attrs & (SFGAO_FOLDER | SFGAO_LINK))) {
+            continue;
+        }
+
+        PIDLIST_ABSOLUTE itemAbs = nullptr;
+        if (FAILED(SHGetIDListFromObject(item.get(), &itemAbs)) || !itemAbs) {
+            continue;
+        }
+
+        PIDLIST_ABSOLUTE target = nullptr;
+        if (attrs & SFGAO_FOLDER) {
+            target = itemAbs;
+            itemAbs = nullptr;
+        } else {
+            winrt::com_ptr<IShellFolder> parent;
+            PCUITEMID_CHILD child = nullptr;
+            if (SUCCEEDED(SHBindToParent(itemAbs, IID_PPV_ARGS(parent.put()),
+                                         &child)) &&
+                parent && child) {
+                target = ResolveFolderShortcut(parent.get(),
+                                               (LPCITEMIDLIST)child);
+            }
+        }
+        if (itemAbs) {
+            ILFree(itemAbs);
+        }
+        if (!target) {
+            continue;
+        }
+
+        // The display name is what the row shows, which is what the UI thread
+        // looks the hit item up by.
+        std::wstring key;
+        PWSTR name = nullptr;
+        if (SUCCEEDED(item->GetDisplayName(SIGDN_NORMALDISPLAY, &name)) &&
+            name) {
+            key = ToLower(name);
+            CoTaskMemFree(name);
+        }
+
+        if (key.empty() || out.find(key) != out.end()) {
+            ILFree(target);
+            continue;
+        }
+        out[key] = target;
     }
 }
 
@@ -1813,9 +1995,10 @@ void WorkerBuildSnapshot(HWND tab, bool isDesktop, POINT pt) {
 
     winrt::com_ptr<IShellFolder> folder;
     PIDLIST_ABSOLUTE folderAbs = nullptr;
+    bool isDialog = !isDesktop && IsFileDialogWindow(GetAncestor(tab, GA_ROOT));
     if (isDesktop) {
         SHGetDesktopFolder(folder.put());
-    } else if (IsFileDialogWindow(GetAncestor(tab, GA_ROOT))) {
+    } else if (isDialog) {
         GetFolderForFileDialog(tab, folder, &folderAbs);
     } else {
         GetFolderForExplorerTab(tab, folder, &folderAbs);
@@ -1856,10 +2039,30 @@ void WorkerBuildSnapshot(HWND tab, bool isDesktop, POINT pt) {
         }
     }
 
+    // A view that is not showing a folder on disk - search results, Home and
+    // the folders pinned to it, a library, the recycle bin - lists items from
+    // elsewhere, so enumerating "the folder" would not find them. Take the
+    // items from the view itself in that case. Such a view also fills in over
+    // time (a search most of all), so a change in the number of rows on screen
+    // means new items arrived and the map is out of date.
+    bool fromView = !isDesktop && !isDialog && !IsFileSystemPidl(folderAbs);
+    if (fromView && items.size() != g_workerViewItemCount) {
+        folderChanged = true;
+    }
+    g_workerViewItemCount = fromView ? items.size() : 0;
+
     std::unordered_map<std::wstring, PIDLIST_ABSOLUTE> children;
     bool rebuiltChildren = false;
     if (folderChanged) {
-        WorkerBuildChildren(folder.get(), folderAbs, isDesktop, children);
+        if (fromView) {
+            WorkerBuildViewChildren(tab, children);
+        }
+        // Enumerating the folder is the normal path, and the fallback for when
+        // the view would not list its items (too many of them, or no live
+        // shell view to ask).
+        if (children.empty()) {
+            WorkerBuildChildren(folder.get(), folderAbs, isDesktop, children);
+        }
         rebuiltChildren = true;
     }
 
@@ -3441,6 +3644,60 @@ bool ForceSetForegroundWindow(HWND hwnd) {
     return result;
 }
 
+// Cancels the pending close-on-leave countdown, if any.
+void CancelCloseOnLeave() {
+    if (!g_closeOnLeavePending) {
+        return;
+    }
+    g_closeOnLeavePending = false;
+    if (g_sinkWnd) {
+        KillTimer(g_sinkWnd, kCloseOnLeaveTimerId);
+    }
+}
+
+// True if the pointer is somewhere that should keep an open menu alive: inside
+// the hover zone of the item it was opened from (which contains the expand
+// button), or over one of our own windows - the menu, any cascaded submenu, or
+// the button. The mod runs in its own tool process, so "a window of this
+// process" is an exact test: every window we own is part of the mod's UI.
+bool PointerOverMenuOrZone(POINT pt) {
+    if (PtInRect(&g_hoverZoneRect, pt) || PtInRect(&g_chevronRect, pt)) {
+        return true;
+    }
+
+    HWND under = WindowFromPoint(pt);
+    if (!under) {
+        return false;
+    }
+    DWORD pid = 0;
+    GetWindowThreadProcessId(under, &pid);
+    return pid == GetCurrentProcessId();
+}
+
+// Called on every raw mouse event while the menu is up: starts the countdown
+// once the pointer is off both the menu and the item it came from, and cancels
+// it as soon as it is back on either. The short grace period is what lets the
+// pointer cross the gap between the row and the menu without the menu
+// vanishing underneath it.
+void UpdateCloseOnLeave() {
+    if (!g_menuActive || !g_settings.closeOnLeave || !g_sinkWnd) {
+        return;
+    }
+
+    POINT pt;
+    if (!GetCursorPos(&pt)) {
+        return;
+    }
+
+    if (PointerOverMenuOrZone(pt)) {
+        CancelCloseOnLeave();
+    } else if (!g_closeOnLeavePending) {
+        g_closeOnLeavePending = true;
+        SetTimer(g_sinkWnd, kCloseOnLeaveTimerId,
+                 (UINT)g_settings.closeDelayMs, nullptr);
+    }
+}
+
 // Shows the folder menu and pumps a nested message loop until it is dismissed.
 void ShowFolderMenuModal(PCIDLIST_ABSOLUTE pidlAbs, RECT anchorRect) {
     g_menuActive = true;
@@ -3460,6 +3717,7 @@ void ShowFolderMenuModal(PCIDLIST_ABSOLUTE pidlAbs, RECT anchorRect) {
         if (!hwndMenu || !ForceSetForegroundWindow(hwndMenu)) {
             Wh_Log(L"Could not bring menu window to foreground, closing");
             CloseMenuBand(band.get());
+            CancelCloseOnLeave();
             g_menuActive = false;
             g_menuDpi = 0;
             return;
@@ -3530,6 +3788,7 @@ void ShowFolderMenuModal(PCIDLIST_ABSOLUTE pidlAbs, RECT anchorRect) {
     // Deferred work posted by the menu band (e.g. launching an item) runs once
     // we return to the outer message loop, which keeps pumping.
     g_pendingExecAction = FolderAction::nothing;
+    CancelCloseOnLeave();
     g_menuActive = false;
     g_menuDpi = 0;
 }
@@ -3704,26 +3963,14 @@ void ShowChevronForItem(PIDLIST_ABSOLUTE childAbs, RECT itemRect) {
 
     SetRect(&g_chevronRect, x, y, x + size, y + size);
 
-    // The zone runs from the button's side of the row inward, so the menu can
-    // be summoned by moving along the row instead of onto the button. Never
-    // smaller than the button itself.
-    int zoneWidth = MulDiv(g_settings.hoverZoneWidth, dpi, 96);
-    if (zoneWidth < size + margin * 2) {
-        zoneWidth = size + margin * 2;
-    }
-    if (left) {
-        g_hoverZoneRect.left = itemRect.left;
-        g_hoverZoneRect.right = itemRect.left + zoneWidth;
-    } else {
-        g_hoverZoneRect.left = itemRect.right - zoneWidth;
-        g_hoverZoneRect.right = itemRect.right;
-    }
-    if (g_hoverZoneRect.left < itemRect.left) {
-        g_hoverZoneRect.left = itemRect.left;
-    }
-    g_hoverZoneRect.top = itemRect.top;
-    g_hoverZoneRect.bottom = itemRect.bottom;
-    // The button can be nudged outside the row by the offset settings; keep it
+    // The zone is the item itself widened by the padding on each side, so the
+    // menu opens from anywhere on the item or just past either end of it. The
+    // item rect here is already trimmed to the name column in Details view, so
+    // the padding is measured from the text rather than from the row's edge.
+    int pad = MulDiv(g_settings.hoverZonePadding, dpi, 96);
+    g_hoverZoneRect = itemRect;
+    InflateRect(&g_hoverZoneRect, pad, 0);
+    // The button can be nudged outside the item by the offset settings; keep it
     // reachable by hover either way.
     UnionRect(&g_hoverZoneRect, &g_hoverZoneRect, &g_chevronRect);
 
@@ -4135,6 +4382,18 @@ LRESULT CALLBACK SinkWndProc(HWND hwnd,
         return 0;
     }
 
+    if (msg == WM_TIMER && wParam == kCloseOnLeaveTimerId) {
+        CancelCloseOnLeave();
+        // Re-check before acting: the pointer may have come back between the
+        // last mouse event and now, and the menu may already be gone.
+        POINT pt;
+        if (g_menuActive && g_pActiveMenuBand && GetCursorPos(&pt) &&
+            !PointerOverMenuOrZone(pt)) {
+            CloseMenuBand(g_pActiveMenuBand);
+        }
+        return 0;
+    }
+
     if (msg == WM_TIMER && wParam == kWatchdogTimerId) {
         // Periodic re-check while the button is shown, to catch navigation that
         // moved no mouse (double-click / keyboard Enter).
@@ -4273,6 +4532,12 @@ LRESULT CALLBACK SinkWndProc(HWND hwnd,
                 ULONGLONG now = GetTickCount64();
                 if (force || now - g_lastInputTick >= kInputCoalesceMs) {
                     g_lastInputTick = now;
+                    // While the menu is up the hover engine is frozen, so the
+                    // pointer leaving the menu is noticed here rather than in
+                    // Evaluate (which returns immediately then). Raw input
+                    // reaches this sink window whichever loop is pumping, so
+                    // this works inside the menu's modal loop too.
+                    UpdateCloseOnLeave();
                     Evaluate(force);
                 }
             }
