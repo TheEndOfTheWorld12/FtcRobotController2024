@@ -45,6 +45,8 @@ so the mod never has to guess which way to flip.
 ## Notes
 
 * Only Windows 11 has this bell.
+* It attaches to the bell that is already on screen when you enable it, so
+  there is nothing to toggle or restart afterwards.
 * If the bell is hidden, turn it on in **Settings -> System -> Notifications**.
 * The mod leaves every other tray icon alone.
 */
@@ -503,6 +505,13 @@ bool ReleaseMatchesChosenButton(
 // without a matching release the button never raises its own click, which is
 // what keeps the notification centre shut.
 void AttachToBell(FrameworkElement iconView) {
+    for (const auto& existing : g_attached) {
+        if (existing.element == iconView) {
+            Wh_Log(L"Already attached to this bell");
+            return;
+        }
+    }
+
     auto pressedHandler = input::PointerEventHandler(
         [](winrt::Windows::Foundation::IInspectable const& sender,
            input::PointerRoutedEventArgs const& args) {
@@ -664,6 +673,223 @@ void DetachAll() {
 
 // ------------------------------------------------------------------- hooks --
 
+// The IconView constructor hook only fires for icons created after the mod
+// loads, which is why enabling it did nothing until the bell was rebuilt. This
+// reaches the taskbar that is already up: through its window to its TaskbarHost
+// to the XamlRoot, which is the same route Taskbar tray system icon tweaks
+// uses. Four symbols from taskbar.dll, and one byte-pattern read to find an
+// offset that moves between builds.
+
+void* CTaskBand_ITaskListWndSite_vftable;
+
+using CTaskBand_GetTaskbarHost_t = void*(WINAPI*)(void* pThis, void** result);
+CTaskBand_GetTaskbarHost_t CTaskBand_GetTaskbarHost_Original;
+
+void* TaskbarHost_FrameHeight_Original;
+
+using std__Ref_count_base__Decref_t = void(WINAPI*)(void* pThis);
+std__Ref_count_base__Decref_t std__Ref_count_base__Decref_Original;
+
+BOOL CALLBACK FindTaskbarWndProc(HWND hWnd, LPARAM lParam) {
+    DWORD processId = 0;
+    WCHAR className[32];
+    if (GetWindowThreadProcessId(hWnd, &processId) &&
+        processId == GetCurrentProcessId() &&
+        GetClassNameW(hWnd, className, ARRAYSIZE(className)) &&
+        _wcsicmp(className, L"Shell_TrayWnd") == 0) {
+        *reinterpret_cast<HWND*>(lParam) = hWnd;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+HWND FindCurrentProcessTaskbarWnd() {
+    HWND taskbar = nullptr;
+    EnumWindows(FindTaskbarWndProc, reinterpret_cast<LPARAM>(&taskbar));
+    return taskbar;
+}
+
+XamlRoot GetTaskbarXamlRoot(HWND hTaskbarWnd) {
+    HWND hTaskSwWnd = (HWND)GetPropW(hTaskbarWnd, L"TaskbandHWND");
+    if (!hTaskSwWnd) {
+        return nullptr;
+    }
+
+    void* taskBand = (void*)GetWindowLongPtrW(hTaskSwWnd, 0);
+    void* taskBandForTaskListWndSite = taskBand;
+    for (int i = 0; *(void**)taskBandForTaskListWndSite !=
+                    CTaskBand_ITaskListWndSite_vftable;
+         i++) {
+        if (i == 20) {
+            return nullptr;
+        }
+        taskBandForTaskListWndSite = (void**)taskBandForTaskListWndSite + 1;
+    }
+
+    void* taskbarHostSharedPtr[2]{};
+    CTaskBand_GetTaskbarHost_Original(taskBandForTaskListWndSite,
+                                      taskbarHostSharedPtr);
+    if (!taskbarHostSharedPtr[0] && !taskbarHostSharedPtr[1]) {
+        return nullptr;
+    }
+
+    size_t taskbarElementIUnknownOffset = 0x48;
+
+#if defined(_M_X64)
+    {
+        // 48:83EC 28 | sub rsp,28
+        // 48:83C1 48 | add rcx,48
+        const BYTE* b = (const BYTE*)TaskbarHost_FrameHeight_Original;
+        if (b[0] == 0x48 && b[1] == 0x83 && b[2] == 0xEC && b[4] == 0x48 &&
+            b[5] == 0x83 && b[6] == 0xC1 && b[7] <= 0x7F) {
+            taskbarElementIUnknownOffset = b[7];
+        } else {
+            Wh_Log(L"Unsupported TaskbarHost::FrameHeight; using the default "
+                   L"offset");
+        }
+    }
+#endif
+
+    auto* taskbarElementIUnknown =
+        *(IUnknown**)((BYTE*)taskbarHostSharedPtr[0] +
+                      taskbarElementIUnknownOffset);
+
+    FrameworkElement taskbarElement = nullptr;
+    taskbarElementIUnknown->QueryInterface(winrt::guid_of<FrameworkElement>(),
+                                           winrt::put_abi(taskbarElement));
+
+    auto result = taskbarElement ? taskbarElement.XamlRoot() : nullptr;
+
+    std__Ref_count_base__Decref_Original(taskbarHostSharedPtr[1]);
+
+    return result;
+}
+
+using RunFromWindowThreadProc_t = void(WINAPI*)(void* parameter);
+
+struct RUN_FROM_WINDOW_THREAD_PARAM {
+    RunFromWindowThreadProc_t proc;
+    void* procParam;
+};
+
+UINT g_runFromWindowThreadMsg;
+
+LRESULT CALLBACK RunFromWindowThreadHookProc(int nCode,
+                                             WPARAM wParam,
+                                             LPARAM lParam) {
+    if (nCode == HC_ACTION) {
+        const CWPSTRUCT* cwp = (const CWPSTRUCT*)lParam;
+        if (cwp->message == g_runFromWindowThreadMsg) {
+            auto* param = (RUN_FROM_WINDOW_THREAD_PARAM*)cwp->lParam;
+            param->proc(param->procParam);
+        }
+    }
+    return CallNextHookEx(nullptr, nCode, wParam, lParam);
+}
+
+bool RunFromWindowThread(HWND hWnd,
+                         RunFromWindowThreadProc_t proc,
+                         void* procParam) {
+    if (!g_runFromWindowThreadMsg) {
+        g_runFromWindowThreadMsg =
+            RegisterWindowMessageW(L"Windhawk_RunFromWindowThread_" WH_MOD_ID);
+    }
+
+    DWORD threadId = GetWindowThreadProcessId(hWnd, nullptr);
+    if (threadId == 0) {
+        return false;
+    }
+
+    if (threadId == GetCurrentThreadId()) {
+        proc(procParam);
+        return true;
+    }
+
+    HHOOK hook = SetWindowsHookExW(WH_CALLWNDPROC, RunFromWindowThreadHookProc,
+                                   nullptr, threadId);
+    if (!hook) {
+        return false;
+    }
+
+    RUN_FROM_WINDOW_THREAD_PARAM param;
+    param.proc = proc;
+    param.procParam = procParam;
+    SendMessageW(hWnd, g_runFromWindowThreadMsg, 0, (LPARAM)&param);
+
+    UnhookWindowsHookEx(hook);
+    return true;
+}
+
+// xamlRoot -> SystemTrayFrame -> SystemTrayFrameGrid -> NotificationCenterButton
+//   -> Grid -> ContentPresenter -> ItemsPresenter -> StackPanel
+//   -> ContentPresenter -> #SystemTrayIcon
+bool AttachFromXamlRoot(XamlRoot xamlRoot) {
+    FrameworkElement child = xamlRoot.Content().try_as<FrameworkElement>();
+    if (!child ||
+        !(child = FindChildByClassName(child, L"SystemTray.SystemTrayFrame")) ||
+        !(child = FindChildByName(child, L"SystemTrayFrameGrid")) ||
+        !(child = FindChildByName(child, L"NotificationCenterButton"))) {
+        Wh_Log(L"Could not reach NotificationCenterButton from the XamlRoot");
+        return false;
+    }
+
+    if (!(child = FindChildByClassName(child,
+                                       L"Windows.UI.Xaml.Controls.Grid")) ||
+        !(child = FindChildByName(child, L"ContentPresenter")) ||
+        !(child = FindChildByClassName(
+              child, L"Windows.UI.Xaml.Controls.ItemsPresenter")) ||
+        !(child = FindChildByClassName(
+              child, L"Windows.UI.Xaml.Controls.StackPanel"))) {
+        Wh_Log(L"Could not reach the button's stack panel");
+        return false;
+    }
+
+    bool attached = false;
+    EnumChildElements(child, [&attached](FrameworkElement presenter) {
+        FrameworkElement iconView =
+            FindChildByName(presenter, L"SystemTrayIcon");
+        if (iconView && LooksLikeTheBell(iconView)) {
+            AttachToBell(iconView);
+            attached = true;
+            return true;  // stop at the first bell
+        }
+        return false;
+    });
+
+    if (!attached) {
+        Wh_Log(L"Walked the live tree but found no bell under the button");
+    }
+    return attached;
+}
+
+struct AttachNowParam {
+    HWND hTaskbarWnd;
+};
+
+void WINAPI AttachNowProc(void* pParam) {
+    auto& param = *(AttachNowParam*)pParam;
+    auto xamlRoot = GetTaskbarXamlRoot(param.hTaskbarWnd);
+    if (!xamlRoot) {
+        Wh_Log(L"Could not get the taskbar's XamlRoot");
+        return;
+    }
+    AttachFromXamlRoot(xamlRoot);
+}
+
+// Attach to the bell that is on screen right now, so enabling the mod is
+// enough and the tray does not have to be rebuilt first.
+void AttachToLiveTaskbar() {
+    HWND hTaskbarWnd = FindCurrentProcessTaskbarWnd();
+    if (!hTaskbarWnd) {
+        Wh_Log(L"No taskbar in this process");
+        return;
+    }
+    AttachNowParam param{hTaskbarWnd};
+    if (!RunFromWindowThread(hTaskbarWnd, AttachNowProc, &param)) {
+        Wh_Log(L"Could not run on the taskbar thread");
+    }
+}
+
 using IconView_IconView_t = void*(WINAPI*)(void* pThis);
 IconView_IconView_t IconView_IconView_Original;
 
@@ -777,6 +1003,37 @@ bool HookSystemTraySymbols(HMODULE module) {
     return true;
 }
 
+bool HookTaskbarDllSymbols() {
+    HMODULE module =
+        LoadLibraryExW(L"taskbar.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!module) {
+        Wh_Log(L"Failed to load taskbar.dll");
+        return false;
+    }
+
+    WindhawkUtils::SYMBOL_HOOK taskbarDllHooks[] = {
+        {
+            {LR"(const CTaskBand::`vftable'{for `ITaskListWndSite'})"},
+            &CTaskBand_ITaskListWndSite_vftable,
+        },
+        {
+            {LR"(public: virtual class std::shared_ptr<class TaskbarHost> __cdecl CTaskBand::GetTaskbarHost(void)const )"},
+            &CTaskBand_GetTaskbarHost_Original,
+        },
+        {
+            {LR"(public: int __cdecl TaskbarHost::FrameHeight(void)const )"},
+            &TaskbarHost_FrameHeight_Original,
+        },
+        {
+            {LR"(public: void __cdecl std::_Ref_count_base::_Decref(void))"},
+            &std__Ref_count_base__Decref_Original,
+        },
+    };
+
+    return WindhawkUtils::HookSymbols(module, taskbarDllHooks,
+                                      ARRAYSIZE(taskbarDllHooks));
+}
+
 void HandleLoadedModuleIfSystemTray(HMODULE module, LPCWSTR lpLibFileName) {
     if (!g_systemTrayModuleHooked && GetSystemTrayModuleHandle() == module &&
         !g_systemTrayModuleHooked.exchange(true)) {
@@ -851,11 +1108,24 @@ BOOL Wh_ModInit() {
                                        &LoadLibraryExW_Original);
     }
 
+    if (!HookTaskbarDllSymbols()) {
+        // Not fatal: without this the mod still works once the tray rebuilds,
+        // which is how it behaved before.
+        Wh_Log(L"taskbar.dll symbols unavailable; the bell will only be picked "
+               L"up when the tray is next rebuilt");
+    }
+
     return TRUE;
+}
+
+void Wh_ModAfterInit() {
+    Wh_Log(L">");
+    AttachToLiveTaskbar();
 }
 
 void Wh_ModSettingsChanged() {
     LoadSettings();
+    AttachToLiveTaskbar();
 }
 
 void Wh_ModUninit() {
