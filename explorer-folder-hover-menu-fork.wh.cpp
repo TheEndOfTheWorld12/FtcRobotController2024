@@ -2,7 +2,7 @@
 // @id              explorer-folder-hover-menu-fork
 // @name            Folder Hover Menu - Fork
 // @description     Hover a folder in File Explorer to get an expand button that opens a cascading menu of the folder's contents
-// @version         1.5
+// @version         1.6
 // @author          m417z
 // @github          https://github.com/m417z
 // @twitter         https://twitter.com/m417z
@@ -20,8 +20,11 @@ appears in the corner of that folder. Rest the pointer anywhere on the folder -
 or a little past either end of its name - and a cascading menu of the folder's
 contents pops up: no click needed, and you do not have to land on the button
 itself. Move the pointer off both the menu and the folder and the menu closes
-again on its own. Clicking still works, and the hover, its zone, its delay and
-the close-on-leave behaviour can all be changed in the settings.
+again on its own. Explorer's own info tip - the box listing the folder's size,
+date and contents - is kept out of the way while the menu is up, so the two no
+longer sit on top of each other. Clicking still works, and the hover, its zone,
+its delay, the close-on-leave behaviour and the info tip can all be changed in
+the settings.
 
 This works everywhere folders are shown:
 
@@ -66,6 +69,11 @@ Inspired by [QTTabBar](https://qttabbar.wikidot.com/).
   $description: >-
     How long the pointer may be away before the menu closes, from 0 to 2000. A
     little slack lets you cross a gap between the item and the menu.
+- hideInfoTips: true
+  $name: Hide Explorer's info tip
+  $description: >-
+    Dismiss Explorer's own info tip - the box listing a folder's size, date and
+    contents - while the menu is open, so it does not sit on top of the menu.
 - hoverDelay: 250
   $name: Hover delay (ms)
   $description: >-
@@ -241,6 +249,7 @@ struct {
     int hoverZonePadding;
     bool closeOnLeave;
     int closeDelayMs;
+    bool hideInfoTips;
     int hoverDelayMs;
     bool roundedCorners;
     int iconSize;
@@ -289,6 +298,8 @@ void LoadSettings() {
         closeDelay = 2000;
     }
     g_settings.closeDelayMs = closeDelay;
+
+    g_settings.hideInfoTips = Wh_GetIntSetting(L"hideInfoTips");
 
     int hoverDelay = Wh_GetIntSetting(L"hoverDelay");
     if (hoverDelay < 0) {
@@ -381,6 +392,10 @@ ULONG_PTR g_gdiplusToken;
 HWND g_chevronWnd;  // The visible expand button.
 HWND g_sinkWnd;     // Hidden window: raw input + app messages (UI thread).
 HWINEVENTHOOK g_foregroundHook;
+// Watches the hovered view's process for Explorer's own info tip appearing, so
+// it can be popped before it covers the menu (see InfoTipShownProc).
+HWINEVENTHOOK g_infoTipHook;
+DWORD g_infoTipPid;
 // "TaskbarCreated" broadcast id; Explorer broadcasts it when the shell
 // (re)starts, so the sink window re-checks the active state then (see
 // SinkWndProc), recovering the desktop after an Explorer restart without
@@ -3888,6 +3903,117 @@ void RenderChevron(HWND hwnd, int x, int y, int size) {
     ReleaseDC(nullptr, screenDC);
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// Explorer's info tip.
+//
+// Resting on a folder makes Explorer put up its own info tip - the box listing
+// the folder's size, date and what is inside it - anchored to the item the
+// pointer is on. That is exactly where this mod's menu goes, so the two land on
+// top of each other. The tip is an ordinary tooltip control living in the
+// view's process, so it is dismissed the way a tooltip is: TTM_POP, which both
+// takes it off the screen and leaves the control's own state consistent, so it
+// behaves normally again once the menu is gone.
+
+constexpr WCHAR kTooltipClass[] = L"tooltips_class32";
+
+// TTM_POP has been in commctrl.h since comctl32 v5; defined here only so a
+// toolchain whose headers predate it still builds.
+#ifndef TTM_POP
+#define TTM_POP (WM_USER + 28)
+#endif
+
+// True while Explorer's info tip would get in the way: the menu is up, or the
+// button is showing and a hover is about to bring the menu up.
+bool InfoTipsUnwanted() {
+    return g_settings.hideInfoTips &&
+           (g_menuActive || (g_chevronVisible && g_settings.openOnHover));
+}
+
+// Takes one tooltip off the screen. The message is posted rather than sent: it
+// needs no answer, and the owning thread may be busy drawing the very tip we
+// are dismissing.
+void DismissTooltip(HWND hwnd) {
+    PostMessageW(hwnd, TTM_POP, 0, 0);
+    ShowWindow(hwnd, SW_HIDE);
+}
+
+BOOL CALLBACK DismissTooltipsProc(HWND hwnd, LPARAM lParam) {
+    WCHAR cls[64];
+    if (IsWindowVisible(hwnd) && GetClassNameW(hwnd, cls, ARRAYSIZE(cls)) &&
+        wcscmp(cls, kTooltipClass) == 0) {
+        DismissTooltip(hwnd);
+    }
+    return TRUE;
+}
+
+// Pops any info tip the view already has on screen. The window hook below only
+// sees tips that appear from now on, so this covers the one that was already up
+// when the menu opened. A tooltip belongs to the thread of the control that
+// owns it, which for the file list is the tab's own thread.
+void DismissTooltipsForTab(HWND tab) {
+    if (!g_settings.hideInfoTips || !tab) {
+        return;
+    }
+    DWORD threadId = GetWindowThreadProcessId(tab, nullptr);
+    if (threadId) {
+        EnumThreadWindows(threadId, DismissTooltipsProc, 0);
+    }
+}
+
+// Pops Explorer's info tip the moment it is shown.
+VOID CALLBACK InfoTipShownProc(HWINEVENTHOOK hook,
+                               DWORD event,
+                               HWND hwnd,
+                               LONG idObject,
+                               LONG idChild,
+                               DWORD idEventThread,
+                               DWORD dwmsEventTime) {
+    if (!hwnd || idObject != OBJID_WINDOW || idChild != CHILDID_SELF ||
+        !InfoTipsUnwanted()) {
+        return;
+    }
+
+    WCHAR cls[64];
+    if (GetClassNameW(hwnd, cls, ARRAYSIZE(cls)) &&
+        wcscmp(cls, kTooltipClass) == 0) {
+        DismissTooltip(hwnd);
+    }
+}
+
+void StopInfoTipSuppression() {
+    if (g_infoTipHook) {
+        UnhookWinEvent(g_infoTipHook);
+        g_infoTipHook = nullptr;
+        g_infoTipPid = 0;
+    }
+}
+
+// Starts watching `pid` (the hovered view's process) for info tips. Scoped to
+// that one process, and only installed while the button is up, so the mod is
+// not listening to the whole desktop's window events.
+void StartInfoTipSuppression(HWND tab) {
+    DWORD pid = 0;
+    if (!g_settings.hideInfoTips || !tab ||
+        !GetWindowThreadProcessId(tab, &pid) || !pid) {
+        return;
+    }
+    if (g_infoTipHook && g_infoTipPid == pid) {
+        return;
+    }
+
+    StopInfoTipSuppression();
+    g_infoTipHook = SetWinEventHook(
+        EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, nullptr, InfoTipShownProc, pid, 0,
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    if (g_infoTipHook) {
+        g_infoTipPid = pid;
+    } else {
+        Wh_Log(L"SetWinEventHook for info tips failed, le=%lu", GetLastError());
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
 void CancelHoverOpen() {
     if (!g_hoverOpenPending) {
         return;
@@ -3900,6 +4026,7 @@ void CancelHoverOpen() {
 
 void HideChevron() {
     CancelHoverOpen();
+    StopInfoTipSuppression();
     if (g_chevronVisible) {
         ShowWindow(g_chevronWnd, SW_HIDE);
         g_chevronVisible = false;
@@ -3981,6 +4108,9 @@ void ShowChevronForItem(PIDLIST_ABSOLUTE childAbs, RECT itemRect) {
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     g_chevronVisible = true;
     SetTimer(g_sinkWnd, kWatchdogTimerId, kWatchdogIntervalMs, nullptr);
+    // From here on the pointer is resting on a folder, which is what makes
+    // Explorer put its info tip up over the item - and over the menu.
+    StartInfoTipSuppression(g_targetTab);
 }
 
 // Opens the menu for the folder the button is currently showing. Shared by the
@@ -3993,6 +4123,9 @@ void OpenMenuForTarget() {
         return;
     }
     CancelHoverOpen();
+    // Explorer may already have its info tip up over the item; the window hook
+    // only catches tips that appear from now on, so clear that one here.
+    DismissTooltipsForTab(g_targetTab);
     RECT anchorRect = g_chevronRect;
     PIDLIST_ABSOLUTE pidl = ILClone(g_targetPidl);
     if (pidl) {
@@ -4656,6 +4789,7 @@ DWORD WINAPI UiThreadProc(LPVOID param) {
         UnhookWinEvent(g_foregroundHook);
         g_foregroundHook = nullptr;
     }
+    StopInfoTipSuppression();
     SetRawInputActive(false);
 
     // Stop the worker before tearing down windows it posts to.
