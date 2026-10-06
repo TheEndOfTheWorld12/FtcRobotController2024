@@ -16,8 +16,9 @@
 # Folder Hover Menu
 
 When you hover the mouse over a folder in File Explorer, a small expand button
-appears in the corner of that folder. Rest the pointer on it and a cascading
-menu of the folder's contents pops up - no click needed. Clicking still works,
+appears in the corner of that folder. Rest the pointer anywhere along that side
+of the row and a cascading menu of the folder's contents pops up - no click
+needed, and you do not have to land on the button itself. Clicking still works,
 and the hover can be turned off or its delay changed in the settings.
 
 This works in the file list and in the **navigation pane** on the left, so Quick
@@ -42,6 +43,11 @@ Inspired by [QTTabBar](https://qttabbar.wikidot.com/).
   $description: >-
     Open the menu by resting the pointer on the expand button, instead of having
     to click it. Clicking still works either way.
+- hoverZoneWidth: 90
+  $name: Hover zone width (px)
+  $description: >-
+    How far along the row the hover zone reaches from the button's side, so you
+    do not have to land on the button itself. Set to 0 to require the button.
 - hoverDelay: 250
   $name: Hover delay (ms)
   $description: >-
@@ -214,6 +220,7 @@ enum class ShowHidden {
 
 struct {
     bool openOnHover;
+    int hoverZoneWidth;
     int hoverDelayMs;
     bool roundedCorners;
     int iconSize;
@@ -244,6 +251,14 @@ FolderAction ParseFolderAction(PCWSTR value) {
 
 void LoadSettings() {
     g_settings.openOnHover = Wh_GetIntSetting(L"openOnHover");
+
+    int hoverZoneWidth = Wh_GetIntSetting(L"hoverZoneWidth");
+    if (hoverZoneWidth < 0) {
+        hoverZoneWidth = 0;
+    } else if (hoverZoneWidth > 400) {
+        hoverZoneWidth = 400;
+    }
+    g_settings.hoverZoneWidth = hoverZoneWidth;
 
     int hoverDelay = Wh_GetIntSetting(L"hoverDelay");
     if (hoverDelay < 0) {
@@ -379,6 +394,9 @@ bool g_chevronVisible;
 bool g_menuActive;
 RECT g_hoverItemRect;
 RECT g_chevronRect;
+// The band of the row that arms the hover. Wider than the button so the menu
+// can be summoned by moving along the row rather than onto a small target.
+RECT g_hoverZoneRect;
 PIDLIST_ABSOLUTE g_targetPidl;
 
 // The Explorer tab (see GetExplorerTabWindow) the hovered folder lives in, and
@@ -422,6 +440,9 @@ constexpr UINT_PTR kDialogActivateTimerId = 2;
 // not open anything.
 constexpr UINT_PTR kHoverOpenTimerId = 3;
 bool g_hoverOpenPending;
+// Set when a menu closes while the pointer is still in the zone, so it does not
+// immediately open again; cleared once the pointer leaves.
+bool g_hoverOpenBlocked;
 constexpr int kDialogActivateMaxPolls = 30;
 // The file dialog being polled for a shell view, and the number of polls left
 // before giving up. UI thread only.
@@ -3390,6 +3411,36 @@ winrt::com_ptr<IMenuBand> PopupFolderMenu(PCIDLIST_ABSOLUTE pidlAbs,
     return nullptr;
 }
 
+// Takes the foreground for `hwnd`, even though nothing was clicked.
+//
+// Windows only lets the process that owns the foreground - or one the user just
+// interacted with - call SetForegroundWindow. A click on the expand button
+// granted us that; a hover does not, so the call fails, the menu is torn down
+// the instant it appears, and all you see is it fading out. Attaching our input
+// queue to the foreground thread for the duration of the call makes Windows
+// treat us as the same input context, which is the long-standing way round
+// this. The attachment is undone immediately afterwards.
+bool ForceSetForegroundWindow(HWND hwnd) {
+    if (SetForegroundWindow(hwnd)) {
+        return true;
+    }
+
+    HWND foreground = GetForegroundWindow();
+    DWORD foregroundThread =
+        foreground ? GetWindowThreadProcessId(foreground, nullptr) : 0;
+    DWORD thisThread = GetCurrentThreadId();
+    if (!foregroundThread || foregroundThread == thisThread) {
+        return false;
+    }
+
+    bool attached = AttachThreadInput(thisThread, foregroundThread, TRUE);
+    bool result = SetForegroundWindow(hwnd);
+    if (attached) {
+        AttachThreadInput(thisThread, foregroundThread, FALSE);
+    }
+    return result;
+}
+
 // Shows the folder menu and pumps a nested message loop until it is dismissed.
 void ShowFolderMenuModal(PCIDLIST_ABSOLUTE pidlAbs, RECT anchorRect) {
     g_menuActive = true;
@@ -3406,7 +3457,7 @@ void ShowFolderMenuModal(PCIDLIST_ABSOLUTE pidlAbs, RECT anchorRect) {
         // on screen with no way to dismiss it. Claim the foreground explicitly;
         // if that fails, tear the popup down instead of letting it linger.
         HWND hwndMenu = GetMenuBandWindow(band.get());
-        if (!hwndMenu || !SetForegroundWindow(hwndMenu)) {
+        if (!hwndMenu || !ForceSetForegroundWindow(hwndMenu)) {
             Wh_Log(L"Could not bring menu window to foreground, closing");
             CloseMenuBand(band.get());
             g_menuActive = false;
@@ -3597,6 +3648,7 @@ void HideChevron() {
     }
     SetRectEmpty(&g_hoverItemRect);
     SetRectEmpty(&g_chevronRect);
+    SetRectEmpty(&g_hoverZoneRect);
 }
 
 // Takes ownership of childAbs.
@@ -3652,6 +3704,29 @@ void ShowChevronForItem(PIDLIST_ABSOLUTE childAbs, RECT itemRect) {
 
     SetRect(&g_chevronRect, x, y, x + size, y + size);
 
+    // The zone runs from the button's side of the row inward, so the menu can
+    // be summoned by moving along the row instead of onto the button. Never
+    // smaller than the button itself.
+    int zoneWidth = MulDiv(g_settings.hoverZoneWidth, dpi, 96);
+    if (zoneWidth < size + margin * 2) {
+        zoneWidth = size + margin * 2;
+    }
+    if (left) {
+        g_hoverZoneRect.left = itemRect.left;
+        g_hoverZoneRect.right = itemRect.left + zoneWidth;
+    } else {
+        g_hoverZoneRect.left = itemRect.right - zoneWidth;
+        g_hoverZoneRect.right = itemRect.right;
+    }
+    if (g_hoverZoneRect.left < itemRect.left) {
+        g_hoverZoneRect.left = itemRect.left;
+    }
+    g_hoverZoneRect.top = itemRect.top;
+    g_hoverZoneRect.bottom = itemRect.bottom;
+    // The button can be nudged outside the row by the offset settings; keep it
+    // reachable by hover either way.
+    UnionRect(&g_hoverZoneRect, &g_hoverZoneRect, &g_chevronRect);
+
     // UpdateLayeredWindow (inside RenderChevron) sets the position, size, and
     // per-pixel-alpha content; SetWindowPos only asserts top-most and shows it.
     RenderChevron(g_chevronWnd, x, y, size);
@@ -3677,6 +3752,9 @@ void OpenMenuForTarget() {
         ShowFolderMenuModal(pidl, anchorRect);
         ILFree(pidl);
     }
+    // Dismissing the menu usually leaves the pointer right where it was, which
+    // would arm the hover again and reopen immediately. Wait for it to leave.
+    g_hoverOpenBlocked = true;
 }
 
 LRESULT CALLBACK ChevronWndProc(HWND hwnd,
@@ -3764,11 +3842,16 @@ void Evaluate(bool forceRefresh) {
 
     bool onButton = g_chevronVisible && PtInRect(&g_chevronRect, pt);
 
-    // Resting on the button opens the menu. Armed the moment the pointer lands
-    // on it and cancelled as soon as it leaves, so only a deliberate rest
-    // counts.
-    if (g_settings.openOnHover && g_sinkWnd) {
-        if (onButton) {
+    // Resting anywhere in the row's hover zone opens the menu. Armed the moment
+    // the pointer lands in it and cancelled as soon as it leaves, so only a
+    // deliberate rest counts. onButton stays the button itself, because it also
+    // drives the "cursor is over our own window" handling further down.
+    bool onZone = g_chevronVisible && PtInRect(&g_hoverZoneRect, pt);
+    if (!onZone) {
+        g_hoverOpenBlocked = false;  // Left the zone; a fresh rest may open.
+    }
+    if (g_settings.openOnHover && g_sinkWnd && !g_hoverOpenBlocked) {
+        if (onZone) {
             if (!g_hoverOpenPending) {
                 g_hoverOpenPending = true;
                 SetTimer(g_sinkWnd, kHoverOpenTimerId,
@@ -3777,7 +3860,7 @@ void Evaluate(bool forceRefresh) {
         } else {
             CancelHoverOpen();
         }
-    } else if (!g_settings.openOnHover) {
+    } else {
         CancelHoverOpen();
     }
 
@@ -4046,7 +4129,7 @@ LRESULT CALLBACK SinkWndProc(HWND hwnd,
         // armed and the pointer moved away between the last evaluation and now.
         POINT pt;
         if (!g_menuActive && g_chevronVisible && GetCursorPos(&pt) &&
-            PtInRect(&g_chevronRect, pt)) {
+            PtInRect(&g_hoverZoneRect, pt)) {
             OpenMenuForTarget();
         }
         return 0;
