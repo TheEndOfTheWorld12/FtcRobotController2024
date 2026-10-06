@@ -2,7 +2,7 @@
 // @id              explorer-folder-hover-menu-fork
 // @name            Folder Hover Menu - Fork
 // @description     Hover a folder in File Explorer to get an expand button that opens a cascading menu of the folder's contents
-// @version         1.6
+// @version         1.7
 // @author          m417z
 // @github          https://github.com/m417z
 // @twitter         https://twitter.com/m417z
@@ -1236,8 +1236,10 @@ bool GetFolderForExplorerTab(HWND tab,
 // the text is fetched with an explicit WM_GETTEXT.
 
 // Defined below (window-tree helpers section); used here to locate the address
-// bar inside a file dialog.
+// bar inside a file dialog, and to recognise the navigation pane by its window
+// class when UI Automation describes it as something other than a tree.
 HWND FindDescendantOfClass(HWND parent, PCWSTR className);
+bool IsWithinClass(HWND hwnd, PCWSTR className, int maxDepth);
 
 // The common item dialog top-level window class (a standard Win32 dialog).
 constexpr WCHAR kFileDialogClass[] = L"#32770";
@@ -1781,11 +1783,19 @@ void WorkerBuildViewChildren(
 PIDLIST_ABSOLUTE FindChildByDisplayName(IShellFolder* parent,
                                         PCIDLIST_ABSOLUTE parentAbs,
                                         const std::wstring& name) {
+    // The pane's own roots - Home, Quick access, Gallery, and the folders
+    // pinned under them - are not handed out by an ordinary enumeration at all,
+    // which is why walking the pane by name used to stop at its very first
+    // level. SHCONTF_NAVIGATION_PANE asks for exactly what the pane itself
+    // shows. Its value is spelled out so the mod still builds against headers
+    // that predate the flag.
+    constexpr DWORD kShcontfNavigationPane = 0x1000;
+    const SHCONTF flags =
+        (SHCONTF)((DWORD)SHCONTF_FOLDERS | (DWORD)SHCONTF_NONFOLDERS |
+                  (DWORD)SHCONTF_INCLUDEHIDDEN | kShcontfNavigationPane);
+
     winrt::com_ptr<IEnumIDList> enumerator;
-    if (FAILED(parent->EnumObjects(nullptr,
-                                   SHCONTF_FOLDERS | SHCONTF_NONFOLDERS |
-                                       SHCONTF_INCLUDEHIDDEN,
-                                   enumerator.put())) ||
+    if (FAILED(parent->EnumObjects(nullptr, flags, enumerator.put())) ||
         !enumerator) {
         return nullptr;
     }
@@ -1810,6 +1820,89 @@ PIDLIST_ABSOLUTE FindChildByDisplayName(IShellFolder* parent,
     return result;
 }
 
+// The parse names of the nodes Explorer puts at the top of the navigation
+// pane. The pane does not enumerate these from the desktop - it appends each of
+// them explicitly - so walking down from the desktop by display name cannot
+// reach them, which is why the pane's own roots have to be listed here. The
+// name to match is read back from the shell rather than written out, so this
+// works whatever language Windows is in, and a root the running build does not
+// have simply fails to parse and is skipped.
+constexpr PCWSTR kNavPaneRoots[] = {
+    L"::{679F85CB-0220-4080-B29B-5540CC05AAB6}",  // Quick access
+    L"::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}",  // Home
+    L"::{E88865EA-0E1C-4E20-9AA6-EDCD0212C87C}",  // Gallery
+    L"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}",  // This PC
+    L"::{031E4825-7B94-4DC3-B131-E946B44C8DD5}",  // Libraries
+    L"::{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}",  // Network
+    L"::{645FF040-5081-101B-9F08-00AA002F954E}",  // Recycle Bin
+    L"shell:OneDrive",
+    L"shell:UsersFilesFolder",  // The user's own folder.
+    L"shell:Desktop",
+};
+
+// Containers whose children the pane also shows at its top level: the user's
+// own folder (Desktop, Documents, Downloads, ...) and This PC (the drives).
+constexpr PCWSTR kNavPaneRootParents[] = {
+    L"shell:UsersFilesFolder",
+    L"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}",
+};
+
+// The display name of `pidl`, lowercased, or an empty string.
+std::wstring DisplayNameOfPidl(PCIDLIST_ABSOLUTE pidl) {
+    std::wstring result;
+    PWSTR name = nullptr;
+    if (SUCCEEDED(SHGetNameFromIDList(pidl, SIGDN_NORMALDISPLAY, &name)) &&
+        name) {
+        result = ToLower(name);
+        CoTaskMemFree(name);
+    }
+    return result;
+}
+
+// The top-level pane node whose display name is `name` (lowercased), or
+// nullptr. Caller frees.
+PIDLIST_ABSOLUTE ResolveNavPaneRoot(const std::wstring& name) {
+    for (PCWSTR parseName : kNavPaneRoots) {
+        PIDLIST_ABSOLUTE abs = nullptr;
+        if (FAILED(SHParseDisplayName(parseName, nullptr, &abs, 0, nullptr)) ||
+            !abs) {
+            continue;
+        }
+        if (DisplayNameOfPidl(abs) == name) {
+            return abs;
+        }
+        ILFree(abs);
+    }
+
+    winrt::com_ptr<IShellFolder> desktop;
+    if (FAILED(SHGetDesktopFolder(desktop.put())) || !desktop) {
+        return nullptr;
+    }
+
+    for (PCWSTR parseName : kNavPaneRootParents) {
+        PIDLIST_ABSOLUTE parentAbs = nullptr;
+        if (FAILED(SHParseDisplayName(parseName, nullptr, &parentAbs, 0,
+                                      nullptr)) ||
+            !parentAbs) {
+            continue;
+        }
+
+        PIDLIST_ABSOLUTE found = nullptr;
+        winrt::com_ptr<IShellFolder> parent;
+        if (SUCCEEDED(desktop->BindToObject(parentAbs, nullptr,
+                                            IID_PPV_ARGS(parent.put()))) &&
+            parent) {
+            found = FindChildByDisplayName(parent.get(), parentAbs, name);
+        }
+        ILFree(parentAbs);
+        if (found) {
+            return found;
+        }
+    }
+
+    return nullptr;
+}
+
 // Walks `path` (root first, already lowercased) down from the desktop. Returns
 // the absolute pidl of the last element, or nullptr if any level is missing.
 // Caller frees.
@@ -1829,6 +1922,11 @@ PIDLIST_ABSOLUTE ResolveNamespacePath(const std::vector<std::wstring>& path) {
     for (size_t i = 0; i < path.size(); i++) {
         PIDLIST_ABSOLUTE childAbs =
             FindChildByDisplayName(current.get(), currentAbs, path[i]);
+        if (!childAbs && i == 0) {
+            // Nothing by that name under the desktop: the pane's own top-level
+            // nodes live outside the desktop's children, so look there.
+            childAbs = ResolveNavPaneRoot(path[0]);
+        }
         if (!childAbs) {
             if (currentAbs) {
                 ILFree(currentAbs);
@@ -1947,8 +2045,21 @@ void WorkerInstallTreeSnapshot(HWND tab,
     std::unordered_map<std::wstring, PIDLIST_ABSOLUTE> children;
 
     std::vector<std::wstring> path = TreeNodePathAt(pt);
-    if (!path.empty()) {
-        if (PIDLIST_ABSOLUTE abs = ResolveNamespacePath(path)) {
+    if (path.empty()) {
+        Wh_Log(L"nav pane: %d items, no tree node under the cursor",
+               (int)items.size());
+    } else {
+        std::wstring joined;
+        for (const std::wstring& part : path) {
+            if (!joined.empty()) {
+                joined += L" > ";
+            }
+            joined += part;
+        }
+        PIDLIST_ABSOLUTE abs = ResolveNamespacePath(path);
+        Wh_Log(L"nav pane: %d items, node \"%s\" %s", (int)items.size(),
+               joined.c_str(), abs ? L"resolved" : L"did NOT resolve");
+        if (abs) {
             children[path.back()] = abs;  // Already lowercased.
         }
     }
@@ -1989,13 +2100,23 @@ void WorkerBuildSnapshot(HWND tab, bool isDesktop, POINT pt) {
         SetRectEmpty(&g_workerContainerRect);
         g_workerContainerIsTree = false;
         if (g_workerContainer) {
-            g_workerContainerIsTree = IsTreeContainer(g_workerContainer.get());
+            // Normally UI Automation calls the pane a Tree. When the container
+            // had to be bound to the window directly (see
+            // FindContainerFromWindow) it can come back as something else, and
+            // the pane would then be driven down the file-list path and
+            // silently resolve nothing - so the window class has the last word.
+            g_workerContainerIsTree =
+                IsTreeContainer(g_workerContainer.get()) ||
+                IsWithinClass(WindowFromPoint(pt), L"NamespaceTreeControl", 8);
             RECT bounds;
             if (SUCCEEDED(
                     g_workerContainer->get_CurrentBoundingRectangle(&bounds))) {
                 g_workerContainerRect = bounds;
             }
         }
+        Wh_Log(L"container %s, tree=%d",
+               g_workerContainer ? L"acquired" : L"NOT found",
+               (int)g_workerContainerIsTree);
     }
 
     // The navigation pane resolves each node on its own, so none of the
@@ -4193,6 +4314,41 @@ bool HasShellView(HWND root) {
     return FindDescendantOfClass(root, L"SHELLDLL_DefView") != nullptr;
 }
 
+// The last window the hover engine declined to act on, and the line reported
+// for it, so the same one is not logged again on every mouse move. UI thread
+// only.
+HWND g_lastRejectWnd;
+std::wstring g_lastRejectLogged;
+
+// Names, once per distinct window class, a point the hover engine declined to
+// act on. Hovering moves the pointer constantly, so without the de-duplication
+// this would flood the log; with it, one line names the control that was not
+// recognised - which is exactly what a report of "no button here" needs.
+void LogSurfaceReject(HWND under, HWND root) {
+    // This runs on the raw-input path, so the common case - the pointer still
+    // over the same unrecognised control - must cost nothing.
+    if (under == g_lastRejectWnd) {
+        return;
+    }
+    g_lastRejectWnd = under;
+
+    WCHAR cls[64] = L"(none)";
+    WCHAR rootCls[64] = L"(none)";
+    if (under) {
+        GetClassNameW(under, cls, ARRAYSIZE(cls));
+    }
+    if (root) {
+        GetClassNameW(root, rootCls, ARRAYSIZE(rootCls));
+    }
+
+    std::wstring key = std::wstring(cls) + L" in " + rootCls;
+    if (key == g_lastRejectLogged) {
+        return;
+    }
+    g_lastRejectLogged = key;
+    Wh_Log(L"not a surface the mod handles: %s", key.c_str());
+}
+
 // True if hwnd or one of its ancestors (up to maxDepth) has the given class.
 bool IsWithinClass(HWND hwnd, PCWSTR className, int maxDepth) {
     for (int i = 0; hwnd && i < maxDepth; i++) {
@@ -4263,14 +4419,19 @@ void Evaluate(bool forceRefresh) {
         HWND under = WindowFromPoint(pt);
         HWND root = under ? GetAncestor(under, GA_ROOT) : nullptr;
         bool isDialog = false;
-        // The file list, or the navigation pane (Quick access and its pins,
-        // This PC, drives, OneDrive, Network) - which is a tree, not a view, so
-        // it is matched by its own control class.
+        // The file list, or the navigation pane (Home, Quick access and its
+        // pins, This PC, drives, OneDrive, Network) - which is a tree, not a
+        // view, so it is matched by its own control class, and by the tree
+        // window inside it: which of the two the cursor lands on, and how
+        // deeply it is nested, has shifted between Windows builds, so matching
+        // either is what keeps the pane working across them.
         bool onSurface =
             under && (IsWithinClass(under, L"SHELLDLL_DefView", 8) ||
-                      IsWithinClass(under, L"NamespaceTreeControl", 8));
+                      IsWithinClass(under, L"NamespaceTreeControl", 8) ||
+                      IsWithinClass(under, L"SysTreeView32", 2));
         if (!under || !root || !ClassifyRoot(root, &isDesktop, &isDialog) ||
             !onSurface) {
+            LogSurfaceReject(under, root);
             HideChevron();
             return;
         }
