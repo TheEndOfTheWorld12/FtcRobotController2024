@@ -74,6 +74,7 @@ so the mod never has to guess which way to flip.
 #include <atomic>
 #include <functional>
 #include <list>
+#include <mutex>
 #include <string>
 #include <vector>
 
