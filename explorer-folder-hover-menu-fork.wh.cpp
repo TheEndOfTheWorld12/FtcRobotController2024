@@ -2,7 +2,7 @@
 // @id              explorer-folder-hover-menu-fork
 // @name            Folder Hover Menu - Fork
 // @description     Hover a folder in File Explorer to get an expand button that opens a cascading menu of the folder's contents
-// @version         1.7
+// @version         1.8
 // @author          m417z
 // @github          https://github.com/m417z
 // @twitter         https://twitter.com/m417z
@@ -1780,6 +1780,32 @@ void WorkerBuildViewChildren(
 // The child of `parent` whose display name matches `name`, or nullptr. Caller
 // frees. Hidden items are included so a hidden folder shown in the pane still
 // resolves.
+// True if `paneName` - the name the navigation pane shows - names the shell
+// item whose display name is `shellName`. Both are lowercased.
+//
+// The pane does not show a bare name: it appends a parenthesised status, so the
+// Desktop redirected into OneDrive reads "Desktop (OneDrive)" and a folder
+// pinned to Quick access reads "src (pinned)". Nothing by those names exists in
+// the namespace, which is why every pane node used to come back unresolved. The
+// status is matched as "anything in brackets after the name" rather than by its
+// text, so it holds in any language and for statuses not seen here.
+//
+// A folder may legitimately have brackets in its name ("Local Disk (C:)"), so
+// the whole name counts as a match too - and callers keep the longest match,
+// which is what stops a sibling "Local Disk" from winning over it.
+bool NameMatchesPaneLabel(const std::wstring& paneName,
+                          const std::wstring& shellName) {
+    if (shellName.empty()) {
+        return false;
+    }
+    if (paneName == shellName) {
+        return true;
+    }
+    return paneName.size() > shellName.size() + 1 &&
+           paneName.compare(0, shellName.size(), shellName) == 0 &&
+           paneName.compare(shellName.size(), 2, L" (") == 0;
+}
+
 PIDLIST_ABSOLUTE FindChildByDisplayName(IShellFolder* parent,
                                         PCIDLIST_ABSOLUTE parentAbs,
                                         const std::wstring& name) {
@@ -1800,10 +1826,15 @@ PIDLIST_ABSOLUTE FindChildByDisplayName(IShellFolder* parent,
         return nullptr;
     }
 
+    // Keep the longest display name the pane's label matches, so a name that
+    // really does end in brackets beats a shorter sibling that is only a prefix
+    // of it. An exact match is the longest possible, so it ends the search.
     PIDLIST_ABSOLUTE result = nullptr;
+    size_t bestLen = 0;
+    bool exact = false;
     LPITEMIDLIST child = nullptr;
     ULONG fetched = 0;
-    while (!result && enumerator->Next(1, &child, &fetched) == S_OK &&
+    while (!exact && enumerator->Next(1, &child, &fetched) == S_OK &&
            fetched == 1) {
         STRRET strret;
         WCHAR buffer[MAX_PATH];
@@ -1811,11 +1842,25 @@ PIDLIST_ABSOLUTE FindChildByDisplayName(IShellFolder* parent,
                 parent->GetDisplayNameOf(child, SHGDN_NORMAL, &strret)) &&
             SUCCEEDED(
                 StrRetToBufW(&strret, child, buffer, ARRAYSIZE(buffer))) &&
-            *buffer && ToLower(buffer) == name) {
-            result = ILCombine(parentAbs, child);
+            *buffer) {
+            std::wstring display = ToLower(buffer);
+            if (display.size() > bestLen &&
+                NameMatchesPaneLabel(name, display)) {
+                if (PIDLIST_ABSOLUTE abs = ILCombine(parentAbs, child)) {
+                    if (result) {
+                        ILFree(result);
+                    }
+                    result = abs;
+                    bestLen = display.size();
+                    exact = display == name;
+                }
+            }
         }
         CoTaskMemFree(child);
         child = nullptr;
+    }
+    if (child) {
+        CoTaskMemFree(child);
     }
     return result;
 }
@@ -1868,7 +1913,7 @@ PIDLIST_ABSOLUTE ResolveNavPaneRoot(const std::wstring& name) {
             !abs) {
             continue;
         }
-        if (DisplayNameOfPidl(abs) == name) {
+        if (NameMatchesPaneLabel(name, DisplayNameOfPidl(abs))) {
             return abs;
         }
         ILFree(abs);
@@ -1928,6 +1973,8 @@ PIDLIST_ABSOLUTE ResolveNamespacePath(const std::vector<std::wstring>& path) {
             childAbs = ResolveNavPaneRoot(path[0]);
         }
         if (!childAbs) {
+            Wh_Log(L"nav pane: level %d, \"%s\" is not in the namespace",
+                   (int)i, path[i].c_str());
             if (currentAbs) {
                 ILFree(currentAbs);
             }
