@@ -2,7 +2,7 @@
 // @id              explorer-folder-hover-menu-fork
 // @name            Folder Hover Menu - Fork
 // @description     Hover a folder in File Explorer to get an expand button that opens a cascading menu of the folder's contents
-// @version         1.9
+// @version         1.10
 // @author          m417z
 // @github          https://github.com/m417z
 // @twitter         https://twitter.com/m417z
@@ -1949,11 +1949,16 @@ constexpr PCWSTR kNavPaneRoots[] = {
     L"shell:Desktop",
 };
 
-// Containers whose children the pane also shows at its top level: the user's
-// own folder (Desktop, Documents, Downloads, ...) and This PC (the drives).
+// Containers whose children the pane lists directly, rather than showing the
+// container and letting you open it: Quick access and Home hold the pinned and
+// frequent folders, and the user's own folder and This PC supply the Desktop,
+// Downloads, Documents and drive entries the pane shows at its top level. A
+// name that is not under the desktop is looked for in each of these.
 constexpr PCWSTR kNavPaneRootParents[] = {
+    L"::{679F85CB-0220-4080-B29B-5540CC05AAB6}",  // Quick access
+    L"::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}",  // Home
     L"shell:UsersFilesFolder",
-    L"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}",
+    L"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}",  // This PC
 };
 
 // The display name of `pidl`, lowercased, or an empty string.
@@ -2015,7 +2020,8 @@ PIDLIST_ABSOLUTE ResolveNavPaneRoot(const std::wstring& name) {
 // Walks `path` (root first, already lowercased) down from the desktop. Returns
 // the absolute pidl of the last element, or nullptr if any level is missing.
 // Caller frees.
-PIDLIST_ABSOLUTE ResolveNamespacePath(const std::vector<std::wstring>& path) {
+PIDLIST_ABSOLUTE ResolveNamespacePathExact(
+    const std::vector<std::wstring>& path) {
     if (path.empty()) {
         return nullptr;
     }
@@ -2076,6 +2082,33 @@ PIDLIST_ABSOLUTE ResolveNamespacePath(const std::vector<std::wstring>& path) {
     return nullptr;
 }
 
+// Resolves a pane node from the names of it and the nodes above it on screen.
+//
+// The whole path is tried first. If it does not resolve, the leading names are
+// dropped one at a time and what is left is tried again - because what the pane
+// shows above a node is not always the folder that node lives in. A folder
+// pinned to Quick access is the plain case: the pane lists it alongside the
+// other pins, so the name above it is another pin, not its parent. Dropping
+// that leaves the node's own name, which does resolve, because Quick access and
+// Home are searched as containers in their own right.
+//
+// A shortened path is a weaker claim than the whole one - two folders pinned
+// from different places can share a name, and then the first found wins - so it
+// is only reached once the whole path has failed.
+PIDLIST_ABSOLUTE ResolveNamespacePath(const std::vector<std::wstring>& path) {
+    for (size_t drop = 0; drop < path.size(); drop++) {
+        std::vector<std::wstring> suffix(path.begin() + drop, path.end());
+        if (PIDLIST_ABSOLUTE abs = ResolveNamespacePathExact(suffix)) {
+            return abs;
+        }
+    }
+    return nullptr;
+}
+
+// The last ancestor chain reported for a pane node, so a pointer resting on one
+// does not repeat the same line every refresh. Worker thread only.
+std::wstring g_lastTreeChainLogged;
+
 // The display names of the tree node at `pt` and of its ancestor nodes, root
 // first and lowercased. Empty if the point is not on a tree node.
 std::vector<std::wstring> TreeNodePathAt(POINT pt) {
@@ -2096,19 +2129,32 @@ std::vector<std::wstring> TreeNodePathAt(POINT pt) {
 
     // Climb to the tree node itself (the point may land on a label inside it),
     // then keep climbing, collecting a name at each node, until the Tree.
+    //
+    // Every level is also recorded, with its control type, into a line for the
+    // log: when a node will not resolve, what the pane claims is above it is
+    // the first thing worth seeing, and it is not always its parent folder.
+    std::wstring chain;
     winrt::com_ptr<IUIAutomationElement> current = element;
     for (int depth = 0; current && depth < 32; depth++) {
         CONTROLTYPEID controlType = 0;
         current->get_CurrentControlType(&controlType);
+
+        _bstr_t name;
+        current->get_CurrentName(name.GetAddress());
+        std::wstring nameText =
+            name.length() > 0 ? std::wstring(name, name.length())
+                              : std::wstring();
+
+        if (!chain.empty()) {
+            chain += L" < ";
+        }
+        chain += std::to_wstring((int)controlType) + L":" + nameText;
+
         if (controlType == UIA_TreeControlTypeId) {
             break;  // Reached the pane itself; the path is complete.
         }
-        if (controlType == UIA_TreeItemControlTypeId) {
-            _bstr_t name;
-            if (SUCCEEDED(current->get_CurrentName(name.GetAddress())) &&
-                name.length() > 0) {
-                path.push_back(ToLower(std::wstring(name, name.length())));
-            }
+        if (controlType == UIA_TreeItemControlTypeId && !nameText.empty()) {
+            path.push_back(ToLower(nameText));
         }
 
         winrt::com_ptr<IUIAutomationElement> parent;
@@ -2117,6 +2163,11 @@ std::vector<std::wstring> TreeNodePathAt(POINT pt) {
             break;
         }
         current = std::move(parent);
+    }
+
+    if (chain != g_lastTreeChainLogged) {
+        g_lastTreeChainLogged = chain;
+        Wh_Log(L"nav pane chain (innermost first): %s", chain.c_str());
     }
 
     std::reverse(path.begin(), path.end());  // Root first.
