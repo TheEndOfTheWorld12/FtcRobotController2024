@@ -2,7 +2,7 @@
 // @id              explorer-folder-hover-menu-fork
 // @name            Folder Hover Menu - Fork
 // @description     Hover a folder in File Explorer to get an expand button that opens a cascading menu of the folder's contents
-// @version         1.11
+// @version         1.12
 // @author          m417z
 // @github          https://github.com/m417z
 // @twitter         https://twitter.com/m417z
@@ -519,6 +519,11 @@ HWND g_snapTab;  // The tab (see GetExplorerTabWindow) the snapshot holds.
 bool g_snapIsDesktop;
 std::vector<CachedItem> g_snapItems;
 LONG g_snapNameColumnRight;  // Right edge of the name column, 0 if none.
+// Bounds of the control the snapshot was taken from, empty if unknown. The file
+// list and the navigation pane belong to the same tab, so without this the UI
+// thread cannot tell that the pointer has crossed from one into the other, and
+// would wait for the snapshot to go stale before asking for the right one.
+RECT g_snapContainerRect;
 ULONGLONG g_snapBuiltTick;
 // Child folder display name (lowercased) -> target absolute pidl. Rebuilt only
 // when the folder changes; owned here (freed on rebuild and shutdown).
@@ -1973,19 +1978,54 @@ std::wstring DisplayNameOfPidl(PCIDLIST_ABSOLUTE pidl) {
     return result;
 }
 
-// The top-level pane node whose display name is `name` (lowercased), or
-// nullptr. Caller frees.
-PIDLIST_ABSOLUTE ResolveNavPaneRoot(const std::wstring& name) {
+// The pane's roots, parsed once. Neither their pidls nor their display names
+// change while Explorer is running, and parsing ten of them - and asking the
+// shell for each one's name - on every single hover was a good part of what
+// made the pane feel slow. Worker thread only; owns its pidls.
+struct NavPaneRoot {
+    PIDLIST_ABSOLUTE pidl;
+    std::wstring name;  // Lowercased display name.
+};
+std::vector<NavPaneRoot> g_navPaneRoots;
+bool g_navPaneRootsBuilt;
+
+void EnsureNavPaneRoots() {
+    if (g_navPaneRootsBuilt) {
+        return;
+    }
+    g_navPaneRootsBuilt = true;
+
     for (PCWSTR parseName : kNavPaneRoots) {
         PIDLIST_ABSOLUTE abs = nullptr;
         if (FAILED(SHParseDisplayName(parseName, nullptr, &abs, 0, nullptr)) ||
             !abs) {
+            continue;  // Not a root this Windows build has.
+        }
+        std::wstring name = DisplayNameOfPidl(abs);
+        if (name.empty()) {
+            ILFree(abs);
             continue;
         }
-        if (NameMatchesPaneLabel(name, DisplayNameOfPidl(abs))) {
-            return abs;
+        g_navPaneRoots.push_back({abs, name});
+    }
+}
+
+void FreeNavPaneRoots() {
+    for (NavPaneRoot& root : g_navPaneRoots) {
+        ILFree(root.pidl);
+    }
+    g_navPaneRoots.clear();
+    g_navPaneRootsBuilt = false;
+}
+
+// The top-level pane node whose display name is `name` (lowercased), or
+// nullptr. Caller frees.
+PIDLIST_ABSOLUTE ResolveNavPaneRoot(const std::wstring& name) {
+    EnsureNavPaneRoots();
+    for (const NavPaneRoot& root : g_navPaneRoots) {
+        if (NameMatchesPaneLabel(name, root.name)) {
+            return ILClone(root.pidl);
         }
-        ILFree(abs);
     }
 
     winrt::com_ptr<IShellFolder> desktop;
@@ -2105,6 +2145,61 @@ PIDLIST_ABSOLUTE ResolveNamespacePath(const std::vector<std::wstring>& path) {
     return nullptr;
 }
 
+// Nodes resolved recently, keyed by the path the pane reports for them, so
+// moving back along the pane - or simply resting on one row, which rebuilds the
+// snapshot twice a second - does not pay for the same walk again. That walk is
+// the expensive part of the pane: several folder enumerations, and more when
+// the pane's path is not the node's real parentage.
+//
+// Entries expire, so a folder that was renamed, unpinned or newly pinned is not
+// remembered wrongly for long. A resolution that failed is remembered too, so a
+// node that cannot be resolved is not retried on every refresh.
+constexpr ULONGLONG kTreeNodeCacheTtlMs = 10000;
+constexpr size_t kTreeNodeCacheMax = 64;
+
+struct CachedTreeNode {
+    PIDLIST_ABSOLUTE pidl;  // nullptr means "this one does not resolve".
+    ULONGLONG tick;
+};
+
+std::unordered_map<std::wstring, CachedTreeNode> g_treeNodeCache;
+
+void ClearTreeNodeCache() {
+    for (auto& entry : g_treeNodeCache) {
+        if (entry.second.pidl) {
+            ILFree(entry.second.pidl);
+        }
+    }
+    g_treeNodeCache.clear();
+}
+
+// ResolveNamespacePath, with the recent answers remembered. Caller frees.
+PIDLIST_ABSOLUTE ResolveTreeNode(const std::vector<std::wstring>& path,
+                                 const std::wstring& key) {
+    ULONGLONG now = GetTickCount64();
+
+    auto it = g_treeNodeCache.find(key);
+    if (it != g_treeNodeCache.end()) {
+        if (now - it->second.tick < kTreeNodeCacheTtlMs) {
+            return it->second.pidl ? ILClone(it->second.pidl) : nullptr;
+        }
+        if (it->second.pidl) {
+            ILFree(it->second.pidl);
+        }
+        g_treeNodeCache.erase(it);
+    }
+
+    PIDLIST_ABSOLUTE abs = ResolveNamespacePath(path);
+    PIDLIST_ABSOLUTE stored = abs ? ILClone(abs) : nullptr;
+    if (stored || !abs) {
+        if (g_treeNodeCache.size() >= kTreeNodeCacheMax) {
+            ClearTreeNodeCache();
+        }
+        g_treeNodeCache[key] = {stored, now};
+    }
+    return abs;
+}
+
 // The last ancestor chain reported for a pane node, so a pointer resting on one
 // does not repeat the same line every refresh. Worker thread only.
 std::wstring g_lastTreeChainLogged;
@@ -2139,11 +2234,16 @@ std::vector<std::wstring> TreeNodePathAt(POINT pt) {
         CONTROLTYPEID controlType = 0;
         current->get_CurrentControlType(&controlType);
 
-        _bstr_t name;
-        current->get_CurrentName(name.GetAddress());
-        std::wstring nameText =
-            name.length() > 0 ? std::wstring(name, name.length())
-                              : std::wstring();
+        // Only a tree node's name is wanted, and each name is a call across to
+        // Explorer, so the other levels contribute their control type alone.
+        std::wstring nameText;
+        if (controlType == UIA_TreeItemControlTypeId) {
+            _bstr_t name;
+            if (SUCCEEDED(current->get_CurrentName(name.GetAddress())) &&
+                name.length() > 0) {
+                nameText.assign(name, name.length());
+            }
+        }
 
         if (!chain.empty()) {
             chain += L" < ";
@@ -2153,7 +2253,7 @@ std::vector<std::wstring> TreeNodePathAt(POINT pt) {
         if (controlType == UIA_TreeControlTypeId) {
             break;  // Reached the pane itself; the path is complete.
         }
-        if (controlType == UIA_TreeItemControlTypeId && !nameText.empty()) {
+        if (!nameText.empty()) {
             path.push_back(ToLower(nameText));
         }
 
@@ -2287,7 +2387,7 @@ void WorkerInstallTreeSnapshot(HWND tab,
             }
             joined += part;
         }
-        PIDLIST_ABSOLUTE abs = ResolveNamespacePath(path);
+        PIDLIST_ABSOLUTE abs = ResolveTreeNode(path, joined);
         Wh_Log(L"nav pane: %d items, node \"%s\" %s", (int)items.size(),
                joined.c_str(), abs ? L"resolved" : L"did NOT resolve");
         if (abs) {
@@ -2298,6 +2398,7 @@ void WorkerInstallTreeSnapshot(HWND tab,
     EnterCriticalSection(&g_snapshotLock);
     g_snapItems.swap(items);
     g_snapNameColumnRight = 0;  // The pane has no columns.
+    g_snapContainerRect = g_workerContainerRect;
     g_snapTab = tab;
     g_snapIsDesktop = isDesktop;
     g_snapBuiltTick = tick;
@@ -2377,6 +2478,7 @@ void WorkerBuildSnapshot(HWND tab, bool isDesktop, POINT pt) {
         EnterCriticalSection(&g_snapshotLock);
         g_snapItems.clear();
         g_snapNameColumnRight = 0;
+        g_snapContainerRect = g_workerContainerRect;
         g_snapTab = tab;
         g_snapIsDesktop = isDesktop;
         g_snapBuiltTick = tick;
@@ -2438,6 +2540,7 @@ void WorkerBuildSnapshot(HWND tab, bool isDesktop, POINT pt) {
     EnterCriticalSection(&g_snapshotLock);
     g_snapItems.swap(items);
     g_snapNameColumnRight = nameColumnRight;
+    g_snapContainerRect = g_workerContainerRect;
     g_snapTab = tab;
     g_snapIsDesktop = isDesktop;
     g_snapBuiltTick = tick;
@@ -2890,6 +2993,8 @@ DWORD WINAPI WorkerThreadProc(LPVOID param) {
         ILFree(g_workerFolderAbs);
         g_workerFolderAbs = nullptr;
     }
+    ClearTreeNodeCache();
+    FreeNavPaneRoots();
     OleUninitialize();
     return 0;
 }
@@ -4685,8 +4790,15 @@ void Evaluate(bool forceRefresh) {
         tab = g_snapTab;
         isDesktop = g_snapIsDesktop;
     }
+    // The pointer leaving the control the snapshot came from counts as a
+    // mismatch, which asks for a fresh one straight away. The file list and the
+    // navigation pane share a tab, so matching on the tab alone would leave the
+    // pointer in one of them being hit-tested against the other's items until
+    // the snapshot went stale - up to half a second of nothing happening.
     bool snapMatches =
-        g_snapValid && g_snapTab == tab && g_snapIsDesktop == isDesktop;
+        g_snapValid && g_snapTab == tab && g_snapIsDesktop == isDesktop &&
+        (IsRectEmpty(&g_snapContainerRect) ||
+         PtInRect(&g_snapContainerRect, pt));
     if (snapMatches) {
         for (const CachedItem& item : g_snapItems) {
             RECT r = item.rect;
