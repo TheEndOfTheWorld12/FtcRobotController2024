@@ -2,7 +2,7 @@
 // @id              explorer-folder-hover-menu-fork
 // @name            Folder Hover Menu - Fork
 // @description     Hover a folder in File Explorer to get an expand button that opens a cascading menu of the folder's contents
-// @version         1.8
+// @version         1.9
 // @author          m417z
 // @github          https://github.com/m417z
 // @twitter         https://twitter.com/m417z
@@ -1806,22 +1806,27 @@ bool NameMatchesPaneLabel(const std::wstring& paneName,
            paneName.compare(shellName.size(), 2, L" (") == 0;
 }
 
-PIDLIST_ABSOLUTE FindChildByDisplayName(IShellFolder* parent,
-                                        PCIDLIST_ABSOLUTE parentAbs,
-                                        const std::wstring& name) {
-    // The pane's own roots - Home, Quick access, Gallery, and the folders
-    // pinned under them - are not handed out by an ordinary enumeration at all,
-    // which is why walking the pane by name used to stop at its very first
-    // level. SHCONTF_NAVIGATION_PANE asks for exactly what the pane itself
-    // shows. Its value is spelled out so the mod still builds against headers
-    // that predate the flag.
-    constexpr DWORD kShcontfNavigationPane = 0x1000;
-    const SHCONTF flags =
-        (SHCONTF)((DWORD)SHCONTF_FOLDERS | (DWORD)SHCONTF_NONFOLDERS |
-                  (DWORD)SHCONTF_INCLUDEHIDDEN | kShcontfNavigationPane);
+// How many of a folder's children to name in the log when a lookup misses.
+constexpr int kLookupSampleItems = 8;
+
+// The last name a lookup failed on, so a pointer resting on an unresolvable
+// node does not repeat the same diagnostic every refresh. Worker thread only.
+std::wstring g_lastLookupMissLogged;
+
+// One enumeration pass of FindChildByDisplayName, asking for `grfFlags`.
+// Reports how many children it saw and the first few of their display names,
+// which is what the caller logs when nothing matched.
+PIDLIST_ABSOLUTE FindChildByDisplayNameIn(IShellFolder* parent,
+                                          PCIDLIST_ABSOLUTE parentAbs,
+                                          const std::wstring& name,
+                                          SHCONTF grfFlags,
+                                          int* outCount,
+                                          std::wstring* outSample) {
+    *outCount = 0;
+    outSample->clear();
 
     winrt::com_ptr<IEnumIDList> enumerator;
-    if (FAILED(parent->EnumObjects(nullptr, flags, enumerator.put())) ||
+    if (FAILED(parent->EnumObjects(nullptr, grfFlags, enumerator.put())) ||
         !enumerator) {
         return nullptr;
     }
@@ -1843,6 +1848,14 @@ PIDLIST_ABSOLUTE FindChildByDisplayName(IShellFolder* parent,
             SUCCEEDED(
                 StrRetToBufW(&strret, child, buffer, ARRAYSIZE(buffer))) &&
             *buffer) {
+            (*outCount)++;
+            if (*outCount <= kLookupSampleItems) {
+                if (!outSample->empty()) {
+                    *outSample += L" | ";
+                }
+                *outSample += buffer;
+            }
+
             std::wstring display = ToLower(buffer);
             if (display.size() > bestLen &&
                 NameMatchesPaneLabel(name, display)) {
@@ -1863,6 +1876,57 @@ PIDLIST_ABSOLUTE FindChildByDisplayName(IShellFolder* parent,
         CoTaskMemFree(child);
     }
     return result;
+}
+
+PIDLIST_ABSOLUTE FindChildByDisplayName(IShellFolder* parent,
+                                        PCIDLIST_ABSOLUTE parentAbs,
+                                        const std::wstring& name) {
+    // Two enumerations, because neither one is a superset of the other.
+    //
+    // SHCONTF_NAVIGATION_PANE asks for what the pane itself shows, and is the
+    // only way to get Home, Quick access and the folders pinned under them -
+    // an ordinary enumeration does not hand those out at all. But it is a
+    // filter as much as a key: ask the desktop for it and you get the pane's
+    // roots rather than the folders actually sitting on the desktop, which is
+    // why the walk kept reaching the right folder and then finding nothing
+    // inside it. So a miss in the pane's enumeration is retried in the ordinary
+    // one rather than taken as the answer.
+    //
+    // The flag's value is spelled out so the mod still builds against headers
+    // that predate it.
+    constexpr DWORD kShcontfNavigationPane = 0x1000;
+    constexpr DWORD kCommon = (DWORD)SHCONTF_FOLDERS |
+                              (DWORD)SHCONTF_NONFOLDERS |
+                              (DWORD)SHCONTF_INCLUDEHIDDEN;
+    const SHCONTF passes[] = {(SHCONTF)(kCommon | kShcontfNavigationPane),
+                              (SHCONTF)kCommon};
+
+    int count = 0;
+    std::wstring sample;
+    for (SHCONTF grfFlags : passes) {
+        int passCount = 0;
+        std::wstring passSample;
+        PIDLIST_ABSOLUTE result = FindChildByDisplayNameIn(
+            parent, parentAbs, name, grfFlags, &passCount, &passSample);
+        if (result) {
+            return result;
+        }
+        // Report whichever pass saw more, so the log describes the enumeration
+        // that actually had something in it.
+        if (passCount > count) {
+            count = passCount;
+            sample = passSample;
+        }
+    }
+
+    // Name what the folder really holds, once per distinct lookup, so a path
+    // that will not resolve says why rather than just that it did not.
+    if (name != g_lastLookupMissLogged) {
+        g_lastLookupMissLogged = name;
+        Wh_Log(L"no child matches \"%s\" among %d: %s", name.c_str(), count,
+               sample.empty() ? L"(nothing enumerated)" : sample.c_str());
+    }
+    return nullptr;
 }
 
 // The parse names of the nodes Explorer puts at the top of the navigation
