@@ -2,7 +2,7 @@
 // @id              explorer-folder-hover-menu-fork
 // @name            Folder Hover Menu - Fork
 // @description     Hover a folder in File Explorer to get an expand button that opens a cascading menu of the folder's contents
-// @version         1.10
+// @version         1.11
 // @author          m417z
 // @github          https://github.com/m417z
 // @twitter         https://twitter.com/m417z
@@ -2199,6 +2199,70 @@ bool EnsureWorkerUia() {
 // under the cursor is resolved to a pidl; the rest are there to hit-test
 // against. Keyed by the node's own display name, which is what the UI thread
 // looks the hit item up by.
+// Stretches the pane's rows across its full width.
+//
+// A tree item's rectangle covers its label and nothing else - UI Automation
+// reports what the tree control measures, and that is the text - so the empty
+// space to the right of a short name belongs to no row at all, and hovering
+// there did nothing. Each row is widened to the pane itself, taken from the
+// pane window's client area so the scroll bar is left out and the button does
+// not land on top of it. Only the horizontal extent changes, so rows still
+// cannot be mistaken for one another.
+void WidenTreeRowsToPane(std::vector<CachedItem>& items, POINT pt) {
+    RECT pane = g_workerContainerRect;
+
+    HWND paneWnd = WindowFromPoint(pt);
+    RECT client;
+    POINT topLeft;
+    POINT bottomRight;
+    if (paneWnd && GetClientRect(paneWnd, &client) &&
+        client.right > client.left) {
+        topLeft.x = client.left;
+        topLeft.y = client.top;
+        bottomRight.x = client.right;
+        bottomRight.y = client.bottom;
+        if (ClientToScreen(paneWnd, &topLeft) &&
+            ClientToScreen(paneWnd, &bottomRight)) {
+            pane.left = topLeft.x;
+            pane.right = bottomRight.x;
+        }
+    }
+
+    if (pane.right <= pane.left) {
+        return;  // Nothing trustworthy to widen to; leave the labels alone.
+    }
+
+    for (CachedItem& item : items) {
+        if (item.rect.right <= item.rect.left) {
+            continue;  // An item with no rectangle of its own (scrolled out).
+        }
+        if (pane.left < item.rect.left) {
+            item.rect.left = pane.left;
+        }
+        if (pane.right > item.rect.right) {
+            item.rect.right = pane.right;
+        }
+    }
+}
+
+// The point to resolve the hovered node from.
+//
+// Rows are widened to the pane below, so the pointer can be anywhere along one.
+// UI Automation still only finds the node on its label, though, so a point out
+// in the widened part would hit the pane and find no node at all. Slide
+// sideways onto the label of whichever row the pointer is level with. Must be
+// called before the widening, while the rectangles are still the labels.
+POINT PointOnTreeLabel(const std::vector<CachedItem>& items, POINT pt) {
+    for (const CachedItem& item : items) {
+        if (item.rect.right > item.rect.left && pt.y >= item.rect.top &&
+            pt.y < item.rect.bottom) {
+            POINT onLabel = {(item.rect.left + item.rect.right) / 2, pt.y};
+            return onLabel;
+        }
+    }
+    return pt;
+}
+
 void WorkerInstallTreeSnapshot(HWND tab,
                                bool isDesktop,
                                POINT pt,
@@ -2206,7 +2270,12 @@ void WorkerInstallTreeSnapshot(HWND tab,
                                ULONGLONG tick) {
     std::unordered_map<std::wstring, PIDLIST_ABSOLUTE> children;
 
-    std::vector<std::wstring> path = TreeNodePathAt(pt);
+    // Order matters: the node is resolved from a point on its label, which has
+    // to be worked out before the rows are stretched over the pane's width.
+    POINT resolveAt = PointOnTreeLabel(items, pt);
+    WidenTreeRowsToPane(items, pt);
+
+    std::vector<std::wstring> path = TreeNodePathAt(resolveAt);
     if (path.empty()) {
         Wh_Log(L"nav pane: %d items, no tree node under the cursor",
                (int)items.size());
