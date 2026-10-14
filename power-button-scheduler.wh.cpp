@@ -2,7 +2,7 @@
 // @id              power-button-scheduler
 // @name            Power Button Scheduler
 // @description     Schedule what closing the lid or pressing the power button does, by time, day and whether you are on charge
-// @version         1.0
+// @version         1.1
 // @author          aariv
 // @include         windhawk.exe
 // @compilerOptions -lpowrprof -luser32 -lshell32 -lgdi32 -lgdiplus
@@ -106,6 +106,9 @@ account does not have. The log says exactly what came back - look for
 
 #include <gdiplus.h>
 #include <powrprof.h>
+// The Power*ValueIndex functions are declared here rather than in powrprof.h,
+// which is easy to miss because the related PowerGetActiveScheme is in both.
+#include <powersetting.h>
 #include <shellapi.h>
 
 #include <stdlib.h>
