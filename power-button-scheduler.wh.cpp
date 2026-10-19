@@ -2,7 +2,7 @@
 // @id              power-button-scheduler
 // @name            Power Button Scheduler
 // @description     Schedule what closing the lid or pressing the power button does, by time, day and whether you are on charge
-// @version         1.1
+// @version         1.2
 // @author          aariv
 // @include         windhawk.exe
 // @compilerOptions -lpowrprof -luser32 -lshell32 -lgdi32 -lgdiplus
@@ -647,6 +647,11 @@ DWORD g_applied[kButtonCount][kSourceCount];
 bool g_haveApplied[kButtonCount][kSourceCount];
 bool g_paused;
 bool g_reportedWriteFailure;
+// Why nothing happened, kept so the tray icon can say it. Logging is off per
+// mod by default, so a failure that is only logged is a failure nobody sees.
+DWORD g_lastWriteError;
+bool g_writeRefused;
+bool g_writeIgnored;
 
 HWND g_trayWnd;
 HICON g_trayIcon;
@@ -710,8 +715,11 @@ bool WriteActionValue(const GUID& scheme,
                          L"to change power settings"
                        : L"");
         }
+        g_lastWriteError = error;
+        g_writeRefused = true;
         return false;
     }
+    g_writeRefused = false;
     return true;
 }
 
@@ -841,6 +849,27 @@ void ApplyNow() {
 
     if (wroteAnything) {
         CommitScheme();
+
+        // Read it straight back. A write can report success and still not take
+        // hold - a policy or another tool putting it back - and that looks
+        // exactly like nothing having happened, so it is worth telling apart
+        // from a write that was refused outright.
+        g_writeIgnored = false;
+        for (int b = 0; b < kButtonCount; b++) {
+            for (int s = 0; s < kSourceCount; s++) {
+                if (!g_haveApplied[b][s]) {
+                    continue;
+                }
+                DWORD actual = 0;
+                if (ReadActionValue(g_scheme, (Button)b, (Source)s, &actual) &&
+                    actual != g_applied[b][s]) {
+                    g_writeIgnored = true;
+                    Wh_Log(L"%s %s was set to %s but reads back as %s",
+                           ButtonName((Button)b), SourceName((Source)s),
+                           ActionName(g_applied[b][s]), ActionName(actual));
+                }
+            }
+        }
     } else {
         LogVerbose(L"nothing to change");
     }
@@ -859,6 +888,19 @@ Source CurrentSource() {
 }
 
 std::wstring DescribeState() {
+    // Trouble first: knowing the lid is meant to sleep is no use when the
+    // reason it does not is further down a log nobody has switched on.
+    if (g_writeRefused) {
+        std::wstring text = L"Windows refused the change (error " +
+                            std::to_wstring((int)g_lastWriteError) + L")";
+        if (g_lastWriteError == ERROR_ACCESS_DENIED) {
+            text += L" - needs an administrator";
+        }
+        return text;
+    }
+    if (g_writeIgnored) {
+        return L"Setting was accepted but did not stick";
+    }
     if (g_paused) {
         return L"Paused - Windows' own settings are back";
     }
