@@ -2,7 +2,7 @@
 // @id              explorer-folder-hover-menu-fork
 // @name            Folder Hover Menu - Fork
 // @description     Hover a folder in File Explorer to get an expand button that opens a cascading menu of the folder's contents
-// @version         1.12
+// @version         1.13
 // @author          m417z
 // @github          https://github.com/m417z
 // @twitter         https://twitter.com/m417z
@@ -5410,6 +5410,13 @@ void WhTool_ModUninit() {
 bool g_isToolModProcessLauncher;
 HANDLE g_toolModProcessMutex;
 
+// How long a starting tool process waits for the previous one to let go.
+// Windhawk starts the replacement before the old process has finished its
+// uninit, so on every update the new one finds the mutex still held and, left
+// to the stock behaviour, gives up for good - the old one then exits and
+// nothing is running at all. Measured, the handover needs about 200ms.
+constexpr DWORD kToolModHandoverTimeoutMs = 3000;
+
 void WINAPI EntryPoint_Hook() {
     Wh_Log(L">");
     ExitThread(0);
@@ -5466,8 +5473,17 @@ BOOL Wh_ModInit() {
         }
 
         if (GetLastError() == ERROR_ALREADY_EXISTS) {
-            Wh_Log(L"Tool mod already running (%s)", WH_MOD_ID);
-            ExitProcess(1);
+            // Usually the previous instance on its way out rather than a
+            // genuine second copy, so wait for it before giving up. Owning an
+            // abandoned mutex counts too: that is the previous process having
+            // died without releasing it.
+            DWORD waited = WaitForSingleObject(g_toolModProcessMutex,
+                                               kToolModHandoverTimeoutMs);
+            if (waited != WAIT_OBJECT_0 && waited != WAIT_ABANDONED) {
+                Wh_Log(L"Tool mod already running (%s)", WH_MOD_ID);
+                ExitProcess(1);
+            }
+            Wh_Log(L"Took over from the previous instance");
         }
 
         if (!WhTool_ModInit()) {

@@ -2,7 +2,7 @@
 // @id              caffeine-scheduler
 // @name            Caffeine Scheduler
 // @description     Keep the PC awake on a schedule - set the hours and days, with a tray icon to override it
-// @version         1.0
+// @version         1.1
 // @author          aariv
 // @include         windhawk.exe
 // @compilerOptions -lgdi32 -lgdiplus -luser32 -lshell32 -lole32
@@ -1067,6 +1067,13 @@ void WhTool_ModUninit() {
 bool g_isToolModProcessLauncher;
 HANDLE g_toolModProcessMutex;
 
+// How long a starting tool process waits for the previous one to let go.
+// Windhawk starts the replacement before the old process has finished its
+// uninit, so on every update the new one finds the mutex still held and, left
+// to the stock behaviour, gives up for good - the old one then exits and
+// nothing is running at all. Measured, the handover needs about 200ms.
+constexpr DWORD kToolModHandoverTimeoutMs = 3000;
+
 void WINAPI EntryPoint_Hook() {
     Wh_Log(L">");
     ExitThread(0);
@@ -1123,8 +1130,17 @@ BOOL Wh_ModInit() {
         }
 
         if (GetLastError() == ERROR_ALREADY_EXISTS) {
-            Wh_Log(L"Tool mod already running (%s)", WH_MOD_ID);
-            ExitProcess(1);
+            // Usually the previous instance on its way out rather than a
+            // genuine second copy, so wait for it before giving up. Owning an
+            // abandoned mutex counts too: that is the previous process having
+            // died without releasing it.
+            DWORD waited = WaitForSingleObject(g_toolModProcessMutex,
+                                               kToolModHandoverTimeoutMs);
+            if (waited != WAIT_OBJECT_0 && waited != WAIT_ABANDONED) {
+                Wh_Log(L"Tool mod already running (%s)", WH_MOD_ID);
+                ExitProcess(1);
+            }
+            Wh_Log(L"Took over from the previous instance");
         }
 
         if (!WhTool_ModInit()) {
