@@ -73,9 +73,15 @@ it only sets what the lid and the buttons do.
 
 ## If nothing happens
 
-These are Windows' own power settings, and writing them may need rights your
-account does not have. The log says exactly what came back - look for
-`error 5`, which is Windows for "access denied".
+Hover the tray icon; it says why. Confirmed working from an ordinary,
+non-administrator account, so a refusal is not the expected outcome - but if
+Windows does refuse, the tooltip gives the error number, and `error 5` is
+"access denied".
+
+Worth knowing: this writes the real Windows setting, the same field Power
+Options shows. That field will therefore read differently at different times of
+day, which is the mod working rather than a fault, and a change you make there
+by hand is overwritten within about fifteen seconds while a rule covers it.
 */
 // ==/WindhawkModReadme==
 
