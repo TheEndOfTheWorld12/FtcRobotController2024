@@ -3,7 +3,7 @@
 // @name            TopBar for Windows - Fork
 // @donateUrl       https://www.patreon.com/WasiXGamer/join
 // @description     A working TopBar with Flyouts for Windows through Windhawk.
-// @version         1.4.3
+// @version         1.4.4
 // @author          WasiXGamer
 // @github          https://github.com/wasixgamer
 // @include         explorer.exe
@@ -75,7 +75,8 @@ Pages:
   & date format.
 - **Customizations** — app-title button mode (application name / task list /
   none), task button size & content, media player options, resource monitor
-  metrics & labels and weather units.
+  metrics & labels (CPU, RAM, GPU, network and disk throughput) and weather
+  units.
 - **UI Alignment** — move any button between the Left, Center and Right panels.
 - **Start Menu & Search** — default menu replacements, Start/Search button actions,
   pinned apps, folder shortcuts, shared nine-position alignment and search quick controls.
@@ -86,6 +87,27 @@ Pages:
   copy / paste it via the clipboard.
 - **About** — version info and links.
 
+
+## Resource Monitor: network and disk
+
+The Network and Disk tabs read PDH performance counters, the same source Task
+Manager uses.
+
+- **Network** sums `Bytes Received/sec` and `Bytes Sent/sec` across the
+  adapters that carry real traffic. Loopback, tunnel, WAN miniport, Wi-Fi
+  Direct and Hyper-V `vEthernet` adapters are deliberately left out: each one
+  carries the same bytes as the adapter underneath it, so counting them would
+  report that traffic twice. The info island names the adapters being counted,
+  and **Link speed** is the fastest adapter's advertised rate.
+- **Disk** reads `Disk Read Bytes/sec` and `Disk Write Bytes/sec` on the
+  `_Total` instance, so it covers every physical disk. **Free space** is for
+  the volume Windows is installed on.
+- Both are smoothed with a one second time constant, so the numbers stay
+  readable while the flyout polls five times a second.
+
+Either can also be shown on the bar button itself, next to CPU / RAM / GPU -
+turn it on under **Customizations**, where each can show download, upload,
+the two combined, or both with arrows. They are off by default.
 
 ## Features
 
@@ -98,7 +120,8 @@ Pages:
   connect, battery level), Battery (percentage, health, power saving),
   Weather (current conditions, hourly forecast, location search), Recycle
   Bin (size, item count, empty with confirm), Resource Monitor (CPU / RAM /
-  GPU tabs with live graph, GPU selector, detailed info), Media Player
+  GPU / Network / Disk tabs with live graph, GPU selector, detailed info),
+  Media Player
   (album art, artist, title, transport controls, live progress bar,
   audio-reactive visualizer).
 - **Start menu replacement** — custom Start with account panel, power menu,
@@ -187,7 +210,9 @@ Run **[UWPSpy](https://github.com/m417z/UWPSpy/releases/)** on the TopBar's
 | `DisplayButton` `SoundButton` `WifiButton` `BluetoothButton`  `BatteryButton` | ControlCenter buttons |
 | `ControlCenterButton` | Button to open Control Center |
 | `ClockButton` / `ClockText` | Date/time |
-| `ResourceButton` | CPU / RAM / GPU button |
+| `ResourceButton` | CPU / RAM / GPU / network / disk button |
+| `ResourceNetTab` / `ResourceDiskTab` | Network and Disk tabs in the Resource Monitor |
+| `InfoNetName` / `InfoDiskName` | Adapter and volume lines in the Resource Monitor info island |
 | `WeatherButton` / `WeatherButtonContent` | Weather button and its inline content |
 | `RecycleBinButton` / `RecycleBinIcon` | Recycle Bin button and its glyph |
 | `TrayIconButton` | System tray overflow button |
@@ -397,6 +422,15 @@ namespace resource {
         int gpu = 0;
         bool cpuAvailable = false;
         bool gpuAvailable = false;
+        // Network and disk are byte rates, not percentages: a link has no
+        // "100%" the way a core does, so these stay in bytes per second and
+        // the tabs that show them scale their own graph.
+        double netDownBps = 0;
+        double netUpBps = 0;
+        double diskReadBps = 0;
+        double diskWriteBps = 0;
+        bool netAvailable = false;
+        bool diskAvailable = false;
     };
 
     struct DetailedInfo {
@@ -416,6 +450,13 @@ namespace resource {
         std::wstring gpuName;
         uint64_t vramTotal = 0;
         uint64_t vramUsed = 0;
+        // Network
+        std::wstring netAdapters;
+        double netLinkBitsPerSec = 0;
+        // Disk
+        std::wstring diskRoot;
+        uint64_t diskTotalBytes = 0;
+        uint64_t diskFreeBytes = 0;
     };
 
     // CPU usage via PDH (Performance Data Helper)
@@ -466,6 +507,156 @@ namespace resource {
         return paths;
     }
 
+    // ----------------------------------------------------------------
+    // Network and disk throughput
+    // ----------------------------------------------------------------
+    // PDH does the rate arithmetic, but a rate counter reports nothing until
+    // it has been collected twice with time in between. The bar polls every
+    // 2 s and an open flyout every 200 ms, so each getter keeps its own
+    // sample clock: it recomputes once the window is at least
+    // kThroughputWindowMs wide and hands back the last value in between.
+    // Neither caller has to sleep, and the fast one does not get noise.
+    constexpr ULONGLONG kThroughputWindowMs = 250;
+
+    struct Throughput {
+        double inBytesPerSec = 0;
+        double outBytesPerSec = 0;
+        bool available = false;
+    };
+
+    struct DiskSpace {
+        std::wstring root;
+        uint64_t total = 0;
+        uint64_t free = 0;
+    };
+
+    PDH_HQUERY g_netQuery = nullptr;
+    std::vector<PDH_HCOUNTER> g_netRecvCounters;
+    std::vector<PDH_HCOUNTER> g_netSendCounters;
+    std::vector<PDH_HCOUNTER> g_netBandwidthCounters;
+    std::vector<std::wstring> g_netAdapterNames;
+    bool g_netQueryInitialized = false;
+
+    PDH_HQUERY g_diskQuery = nullptr;
+    PDH_HCOUNTER g_diskReadCounter = nullptr;
+    PDH_HCOUNTER g_diskWriteCounter = nullptr;
+    bool g_diskQueryInitialized = false;
+
+    std::wstring PdhInstanceFromPath(const std::wstring& path) {
+        const auto openPos = path.find(L'(');
+        const auto closePos = path.rfind(L')');
+        if (openPos == std::wstring::npos || closePos == std::wstring::npos ||
+            closePos <= openPos) {
+            return std::wstring();
+        }
+        return path.substr(openPos + 1, closePos - openPos - 1);
+    }
+
+    std::wstring ToLowerAscii(const std::wstring& text) {
+        std::wstring lower;
+        lower.reserve(text.size());
+        for (wchar_t c : text) {
+            lower.push_back((c >= L'A' && c <= L'Z')
+                                ? static_cast<wchar_t>(c - L'A' + L'a')
+                                : c);
+        }
+        return lower;
+    }
+
+    // PDH names each Network Interface instance after the adapter
+    // description, so the adapters Windows creates for itself sit in the list
+    // next to the real ones - and a Hyper-V switch, a VPN tunnel or a Wi-Fi
+    // Direct adapter carries the same bytes as the NIC underneath it.
+    // Summing the whole list would therefore report those bytes twice, so
+    // drop the known pseudo-adapters and count what is left.
+    bool IsCountableNetworkInstance(const std::wstring& instance) {
+        if (instance.empty()) return false;
+        static const PCWSTR kSkip[] = {
+            L"loopback",       L"isatap",              L"teredo",
+            L"pseudo-interface", L"wan miniport",      L"virtual adapter",
+            L"wi-fi direct",   L"vethernet",           L"tap-windows",
+            L"tunnel adapter", L"qos packet scheduler",
+        };
+        std::wstring lower = ToLowerAscii(instance);
+        for (PCWSTR needle : kSkip) {
+            if (lower.find(needle) != std::wstring::npos) return false;
+        }
+        return true;
+    }
+
+    std::wstring FormatByteRate(double bytesPerSec) {
+        if (!(bytesPerSec > 0)) bytesPerSec = 0;
+        double scaled = bytesPerSec;
+        PCWSTR unit = L"B/s";
+        if (scaled >= 1024.0 * 1024.0 * 1024.0) {
+            scaled /= 1024.0 * 1024.0 * 1024.0;
+            unit = L"GB/s";
+        } else if (scaled >= 1024.0 * 1024.0) {
+            scaled /= 1024.0 * 1024.0;
+            unit = L"MB/s";
+        } else if (scaled >= 1024.0) {
+            scaled /= 1024.0;
+            unit = L"KB/s";
+        }
+        wchar_t buf[64];
+        if (unit[0] == L'B' || scaled >= 100.0) {
+            swprintf_s(buf, L"%.0f %s", scaled, unit);
+        } else {
+            swprintf_s(buf, L"%.1f %s", scaled, unit);
+        }
+        return buf;
+    }
+
+    // Link speed is advertised in bits per second, and network kit is sold in
+    // decimal units, so this one divides by 1000 rather than 1024.
+    std::wstring FormatBitRate(double bitsPerSec) {
+        if (!(bitsPerSec > 0)) return L"-";
+        double scaled = bitsPerSec;
+        PCWSTR unit = L"bps";
+        if (scaled >= 1000.0 * 1000.0 * 1000.0) {
+            scaled /= 1000.0 * 1000.0 * 1000.0;
+            unit = L"Gbps";
+        } else if (scaled >= 1000.0 * 1000.0) {
+            scaled /= 1000.0 * 1000.0;
+            unit = L"Mbps";
+        } else if (scaled >= 1000.0) {
+            scaled /= 1000.0;
+            unit = L"Kbps";
+        }
+        wchar_t buf[64];
+        if (scaled >= 100.0) {
+            swprintf_s(buf, L"%.0f %s", scaled, unit);
+        } else {
+            swprintf_s(buf, L"%.1f %s", scaled, unit);
+        }
+        return buf;
+    }
+
+    std::wstring FormatByteSize(uint64_t bytes) {
+        double scaled = static_cast<double>(bytes);
+        PCWSTR unit = L"B";
+        if (scaled >= 1024.0 * 1024.0 * 1024.0 * 1024.0) {
+            scaled /= 1024.0 * 1024.0 * 1024.0 * 1024.0;
+            unit = L"TB";
+        } else if (scaled >= 1024.0 * 1024.0 * 1024.0) {
+            scaled /= 1024.0 * 1024.0 * 1024.0;
+            unit = L"GB";
+        } else if (scaled >= 1024.0 * 1024.0) {
+            scaled /= 1024.0 * 1024.0;
+            unit = L"MB";
+        } else if (scaled >= 1024.0) {
+            scaled /= 1024.0;
+            unit = L"KB";
+        }
+        wchar_t buf[64];
+        if (unit[0] == L'B' || scaled >= 100.0) {
+            swprintf_s(buf, L"%.0f %s", scaled, unit);
+        } else {
+            swprintf_s(buf, L"%.1f %s", scaled, unit);
+        }
+        return buf;
+    }
+
     // RAM usage via GlobalMemoryStatusEx
     std::mutex g_resourceInitMutex;
 
@@ -497,6 +688,64 @@ namespace resource {
             }
         }
 
+        // Network throughput. Received and sent are separate counters on the
+        // same query so one collect serves both.
+        if (!g_netQueryInitialized) {
+            g_netQueryInitialized = true;
+            if (PdhOpenQuery(nullptr, 0, &g_netQuery) == ERROR_SUCCESS) {
+                auto addFiltered = [](PCWSTR wildcard,
+                                      std::vector<PDH_HCOUNTER>* out,
+                                      std::vector<std::wstring>* names) {
+                    for (const auto& path : ExpandGpuWildcard(wildcard)) {
+                        std::wstring instance = PdhInstanceFromPath(path);
+                        if (!IsCountableNetworkInstance(instance)) continue;
+                        PDH_HCOUNTER counter;
+                        if (PdhAddCounter(g_netQuery, path.c_str(), 0,
+                                          &counter) != ERROR_SUCCESS) {
+                            continue;
+                        }
+                        out->push_back(counter);
+                        if (names) names->push_back(instance);
+                    }
+                };
+                addFiltered(L"\\Network Interface(*)\\Bytes Received/sec",
+                            &g_netRecvCounters, &g_netAdapterNames);
+                addFiltered(L"\\Network Interface(*)\\Bytes Sent/sec",
+                            &g_netSendCounters, nullptr);
+                addFiltered(L"\\Network Interface(*)\\Current Bandwidth",
+                            &g_netBandwidthCounters, nullptr);
+                if (g_netRecvCounters.empty() && g_netSendCounters.empty()) {
+                    PdhCloseQuery(g_netQuery);
+                    g_netQuery = nullptr;
+                }
+            }
+        }
+
+        // Disk throughput. PhysicalDisk has a real _Total instance, so unlike
+        // the network there is nothing to expand or filter here.
+        if (!g_diskQueryInitialized) {
+            g_diskQueryInitialized = true;
+            if (PdhOpenQuery(nullptr, 0, &g_diskQuery) == ERROR_SUCCESS) {
+                bool ok =
+                    PdhAddEnglishCounter(
+                        g_diskQuery,
+                        L"\\PhysicalDisk(_Total)\\Disk Read Bytes/sec", 0,
+                        &g_diskReadCounter) == ERROR_SUCCESS;
+                if (PdhAddEnglishCounter(
+                        g_diskQuery,
+                        L"\\PhysicalDisk(_Total)\\Disk Write Bytes/sec", 0,
+                        &g_diskWriteCounter) != ERROR_SUCCESS) {
+                    ok = false;
+                }
+                if (!ok) {
+                    PdhCloseQuery(g_diskQuery);
+                    g_diskQuery = nullptr;
+                    g_diskReadCounter = nullptr;
+                    g_diskWriteCounter = nullptr;
+                }
+            }
+        }
+
         // (GPU Adapter Memory counters are handled by GetVramUsed() with its own query)
     }
 
@@ -515,6 +764,157 @@ namespace resource {
             return static_cast<int>(memInfo.dwMemoryLoad);
         }
         return -1;
+    }
+
+    // Shared by the network and disk getters. prevTick/cached live in the
+    // caller so each kind keeps its own sample clock.
+    bool CollectThroughputQuery(PDH_HQUERY query, ULONGLONG* lastTick,
+                                bool* primed, ULONGLONG* elapsedOut) {
+        if (!query) return false;
+        const ULONGLONG now = GetTickCount64();
+        if (*lastTick != 0 && now - *lastTick < kThroughputWindowMs) {
+            return false;
+        }
+        if (PdhCollectQueryData(query) != ERROR_SUCCESS) return false;
+        const ULONGLONG elapsed = (*lastTick == 0) ? 0 : (now - *lastTick);
+        *lastTick = now;
+        if (!*primed) {
+            // The first collect only establishes the baseline.
+            *primed = true;
+            return false;
+        }
+        *elapsedOut = elapsed;
+        return true;
+    }
+
+    // Smooth towards the new reading with a one second time constant: the
+    // 200 ms flyout cadence stops jittering, while the 2 s bar cadence passes
+    // readings straight through.
+    void BlendThroughput(Throughput* cached, double in, double out,
+                         ULONGLONG elapsedMs) {
+        double alpha = static_cast<double>(elapsedMs) / 1000.0;
+        if (alpha > 1.0) alpha = 1.0;
+        if (alpha < 0.2) alpha = 0.2;
+        if (cached->available) {
+            cached->inBytesPerSec += alpha * (in - cached->inBytesPerSec);
+            cached->outBytesPerSec += alpha * (out - cached->outBytesPerSec);
+        } else {
+            cached->inBytesPerSec = in;
+            cached->outBytesPerSec = out;
+            cached->available = true;
+        }
+    }
+
+    double SumCounters(const std::vector<PDH_HCOUNTER>& counters) {
+        double total = 0;
+        PDH_FMT_COUNTERVALUE value;
+        for (auto counter : counters) {
+            if (PdhGetFormattedCounterValue(counter, PDH_FMT_DOUBLE, nullptr,
+                                            &value) == ERROR_SUCCESS &&
+                value.CStatus == ERROR_SUCCESS && value.doubleValue > 0) {
+                total += value.doubleValue;
+            }
+        }
+        return total;
+    }
+
+    Throughput GetNetworkThroughput() {
+        static Throughput s_cached;
+        static ULONGLONG s_lastTick = 0;
+        static bool s_primed = false;
+        if (!g_netQuery) return Throughput();
+        ULONGLONG elapsed = 0;
+        if (CollectThroughputQuery(g_netQuery, &s_lastTick, &s_primed,
+                                   &elapsed)) {
+            BlendThroughput(&s_cached, SumCounters(g_netRecvCounters),
+                            SumCounters(g_netSendCounters), elapsed);
+        }
+        return s_cached;
+    }
+
+    Throughput GetDiskThroughput() {
+        static Throughput s_cached;
+        static ULONGLONG s_lastTick = 0;
+        static bool s_primed = false;
+        if (!g_diskQuery) return Throughput();
+        ULONGLONG elapsed = 0;
+        if (CollectThroughputQuery(g_diskQuery, &s_lastTick, &s_primed,
+                                   &elapsed)) {
+            PDH_FMT_COUNTERVALUE readValue;
+            PDH_FMT_COUNTERVALUE writeValue;
+            double readBps = 0;
+            double writeBps = 0;
+            if (g_diskReadCounter &&
+                PdhGetFormattedCounterValue(g_diskReadCounter, PDH_FMT_DOUBLE,
+                                            nullptr, &readValue) ==
+                    ERROR_SUCCESS &&
+                readValue.CStatus == ERROR_SUCCESS &&
+                readValue.doubleValue > 0) {
+                readBps = readValue.doubleValue;
+            }
+            if (g_diskWriteCounter &&
+                PdhGetFormattedCounterValue(g_diskWriteCounter, PDH_FMT_DOUBLE,
+                                            nullptr, &writeValue) ==
+                    ERROR_SUCCESS &&
+                writeValue.CStatus == ERROR_SUCCESS &&
+                writeValue.doubleValue > 0) {
+                writeBps = writeValue.doubleValue;
+            }
+            BlendThroughput(&s_cached, readBps, writeBps, elapsed);
+        }
+        return s_cached;
+    }
+
+    // Reported by the adapters themselves. The fastest of the counted ones is
+    // the link the traffic is actually riding on.
+    double GetNetworkLinkBitsPerSec() {
+        if (!g_netQuery) return 0;
+        double best = 0;
+        PDH_FMT_COUNTERVALUE value;
+        for (auto counter : g_netBandwidthCounters) {
+            if (PdhGetFormattedCounterValue(counter, PDH_FMT_DOUBLE, nullptr,
+                                            &value) == ERROR_SUCCESS &&
+                value.CStatus == ERROR_SUCCESS && value.doubleValue > best) {
+                best = value.doubleValue;
+            }
+        }
+        return best;
+    }
+
+    std::wstring GetNetworkAdapterSummary() {
+        if (g_netAdapterNames.empty()) return L"No active adapter";
+        std::wstring summary = g_netAdapterNames[0];
+        if (g_netAdapterNames.size() > 1) {
+            summary += L"  (+" +
+                       std::to_wstring(g_netAdapterNames.size() - 1) +
+                       L" more)";
+        }
+        return summary;
+    }
+
+    // Capacity of the volume Windows is installed on. Cached because it only
+    // moves when files do, and the callers tick twice a second.
+    DiskSpace GetSystemDiskSpaceCached() {
+        static DiskSpace s_cached;
+        static ULONGLONG s_tick = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (s_tick != 0 && now - s_tick < 15000) return s_cached;
+        s_tick = now;
+        DiskSpace space;
+        wchar_t windowsDir[MAX_PATH] = {0};
+        if (GetWindowsDirectoryW(windowsDir, ARRAYSIZE(windowsDir)) > 0 &&
+            windowsDir[0] != L'\0') {
+            wchar_t root[4] = {windowsDir[0], L':', L'\\', L'\0'};
+            ULARGE_INTEGER totalBytes{};
+            ULARGE_INTEGER freeBytes{};
+            if (GetDiskFreeSpaceExW(root, nullptr, &totalBytes, &freeBytes)) {
+                space.root = root;
+                space.total = totalBytes.QuadPart;
+                space.free = freeBytes.QuadPart;
+            }
+        }
+        s_cached = space;
+        return s_cached;
     }
 
     std::wstring ExtractGpuLuidFromInstance(std::wstring_view instance);
@@ -584,6 +984,14 @@ namespace resource {
         usage.gpu = GetGpu(gpuIndex);
         usage.cpuAvailable = (usage.cpu >= 0);
         usage.gpuAvailable = (usage.gpu >= 0);
+        Throughput net = GetNetworkThroughput();
+        usage.netDownBps = net.inBytesPerSec;
+        usage.netUpBps = net.outBytesPerSec;
+        usage.netAvailable = net.available;
+        Throughput disk = GetDiskThroughput();
+        usage.diskReadBps = disk.inBytesPerSec;
+        usage.diskWriteBps = disk.outBytesPerSec;
+        usage.diskAvailable = disk.available;
         return usage;
     }
 
@@ -1076,6 +1484,12 @@ namespace resource {
         info.gpuName = GetGpuName(gpuIndex);
         info.vramTotal = GetVramTotal(gpuIndex);
         info.vramUsed = GetVramUsed(gpuIndex);
+        info.netAdapters = GetNetworkAdapterSummary();
+        info.netLinkBitsPerSec = GetNetworkLinkBitsPerSec();
+        DiskSpace space = GetSystemDiskSpaceCached();
+        info.diskRoot = space.root;
+        info.diskTotalBytes = space.total;
+        info.diskFreeBytes = space.free;
         return info;
     }
 
@@ -1089,6 +1503,22 @@ namespace resource {
             PdhCloseQuery(g_gpuQuery);
             g_gpuQuery = nullptr;
             g_gpuCounters.clear();
+        }
+        if (g_netQuery) {
+            PdhCloseQuery(g_netQuery);
+            g_netQuery = nullptr;
+            g_netRecvCounters.clear();
+            g_netSendCounters.clear();
+            g_netBandwidthCounters.clear();
+            g_netAdapterNames.clear();
+            g_netQueryInitialized = false;
+        }
+        if (g_diskQuery) {
+            PdhCloseQuery(g_diskQuery);
+            g_diskQuery = nullptr;
+            g_diskReadCounter = nullptr;
+            g_diskWriteCounter = nullptr;
+            g_diskQueryInitialized = false;
         }
         // (g_vramQuery is no longer used; see GetVramUsed())
     }
@@ -1547,6 +1977,11 @@ struct {
     bool showCpuUsage = true;
     bool showRamUsage = true;
     bool showGpuUsage = true;
+    bool showNetworkUsage = false;
+    bool showDiskUsage = false;
+    // combined | in | out | both
+    std::wstring networkUsageMode = L"combined";
+    std::wstring diskUsageMode = L"combined";
     bool showMediaButton = true;
     bool showMediaVisualizer = true;
     bool mediaButtonShowIcon = true;
@@ -1556,6 +1991,8 @@ struct {
     std::wstring labelCpu = L"CPU:";
     std::wstring labelRam = L"RAM:";
     std::wstring labelGpu = L"GPU:";
+    std::wstring labelNetwork = L"NET:";
+    std::wstring labelDisk = L"DISK:";
     bool enableHotkeys = false;
     bool disableFlyoutAutoClose = false;
     bool showPinnedSection = true;
@@ -1578,6 +2015,7 @@ struct {
     std::wstring fontColor = L"#FFFFFF";
     std::wstring iconPack = L"winui";
     std::wstring fontFamily;
+    int fontSizeScale = 100;
     bool fontBold = false;
     int globalBlurAmount = 6;
     std::wstring flyoutAnimation = L"zoom";
@@ -1606,6 +2044,19 @@ struct {
     int thumbPreviewMaxHeight = 280;
     int thumbPreviewScale = 100;
 } g_settings;
+
+// Every label in the bar and its flyouts is built by MakeText, so scaling
+// there is the one place that moves all of them together - the alternative was
+// editing some fifty hardcoded FontSize calls. Icon glyph sizes and the
+// settings window are deliberately left alone: the bar already has
+// topBarScale for its overall size, and the settings window is not part of
+// what this setting is for.
+double ScaleFont(double size) {
+    int percent = g_settings.fontSizeScale;
+    if (percent < 50) percent = 50;
+    if (percent > 250) percent = 250;
+    return size * percent / 100.0;
+}
 
 // Tracks the previous state of defaultStartMenu/defaultSearch so the
 // in-app settings reload path can detect the on to off transition and
@@ -1731,7 +2182,7 @@ const std::vector<ControlStyleRule>& BuiltInStyles() {
         {L"ResourceButton", {L"Background:=#15ffffff", L"Margin=5,4"}},
 
 
-        {L"Button#ResourceCpuTab > ContentPresenter#ContentPresenter@CommonStates, Button#ResourceRamTab > ContentPresenter#ContentPresenter@CommonStates, Button#ResourceGpuTab > ContentPresenter#ContentPresenter@CommonStates", {
+        {L"Button#ResourceCpuTab > ContentPresenter#ContentPresenter@CommonStates, Button#ResourceRamTab > ContentPresenter#ContentPresenter@CommonStates, Button#ResourceGpuTab > ContentPresenter#ContentPresenter@CommonStates, Button#ResourceNetTab > ContentPresenter#ContentPresenter@CommonStates, Button#ResourceDiskTab > ContentPresenter#ContentPresenter@CommonStates", {
             L"Background@Selected:=#274755",
             L"BorderBrush@Selected:=#00D6FF",
             L"BorderThickness@Selected=2"
@@ -2071,9 +2522,9 @@ static std::vector<ControlStyleRule> BuildNeonBlueBaseStyles() {
             {L"Background:=#242231", L"Foreground:=#E9F7FF", L"BorderBrush:=#397E9B", L"BorderThickness=1", L"CornerRadius=12"}},
         {L"MenuFlyoutPresenter > Border#PART_BackgroundBorder, MenuFlyoutPresenter > Grid > Border#PART_BackgroundBorder",
             {L"Background:=#242231", L"BorderBrush:=#397E9B", L"CornerRadius=12"}},
-        {L"Button#ResourceCpuTab, Button#ResourceRamTab, Button#ResourceGpuTab",
+        {L"Button#ResourceCpuTab, Button#ResourceRamTab, Button#ResourceGpuTab, Button#ResourceNetTab, Button#ResourceDiskTab",
             {L"Background:=#274755", L"BorderBrush:=#00D6FF", L"CornerRadius=10"}},
-        {L"TextBlock#ResourceCpuTabText, TextBlock#ResourceRamTabText, TextBlock#ResourceGpuTabText",
+        {L"TextBlock#ResourceCpuTabText, TextBlock#ResourceRamTabText, TextBlock#ResourceGpuTabText, TextBlock#ResourceNetTabText, TextBlock#ResourceDiskTabText",
             {L"Foreground:=#E9F7FF", L"FontWeight=SemiBold"}},
         {L"Border#InfoIsland",
             {L"Background:=#274755", L"BorderBrush:=#397E9B", L"BorderThickness=1.3", L"CornerRadius=12"}},
@@ -2081,7 +2532,7 @@ static std::vector<ControlStyleRule> BuildNeonBlueBaseStyles() {
         {L"Canvas#ResourceGraphCanvas > Polygon", {L"Fill:=#34397E9B"}},
         {L"Canvas#ResourceGraphCanvas > Polyline", {L"Stroke=#00C2E4", L"StrokeThickness=2.2"}},
         {L"Grid#ResourceStatsGrid", {L"Background:=#274755", L"CornerRadius=12", L"Padding=8,6,8,6"}},
-        {L"TextBlock#StatLabel0, TextBlock#StatLabel1, TextBlock#StatLabel2, TextBlock#StatLabel3, TextBlock#InfoCpuLabel, TextBlock#InfoRamLabel, TextBlock#InfoGpuLabel",
+        {L"TextBlock#StatLabel0, TextBlock#StatLabel1, TextBlock#StatLabel2, TextBlock#StatLabel3, TextBlock#InfoCpuLabel, TextBlock#InfoRamLabel, TextBlock#InfoGpuLabel, TextBlock#InfoNetLabel, TextBlock#InfoDiskLabel",
             {L"Foreground:=#A3C1CD", L"FontSize=11"}},
         {L"TextBlock#StatValue0, TextBlock#StatValue1, TextBlock#StatValue2, TextBlock#StatValue3",
             {L"Foreground:=#00D6FF", L"FontSize=16", L"FontWeight=SemiBold"}},
@@ -2573,6 +3024,10 @@ std::atomic<ULONGLONG> g_lastTopBarPointerTick{0};
 [[clang::no_destroy]] wuxc::TextBlock g_infoCpuLabel{nullptr};
 [[clang::no_destroy]] wuxc::TextBlock g_infoRamLabel{nullptr};
 [[clang::no_destroy]] wuxc::TextBlock g_infoGpuLabel{nullptr};
+[[clang::no_destroy]] wuxc::TextBlock g_infoNetLabel{nullptr};
+[[clang::no_destroy]] wuxc::TextBlock g_infoNetName{nullptr};
+[[clang::no_destroy]] wuxc::TextBlock g_infoDiskLabel{nullptr};
+[[clang::no_destroy]] wuxc::TextBlock g_infoDiskName{nullptr};
 std::vector<std::wstring> g_gpuNames;
 int g_selectedGpuIndex = 0;
 bool g_selectedGpuIndexLoaded = false;
@@ -2580,7 +3035,12 @@ std::atomic<bool> g_resourceComboOpen{false};
 std::deque<float> g_cpuHistory;
 std::deque<float> g_ramHistory;
 std::map<int, std::deque<float>> g_gpuHistory;
-int g_currentTab = 0; // 0=CPU, 1=RAM, 2=GPU
+// Bytes per second rather than percent, so these two graphs scale themselves.
+std::deque<float> g_netHistory;
+std::deque<float> g_diskHistory;
+int g_currentTab = 0; // 0=CPU, 1=RAM, 2=GPU, 3=Network, 4=Disk
+constexpr int kResourceTabNetwork = 3;
+constexpr int kResourceTabDisk = 4;
 
 [[clang::no_destroy]] std::map<std::wstring, FrameworkElement> g_namedElements;
 [[clang::no_destroy]] FrameworkElement g_rootElement{nullptr};
@@ -3014,6 +3474,8 @@ static const std::map<std::wstring, int>& IntDefaults() {
         { L"showCpuUsage", 1 },
         { L"showRamUsage", 1 },
         { L"showGpuUsage", 1 },
+        { L"showNetworkUsage", 0 },
+        { L"showDiskUsage", 0 },
         { L"showMediaButton", 1 },
         { L"showMediaVisualizer", 1 },
         { L"mediaButtonShowIcon", 1 },
@@ -3021,6 +3483,7 @@ static const std::map<std::wstring, int>& IntDefaults() {
         { L"mediaButtonShowControls", 1 },
         { L"mediaButtonShowVisualizer", 1 },
         { L"fontBold", 0 },
+        { L"fontSizeScale", 100 },
         { L"thumbPreviewEnabled", 1 },
         { L"thumbShowPin", 1 },
         { L"thumbShowMinimize", 1 },
@@ -3048,6 +3511,10 @@ static const std::map<std::wstring, std::wstring>& StringDefaults() {
         { L"labelCpu", L"CPU:" },
         { L"labelRam", L"RAM:" },
         { L"labelGpu", L"GPU:" },
+        { L"labelNetwork", L"NET:" },
+        { L"labelDisk", L"DISK:" },
+        { L"networkUsageMode", L"combined" },
+        { L"diskUsageMode", L"combined" },
         { L"startSearchAlignment", L"center" },
         { L"activationPillColor", L"#FFFFFF" },
     };
@@ -5404,7 +5871,7 @@ void ApplyVisibilitySettings() {
     setVis(L"TrayIconButton", g_settings.showTrayIconButton);
     setVis(L"SettingsButton", g_settings.showSettingsButton);
     setVis(L"WeatherButton", g_settings.showWeatherButton);
-    setVis(L"ResourceButton", g_settings.showResourceButton && (g_settings.showCpuUsage || g_settings.showRamUsage || g_settings.showGpuUsage));
+    setVis(L"ResourceButton", g_settings.showResourceButton && (g_settings.showCpuUsage || g_settings.showRamUsage || g_settings.showGpuUsage || g_settings.showNetworkUsage || g_settings.showDiskUsage));
     setVis(L"ClockButton", g_settings.showClock || g_settings.showDate);
     setVis(L"MediaButton", g_settings.showMediaButton && g_mediaSessionExists);
     setVis(L"NotificationsButton", g_settings.showNotificationsButton);
@@ -6191,6 +6658,19 @@ constexpr PCWSTR kGpuCardStroke =
     L"M3 5 L17 5 L21 8 L21 17 L3 17 Z "
     L"M8 11 A2.5 2.5 0 1 1 13 11 A2.5 2.5 0 1 1 8 11 Z "
     L"M15 11 A2.5 2.5 0 1 1 20 11 A2.5 2.5 0 1 1 15 11 Z";
+// Down and up arrows side by side: network and disk both move bytes in two
+// directions, so one glyph shape serves both tabs.
+constexpr PCWSTR kNetworkStroke =
+    L"M8 3.5 L8 20.5 M4 16.5 L8 20.5 L12 16.5 "
+    L"M16 20.5 L16 3.5 M12 7.5 L16 3.5 L20 7.5";
+
+constexpr PCWSTR kDiskStroke =
+    L"M3.5 6 L20.5 6 L20.5 11 L3.5 11 Z "
+    L"M3.5 13 L20.5 13 L20.5 18 L3.5 18 Z "
+    L"M6 8.5 L9 8.5 M6 15.5 L9 15.5 "
+    L"M17 7.6 L18.6 7.6 L18.6 9.4 L17 9.4 Z "
+    L"M17 14.6 L18.6 14.6 L18.6 16.4 L17 16.4 Z";
+
 constexpr PCWSTR kCheckStroke = L"M5 12.5 L10 17.5 L19 6.5";
 constexpr PCWSTR kRewindStroke =
     L"M11 12 L3 7 L3 17 Z "
@@ -6579,7 +7059,7 @@ wuxc::TextBlock MakeText(PCWSTR name, std::wstring_view text, double size, bool 
         block.Name(name);
     }
     block.Text(winrt::hstring(text));
-    block.FontSize(size);
+    block.FontSize(ScaleFont(size));
 
     if (!g_settings.fontFamily.empty()) {
         try {
@@ -16270,6 +16750,19 @@ void UpdateBatteryButton() {
     }
 }
 
+// Renders an in/out byte-rate pair the way the chosen mode asks for: one
+// direction on its own, the two added together, or both with arrows.
+std::wstring FormatRatePair(double inBps, double outBps,
+                            const std::wstring& mode) {
+    if (mode == L"in") return resource::FormatByteRate(inBps);
+    if (mode == L"out") return resource::FormatByteRate(outBps);
+    if (mode == L"both") {
+        return L"\u2193" + resource::FormatByteRate(inBps) + L" \u2191" +
+               resource::FormatByteRate(outBps);
+    }
+    return resource::FormatByteRate(inBps + outBps);
+}
+
 void ApplyResourceUsageToButton(const resource::Usage& usage) {
     if (!g_resourceButton) return;
 
@@ -16319,6 +16812,24 @@ void ApplyResourceUsageToButton(const resource::Usage& usage) {
         label += usage.gpuAvailable ? (std::to_wstring(usage.gpu) + L"%") : L"-";
         appendMetric(icons::kGpuCardStroke, label);
     }
+    if (g_settings.showNetworkUsage) {
+        std::wstring label = g_settings.labelNetwork;
+        if (!label.empty() && label.back() != L' ') label += L" ";
+        label += usage.netAvailable
+                     ? FormatRatePair(usage.netDownBps, usage.netUpBps,
+                                      g_settings.networkUsageMode)
+                     : L"-";
+        appendMetric(icons::kNetworkStroke, label);
+    }
+    if (g_settings.showDiskUsage) {
+        std::wstring label = g_settings.labelDisk;
+        if (!label.empty() && label.back() != L' ') label += L" ";
+        label += usage.diskAvailable
+                     ? FormatRatePair(usage.diskReadBps, usage.diskWriteBps,
+                                      g_settings.diskUsageMode)
+                     : L"-";
+        appendMetric(icons::kDiskStroke, label);
+    }
 
     if (!any || !g_settings.showResourceButton) {
         g_resourceButton.Visibility(Visibility::Collapsed);
@@ -16361,14 +16872,25 @@ void ApplyResourceFlyoutContentUI(const resource::Usage& usage,
                                   const resource::DetailedInfo& detailed) {
     try {
     // Update Info Island - show only the currently selected component and update it
-    if (g_infoCpuLabel && g_infoCpuName && g_infoRamLabel && g_infoRamName && g_infoGpuLabel && g_infoGpuCombo) {
+    if (g_infoCpuLabel && g_infoCpuName && g_infoRamLabel && g_infoRamName &&
+        g_infoGpuLabel && g_infoGpuCombo && g_infoNetLabel && g_infoNetName &&
+        g_infoDiskLabel && g_infoDiskName) {
+        // Hide the lot first: with five tabs, spelling out every combination
+        // per branch is where a stale row gets left on screen.
+        g_infoCpuLabel.Visibility(Visibility::Collapsed);
+        g_infoCpuName.Visibility(Visibility::Collapsed);
+        g_infoRamLabel.Visibility(Visibility::Collapsed);
+        g_infoRamName.Visibility(Visibility::Collapsed);
+        g_infoGpuLabel.Visibility(Visibility::Collapsed);
+        g_infoGpuCombo.Visibility(Visibility::Collapsed);
+        g_infoNetLabel.Visibility(Visibility::Collapsed);
+        g_infoNetName.Visibility(Visibility::Collapsed);
+        g_infoDiskLabel.Visibility(Visibility::Collapsed);
+        g_infoDiskName.Visibility(Visibility::Collapsed);
+
         if (g_currentTab == 0) {
             g_infoCpuLabel.Visibility(Visibility::Visible);
             g_infoCpuName.Visibility(Visibility::Visible);
-            g_infoRamLabel.Visibility(Visibility::Collapsed);
-            g_infoRamName.Visibility(Visibility::Collapsed);
-            g_infoGpuLabel.Visibility(Visibility::Collapsed);
-            g_infoGpuCombo.Visibility(Visibility::Collapsed);
 
             std::wstring cpuName = resource::GetCpuFullName();
             // Strip the hardcoded base frequency from the name string
@@ -16380,12 +16902,8 @@ void ApplyResourceFlyoutContentUI(const resource::Usage& usage,
             cpuName += L" @ " + std::to_wstring(resource::GetCpuBaseClockMHz()) + L" MHz";
             g_infoCpuName.Text(winrt::hstring(cpuName));
         } else if (g_currentTab == 1) {
-            g_infoCpuLabel.Visibility(Visibility::Collapsed);
-            g_infoCpuName.Visibility(Visibility::Collapsed);
             g_infoRamLabel.Visibility(Visibility::Visible);
             g_infoRamName.Visibility(Visibility::Visible);
-            g_infoGpuLabel.Visibility(Visibility::Collapsed);
-            g_infoGpuCombo.Visibility(Visibility::Collapsed);
 
             std::wstring current = g_infoRamName.Text().c_str();
             if (current.empty() || current == L"Loading...") {
@@ -16406,10 +16924,6 @@ void ApplyResourceFlyoutContentUI(const resource::Usage& usage,
                 if (!ramText.empty()) g_infoRamName.Text(winrt::hstring(ramText));
             }
         } else if (g_currentTab == 2) {
-            g_infoCpuLabel.Visibility(Visibility::Collapsed);
-            g_infoCpuName.Visibility(Visibility::Collapsed);
-            g_infoRamLabel.Visibility(Visibility::Collapsed);
-            g_infoRamName.Visibility(Visibility::Collapsed);
             g_infoGpuLabel.Visibility(Visibility::Visible);
             g_infoGpuCombo.Visibility(Visibility::Visible);
 
@@ -16434,6 +16948,25 @@ void ApplyResourceFlyoutContentUI(const resource::Usage& usage,
                     g_populatingPanel = prev;
                 }
             }
+        } else if (g_currentTab == kResourceTabNetwork) {
+            g_infoNetLabel.Visibility(Visibility::Visible);
+            g_infoNetName.Visibility(Visibility::Visible);
+            if (!detailed.netAdapters.empty()) {
+                g_infoNetName.Text(winrt::hstring(detailed.netAdapters));
+            }
+        } else if (g_currentTab == kResourceTabDisk) {
+            g_infoDiskLabel.Visibility(Visibility::Visible);
+            g_infoDiskName.Visibility(Visibility::Visible);
+            if (detailed.diskTotalBytes > 0) {
+                std::wstring diskText = detailed.diskRoot;
+                if (!diskText.empty() && diskText.back() == L'\\') {
+                    diskText.pop_back();
+                }
+                diskText += L"  " +
+                            resource::FormatByteSize(detailed.diskTotalBytes) +
+                            L" total";
+                g_infoDiskName.Text(winrt::hstring(diskText));
+            }
         }
     }
 
@@ -16451,6 +16984,14 @@ void ApplyResourceFlyoutContentUI(const resource::Usage& usage,
         if (usage.gpuAvailable) hist.push_back(static_cast<float>(usage.gpu));
         else hist.push_back(0);
         if (hist.size() > maxSamples) hist.pop_front();
+    } else if (g_currentTab == kResourceTabNetwork) {
+        g_netHistory.push_back(
+            static_cast<float>(usage.netDownBps + usage.netUpBps));
+        if (g_netHistory.size() > maxSamples) g_netHistory.pop_front();
+    } else if (g_currentTab == kResourceTabDisk) {
+        g_diskHistory.push_back(
+            static_cast<float>(usage.diskReadBps + usage.diskWriteBps));
+        if (g_diskHistory.size() > maxSamples) g_diskHistory.pop_front();
     }
 
     // Set graph colors based on current tab. If the user has any YAML rule
@@ -16470,6 +17011,14 @@ void ApplyResourceFlyoutContentUI(const resource::Usage& usage,
         // GPU: Fluent red #E81123 line, darker red fill
         lineColor = wui::ColorHelper::FromArgb(255, 0xE8, 0x11, 0x23);
         fillColor = wui::ColorHelper::FromArgb(80, 0x80, 0x00, 0x00);
+    } else if (g_currentTab == kResourceTabNetwork) {
+        // Network: amber #F7A23B line, darker fill
+        lineColor = wui::ColorHelper::FromArgb(255, 0xF7, 0xA2, 0x3B);
+        fillColor = wui::ColorHelper::FromArgb(80, 0x8A, 0x5A, 0x1E);
+    } else {
+        // Disk: violet #A86FE0 line, darker fill
+        lineColor = wui::ColorHelper::FromArgb(255, 0xA8, 0x6F, 0xE0);
+        fillColor = wui::ColorHelper::FromArgb(80, 0x5C, 0x3B, 0x7D);
     }
     bool userHasPolyline = false;
     bool userHasPolygon = false;
@@ -16491,6 +17040,8 @@ void ApplyResourceFlyoutContentUI(const resource::Usage& usage,
     // Draw graph (line + fill)
     auto& history = (g_currentTab == 0) ? g_cpuHistory
                    : (g_currentTab == 1) ? g_ramHistory
+                   : (g_currentTab == kResourceTabNetwork) ? g_netHistory
+                   : (g_currentTab == kResourceTabDisk) ? g_diskHistory
                                          : g_gpuHistory[g_selectedGpuIndex];
     
     static int s_lastGraphTab = -1;
@@ -16510,7 +17061,12 @@ void ApplyResourceFlyoutContentUI(const resource::Usage& usage,
         double width = g_graphCanvas.ActualWidth();
         double height = g_graphCanvas.ActualHeight();
         if (width <= 0 || height <= 0) width = 300, height = 150;
-        double minVal = 0, maxVal = 100;
+        // The percentage tabs have a fixed 0-100 ceiling. Network and disk do
+        // not, so they start at a 64 KB/s ceiling and grow from there, which
+        // keeps an idle link from drawing a few hundred bytes as a mountain.
+        const bool rateTab = (g_currentTab == kResourceTabNetwork ||
+                              g_currentTab == kResourceTabDisk);
+        double minVal = 0, maxVal = rateTab ? 65536.0 : 100.0;
         for (float v : history) {
             if (v < minVal) minVal = v;
             if (v > maxVal) maxVal = v;
@@ -16609,6 +17165,22 @@ void ApplyResourceFlyoutContentUI(const resource::Usage& usage,
         value2 = vramBuffer;
         label3 = L""; value3 = L"";
         label4 = L""; value4 = L"";
+    } else if (g_currentTab == kResourceTabNetwork) {
+        label1 = L"Download"; value1 = resource::FormatByteRate(usage.netDownBps);
+        label2 = L"Upload";   value2 = resource::FormatByteRate(usage.netUpBps);
+        label3 = L"Combined";
+        value3 = resource::FormatByteRate(usage.netDownBps + usage.netUpBps);
+        label4 = L"Link speed";
+        value4 = resource::FormatBitRate(detailed.netLinkBitsPerSec);
+    } else if (g_currentTab == kResourceTabDisk) {
+        label1 = L"Read";  value1 = resource::FormatByteRate(usage.diskReadBps);
+        label2 = L"Write"; value2 = resource::FormatByteRate(usage.diskWriteBps);
+        label3 = L"Combined";
+        value3 = resource::FormatByteRate(usage.diskReadBps + usage.diskWriteBps);
+        label4 = L"Free space";
+        value4 = detailed.diskTotalBytes > 0
+                     ? resource::FormatByteSize(detailed.diskFreeBytes)
+                     : L"-";
     }
 
     // Collapse the bottom row for the GPU tab to remove the empty space
@@ -16648,6 +17220,10 @@ void RefreshResourceTabButtonStyles() {
         accent = wui::ColorHelper::FromArgb(255, 0x34, 0xC7, 0x59);
     } else if (g_currentTab == 1) {
         accent = wui::ColorHelper::FromArgb(255, 0x5C, 0x9E, 0xFA);
+    } else if (g_currentTab == kResourceTabNetwork) {
+        accent = wui::ColorHelper::FromArgb(255, 0xF7, 0xA2, 0x3B);
+    } else if (g_currentTab == kResourceTabDisk) {
+        accent = wui::ColorHelper::FromArgb(255, 0xA8, 0x6F, 0xE0);
     } else {
         accent = wui::ColorHelper::FromArgb(255, 0xE8, 0x11, 0x23);
     }
@@ -16730,7 +17306,7 @@ void PopulateResourceFlyout() {
     wuxc::StackPanel tabPanel;
     tabPanel.Name(L"ResourceTabPanel");
     tabPanel.Orientation(wuxc::Orientation::Horizontal);
-    tabPanel.Spacing(4);
+    tabPanel.Spacing(3);
     tabPanel.Margin(Thickness{0, 0, 0, 4});
 
     auto makeTabButton = [&](PCWSTR name, PCWSTR displayText, int tabIndex,
@@ -16740,21 +17316,22 @@ void PopulateResourceFlyout() {
         wuxc::StackPanel content;
         content.Name(winrt::hstring(baseName + L"Content"));
         content.Orientation(wuxc::Orientation::Horizontal);
-        content.Spacing(6);
+        content.Spacing(4);
         content.HorizontalAlignment(HorizontalAlignment::Center);
         content.VerticalAlignment(VerticalAlignment::Center);
-        if (auto icon = BuildVectorIcon((baseName + L"Icon").c_str(), L"", iconStroke, 24, 20, 1.8)) {
+        if (auto icon = BuildVectorIcon((baseName + L"Icon").c_str(), L"", iconStroke, 24, 16, 1.8)) {
             icon.VerticalAlignment(VerticalAlignment::Center);
             content.Children().Append(icon);
         }
-        auto text = MakeText((baseName + L"Text").c_str(), displayText, 14);
+        auto text = MakeText((baseName + L"Text").c_str(), displayText, 11);
         text.VerticalAlignment(VerticalAlignment::Center);
         content.Children().Append(text);
         btn.Content(content);
-        btn.Padding(Thickness{10, 6, 10, 6});
+        btn.Padding(Thickness{4, 6, 4, 6});
         btn.HorizontalAlignment(HorizontalAlignment::Stretch);
-        btn.Width(90);
-        // Per-tab accent hover colors: CPU=green, RAM=blue, GPU=red
+        btn.Width(62);
+        // Per-tab accent hover colors: CPU=green, RAM=blue, GPU=red,
+        // Network=amber, Disk=violet
         btn.Click([tabIndex](auto&&, auto&&) {
             g_currentTab = tabIndex;
             RefreshResourceTabButtonStyles();
@@ -16766,16 +17343,36 @@ void PopulateResourceFlyout() {
     auto cpuTab = makeTabButton(L"ResourceCpuTab", L"CPU", 0, icons::kCpuChipStroke);
     auto ramTab = makeTabButton(L"ResourceRamTab", L"RAM", 1, icons::kRamStickStroke);
     auto gpuTab = makeTabButton(L"ResourceGpuTab", L"GPU", 2, icons::kGpuCardStroke);
+    auto netTab = makeTabButton(L"ResourceNetTab", L"Net",
+                                kResourceTabNetwork, icons::kNetworkStroke);
+    auto diskTab = makeTabButton(L"ResourceDiskTab", L"Disk",
+                                 kResourceTabDisk, icons::kDiskStroke);
     tabPanel.Children().Append(cpuTab);
     tabPanel.Children().Append(ramTab);
     tabPanel.Children().Append(gpuTab);
-    children.Append(tabPanel);
+    tabPanel.Children().Append(netTab);
+    tabPanel.Children().Append(diskTab);
+
+    // Five tabs are a tight fit in a 340 dip panel, and a larger font size
+    // pushes them over it, so the row rides in a horizontal scroller: flush at
+    // the default size, draggable sideways when it is not.
+    wuxc::ScrollViewer tabScroller;
+    tabScroller.Name(L"ResourceTabScroller");
+    tabScroller.Content(tabPanel);
+    tabScroller.HorizontalScrollBarVisibility(wuxc::ScrollBarVisibility::Hidden);
+    tabScroller.VerticalScrollBarVisibility(wuxc::ScrollBarVisibility::Disabled);
+    tabScroller.HorizontalScrollMode(wuxc::ScrollMode::Enabled);
+    tabScroller.VerticalScrollMode(wuxc::ScrollMode::Disabled);
+    tabScroller.Background(MakeBrush(0, 0, 0, 0));
+    children.Append(tabScroller);
 
     // Store tab buttons for highlighting
     g_tabButtons.clear();
     g_tabButtons.push_back(cpuTab);
     g_tabButtons.push_back(ramTab);
     g_tabButtons.push_back(gpuTab);
+    g_tabButtons.push_back(netTab);
+    g_tabButtons.push_back(diskTab);
 
     // Info Island (component details)
     wuxc::Border infoIsland;
@@ -16846,6 +17443,18 @@ void PopulateResourceFlyout() {
 
     infoStack.Children().Append(g_infoGpuLabel);
     infoStack.Children().Append(g_infoGpuCombo);
+
+    // Network adapters being counted
+    g_infoNetLabel = MakeText(L"InfoNetLabel", L"Network", 10, false, 0.6);
+    g_infoNetName = MakeText(L"InfoNetName", L"Loading...", 13, true);
+    infoStack.Children().Append(g_infoNetLabel);
+    infoStack.Children().Append(g_infoNetName);
+
+    // Volume Windows is installed on
+    g_infoDiskLabel = MakeText(L"InfoDiskLabel", L"Disk", 10, false, 0.6);
+    g_infoDiskName = MakeText(L"InfoDiskName", L"Loading...", 13, true);
+    infoStack.Children().Append(g_infoDiskLabel);
+    infoStack.Children().Append(g_infoDiskName);
 
     infoIsland.Child(infoStack);
     children.Append(infoIsland);
@@ -27043,6 +27652,12 @@ void BuildAppearancePage(wuxc::StackPanel& p) {
         AddComboRow(p, L"Font family", L"fontFamily", fontOptions,
                     L"Applies to every label and icon in the topbar.");
     }
+    AddSliderRow(p, L"Font size (%)", L"fontSizeScale", 50, 250,
+                 L"Scales every label in the topbar and its flyouts. 100% is "
+                 L"the built-in size. Icon sizes follow display scaling "
+                 L"instead, so a large value may also need a taller TopBar "
+                 L"height above.",
+                 5);
     AddBoolRow(p, L"Bold text", L"fontBold");
     AddColorRow(p, L"Font color", L"fontColor",
                 L"Foreground color for every label in the topbar and flyouts.");
@@ -27150,6 +27765,28 @@ void BuildLayoutPage(wuxc::StackPanel& p) {
                L"Text before the RAM percentage.");
     AddTextRow(p, L"GPU label", L"labelGpu",
                L"Text before the GPU percentage.");
+    AddBoolRow(p, L"Show network speed", L"showNetworkUsage",
+               L"Throughput across the physical adapters. Virtual, tunnel and "
+               L"loopback adapters are left out, since they carry the same "
+               L"bytes as the adapter underneath them.");
+    AddComboRow(p, L"Network speed shows", L"networkUsageMode", {
+        { L"combined", L"Combined (download + upload)" },
+        { L"in",       L"Download only" },
+        { L"out",      L"Upload only" },
+        { L"both",     L"Both, with arrows" },
+    });
+    AddTextRow(p, L"Network label", L"labelNetwork",
+               L"Text before the network speed.");
+    AddBoolRow(p, L"Show disk speed", L"showDiskUsage",
+               L"Throughput across all physical disks.");
+    AddComboRow(p, L"Disk speed shows", L"diskUsageMode", {
+        { L"combined", L"Combined (read + write)" },
+        { L"in",       L"Read only" },
+        { L"out",      L"Write only" },
+        { L"both",     L"Both, with arrows" },
+    });
+    AddTextRow(p, L"Disk label", L"labelDisk",
+               L"Text before the disk speed.");
 
     p.Children().Append(MakeHeading(L"Weather"));
     AddComboRow(p, L"Temperature unit", L"weatherUnit", {
@@ -27506,6 +28143,7 @@ static std::wstring BuildSettingsJson() {
     addStr(L"iconPack");
     addStr(L"fontColor");
     addStr(L"fontFamily");
+    addInt(L"fontSizeScale");
     addInt(L"fontBold");
     addStr(L"timeFormat");
     addStr(L"dateFormat");
@@ -27543,6 +28181,12 @@ static std::wstring BuildSettingsJson() {
     addStr(L"labelCpu");
     addStr(L"labelRam");
     addStr(L"labelGpu");
+    addInt(L"showNetworkUsage");
+    addInt(L"showDiskUsage");
+    addStr(L"networkUsageMode");
+    addStr(L"diskUsageMode");
+    addStr(L"labelNetwork");
+    addStr(L"labelDisk");
     addInt(L"showMediaButton");
     addInt(L"showMediaVisualizer");
     addInt(L"mediaButtonShowIcon");
@@ -27762,6 +28406,7 @@ static void ApplySettingsPairs(
         L"topBarScaleMode", L"topBarScale", L"barHeight", L"cornerRadius",
         L"topBarBackgroundColor", L"topBarBackgroundOpacity",
         L"iconColor", L"iconPack", L"fontColor", L"fontFamily", L"fontBold",
+        L"fontSizeScale",
         L"globalBlurAmount", L"showStartButton", L"showSearchButton",
         L"centerContent", L"taskButtonWidth", L"taskIconSize",
         L"taskButtonContent", L"showDisplayButton", L"showSoundButton",
@@ -27772,7 +28417,10 @@ static void ApplySettingsPairs(
         L"disableTitleBarBleed",
         L"leftItems", L"centerItems", L"rightItems",
         L"showCpuUsage", L"showRamUsage", L"showGpuUsage",
+        L"showNetworkUsage", L"showDiskUsage",
+        L"networkUsageMode", L"diskUsageMode",
         L"labelCpu", L"labelRam", L"labelGpu",
+        L"labelNetwork", L"labelDisk",
         L"showMediaButton", L"showMediaVisualizer",
         L"mediaButtonShowIcon", L"mediaButtonShowName",
         L"mediaButtonShowControls", L"mediaButtonShowVisualizer",
@@ -27815,6 +28463,8 @@ static void ApplySettingsPairs(
         { L"showCpuUsage",              {   0,   1 } },
         { L"showRamUsage",              {   0,   1 } },
         { L"showGpuUsage",              {   0,   1 } },
+        { L"showNetworkUsage",          {   0,   1 } },
+        { L"showDiskUsage",             {   0,   1 } },
         { L"showMediaButton",           {   0,   1 } },
         { L"showMediaVisualizer",       {   0,   1 } },
         { L"mediaButtonShowIcon",       {   0,   1 } },
@@ -27830,6 +28480,7 @@ static void ApplySettingsPairs(
         { L"showClock",                 {   0,   1 } },
         { L"showDate",                  {   0,   1 } },
         { L"fontBold",                  {   0,   1 } },
+        { L"fontSizeScale",             {  50, 250 } },
         { L"topBarAutoHideMs",          {   0, 2000 } },
         { L"topBarRevealDelayMs",       {   0, 2000 } },
         { L"topBarHideDelayMs",         {   0, 2000 } },
@@ -28722,6 +29373,7 @@ wuxc::Grid BuildWindowContent() {
             const wchar_t* keys[] = {
                 L"barHeight", L"cornerRadius", L"topBarBackgroundColor",
                 L"topBarBackgroundOpacity", L"iconColor", L"fontColor", L"fontFamily", L"fontBold",
+                L"fontSizeScale",
                 L"timeFormat", L"dateFormat", L"showClock", L"showDate",
                 L"leftItems", L"centerItems", L"rightItems",
                 L"taskButtonWidth", L"taskIconSize", L"taskButtonContent",
@@ -28736,7 +29388,10 @@ wuxc::Grid BuildWindowContent() {
         L"showPinnedSection", L"searchQuickControls", L"startSearchAlignment", L"startFolderExplorer", L"startFolderDocuments", L"startFolderDownloads", L"startFolderSettings",
         L"startFolderPictures", L"startFolderMusic", L"startFolderVideos", L"startFolderNetwork",
                 L"showCpuUsage", L"showRamUsage", L"showGpuUsage",
+                L"showNetworkUsage", L"showDiskUsage",
+                L"networkUsageMode", L"diskUsageMode",
                 L"labelCpu", L"labelRam", L"labelGpu",
+                L"labelNetwork", L"labelDisk",
                 L"showMediaButton", L"showMediaVisualizer",
                 L"mediaButtonShowIcon", L"mediaButtonShowName",
                 L"mediaButtonShowControls", L"mediaButtonShowVisualizer",
@@ -32393,7 +33048,9 @@ g_taskListPanel.SizeChanged([](auto&&, auto&&) {
         {
             int metrics = (g_settings.showCpuUsage ? 1 : 0) +
                           (g_settings.showRamUsage ? 1 : 0) +
-                          (g_settings.showGpuUsage ? 1 : 0);
+                          (g_settings.showGpuUsage ? 1 : 0) +
+                          (g_settings.showNetworkUsage ? 1 : 0) +
+                          (g_settings.showDiskUsage ? 1 : 0);
             if (metrics < 1) metrics = 1;
             (void)metrics;
             resourceButton.ClearValue(FrameworkElement::WidthProperty());
@@ -32464,7 +33121,7 @@ g_centerPanel.Children().Append(resourceButton);
 
         auto clockText = MakeText(L"ClockText", L"", 14);
         clockText.TextAlignment(TextAlignment::Center);
-        clockText.LineHeight(15);
+        clockText.LineHeight(ScaleFont(15));
         clockText.IsColorFontEnabled(false);
         ApplyClockInlines(clockText, FormatClockText());
         clockButton.Content(clockText);
@@ -39912,7 +40569,8 @@ DWORD WINAPI TopBarThreadProc(LPVOID) {
         g_resourceTimer.Tick([](wf::IInspectable const&, wf::IInspectable const&) {
             try {
                 if (!g_settings.showCpuUsage && !g_settings.showRamUsage &&
-                    !g_settings.showGpuUsage) {
+                    !g_settings.showGpuUsage && !g_settings.showNetworkUsage &&
+                    !g_settings.showDiskUsage) {
                     return;
                 }
                 if (!g_resourceButton ||
@@ -41063,6 +41721,24 @@ void LoadSettings() {
     if (g_settings.labelRam.empty()) g_settings.labelRam = L"RAM:";
     g_settings.labelGpu = GetStringSettingCopy(L"labelGpu");
     if (g_settings.labelGpu.empty()) g_settings.labelGpu = L"GPU:";
+    g_settings.showNetworkUsage = ReadIntSetting(L"showNetworkUsage", 0) != 0;
+    g_settings.showDiskUsage = ReadIntSetting(L"showDiskUsage", 0) != 0;
+    g_settings.labelNetwork = GetStringSettingCopy(L"labelNetwork");
+    if (g_settings.labelNetwork.empty()) g_settings.labelNetwork = L"NET:";
+    g_settings.labelDisk = GetStringSettingCopy(L"labelDisk");
+    if (g_settings.labelDisk.empty()) g_settings.labelDisk = L"DISK:";
+    g_settings.networkUsageMode = GetStringSettingCopy(L"networkUsageMode");
+    if (g_settings.networkUsageMode != L"in" &&
+        g_settings.networkUsageMode != L"out" &&
+        g_settings.networkUsageMode != L"both") {
+        g_settings.networkUsageMode = L"combined";
+    }
+    g_settings.diskUsageMode = GetStringSettingCopy(L"diskUsageMode");
+    if (g_settings.diskUsageMode != L"in" &&
+        g_settings.diskUsageMode != L"out" &&
+        g_settings.diskUsageMode != L"both") {
+        g_settings.diskUsageMode = L"combined";
+    }
     g_settings.enableHotkeys = Wh_GetIntSetting(L"enableHotkeys") != 0;
     g_settings.disableFlyoutAutoClose = Wh_GetIntSetting(L"disableFlyoutAutoClose") != 0;
     g_settings.showPinnedSection = ReadIntSetting(L"showPinnedSection", 1) != 0;
@@ -41119,6 +41795,9 @@ void LoadSettings() {
     }
     g_iconColorOverride.reset();
     g_settings.fontFamily = GetStringSettingCopy(L"fontFamily");
+    g_settings.fontSizeScale = ReadIntSetting(L"fontSizeScale", 100);
+    if (g_settings.fontSizeScale < 50) g_settings.fontSizeScale = 50;
+    if (g_settings.fontSizeScale > 250) g_settings.fontSizeScale = 250;
     g_settings.fontBold = ReadIntSetting(L"fontBold", 0) != 0;
     g_settings.globalBlurAmount = ReadIntSetting(L"globalBlurAmount", 6);
     if (g_settings.globalBlurAmount < 1) g_settings.globalBlurAmount = 1;
