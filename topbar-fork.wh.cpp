@@ -3,7 +3,7 @@
 // @name            TopBar for Windows - Fork
 // @donateUrl       https://www.patreon.com/WasiXGamer/join
 // @description     A working TopBar with Flyouts for Windows through Windhawk.
-// @version         1.4.4
+// @version         1.4.5
 // @author          WasiXGamer
 // @github          https://github.com/wasixgamer
 // @include         explorer.exe
@@ -74,7 +74,8 @@ Pages:
   global blur amount, icon color, font family / size / color / weight, clock
   & date format.
 - **Customizations** — app-title button mode (application name / task list /
-  none), task button size & content, media player options, resource monitor
+  none), task button size & content, media player options (source picker,
+  shuffle / repeat / skip, output device picker), resource monitor
   metrics & labels (CPU, RAM, GPU, network and disk throughput) and weather
   units.
 - **UI Alignment** — move any button between the Left, Center and Right panels.
@@ -87,6 +88,27 @@ Pages:
   copy / paste it via the clipboard.
 - **About** — version info and links.
 
+
+## Media Player
+
+The flyout drives one player at a time, and Windows can have several loaded at
+once -- music paused in Spotify while a video plays in a browser tab.
+
+- **Source picker** names the app being controlled and steps between every
+  loaded player. Browser tabs count separately: a browser gives all of its
+  tabs the same AppUserModelId, so each session is keyed by that id plus an
+  ordinal rather than by the id alone. A source can be dismissed with the
+  **x**; a row at the bottom of the flyout brings dismissed sources back, and
+  appears even when the dismissed one was the only player.
+- **Shuffle, repeat and 10-second skips** sit either side of the transport.
+  Players report which of these they support, so each is greyed out rather
+  than silently doing nothing.
+- **Output device picker** switches the default playback device from inside
+  the flyout -- the same control the Sound flyout has, since where the audio
+  goes belongs next to what is playing. It changes the Console, Multimedia and
+  Communications roles together, so communication apps follow too.
+
+Everything above can be turned off individually under **Customizations**.
 
 ## Resource Monitor: network and disk
 
@@ -121,9 +143,10 @@ the two combined, or both with arrows. They are off by default.
   Weather (current conditions, hourly forecast, location search), Recycle
   Bin (size, item count, empty with confirm), Resource Monitor (CPU / RAM /
   GPU / Network / Disk tabs with live graph, GPU selector, detailed info),
-  Media Player
-  (album art, artist, title, transport controls, live progress bar,
-  audio-reactive visualizer).
+  Media Player (album art, artist, title, transport controls, shuffle /
+  repeat / 10-second skips, live progress bar with seek, audio-reactive
+  visualizer, source picker across every loaded player, output device
+  picker).
 - **Start menu replacement** — custom Start with account panel, power menu,
   search box, a six-column grid with Pinned above All apps (Win32 shortcuts + UWP apps),
   configurable folder shortcuts and a Lock button.
@@ -218,6 +241,8 @@ Run **[UWPSpy](https://github.com/m417z/UWPSpy/releases/)** on the TopBar's
 | `TrayIconButton` | System tray overflow button |
 | `NotificationsButton` | Windows notifications button |
 | `MediaButton` / `MediaTransportButton` | Media Player button and its transport buttons |
+| `MediaSourceArrow` / `MediaSourceHide` | Source picker arrows and the dismiss button |
+| `MediaRestoreSources` | The row that brings dismissed sources back |
 | `SettingsButton` | Settings gear |
 | `AppTitleButton` / `AppTitleText` | Foreground application-name button |
 | `FlyoutBlurHost` | The blur host border inside every control flyout |
@@ -1988,6 +2013,9 @@ struct {
     bool mediaButtonShowName = true;
     bool mediaButtonShowControls = true;
     bool mediaButtonShowVisualizer = true;
+    bool mediaShowSourcePicker = true;
+    bool mediaShowExtraControls = true;
+    bool mediaShowOutputPicker = true;
     std::wstring labelCpu = L"CPU:";
     std::wstring labelRam = L"RAM:";
     std::wstring labelGpu = L"GPU:";
@@ -3482,6 +3510,9 @@ static const std::map<std::wstring, int>& IntDefaults() {
         { L"mediaButtonShowName", 1 },
         { L"mediaButtonShowControls", 1 },
         { L"mediaButtonShowVisualizer", 1 },
+        { L"mediaShowSourcePicker", 1 },
+        { L"mediaShowExtraControls", 1 },
+        { L"mediaShowOutputPicker", 1 },
         { L"fontBold", 0 },
         { L"fontSizeScale", 100 },
         { L"thumbPreviewEnabled", 1 },
@@ -6670,6 +6701,20 @@ constexpr PCWSTR kDiskStroke =
     L"M6 8.5 L9 8.5 M6 15.5 L9 15.5 "
     L"M17 7.6 L18.6 7.6 L18.6 9.4 L17 9.4 Z "
     L"M17 14.6 L18.6 14.6 L18.6 16.4 L17 16.4 Z";
+
+// Two crossing arrows.
+constexpr PCWSTR kShuffleStroke =
+    L"M4 7 L7.5 7 L16 17 L20 17 "
+    L"M4 17 L7.5 17 L16 7 L20 7 "
+    L"M17.5 4.5 L20.5 7 L17.5 9.5 "
+    L"M17.5 14.5 L20.5 17 L17.5 19.5";
+
+// A loop: two edges with rounded corners and an arrowhead on each.
+constexpr PCWSTR kRepeatStroke =
+    L"M6.5 7.5 L15 7.5 A4 4 0 0 1 19 11.5 L19 13 "
+    L"M17.5 16.5 L9 16.5 A4 4 0 0 1 5 12.5 L5 11 "
+    L"M9 5 L6.5 7.5 L9 10 "
+    L"M15 14 L17.5 16.5 L15 19";
 
 constexpr PCWSTR kCheckStroke = L"M5 12.5 L10 17.5 L19 6.5";
 constexpr PCWSTR kRewindStroke =
@@ -14159,11 +14204,74 @@ double g_visualizerPhase = 0.0;
 bool g_mediaPlaying = false;
 bool g_mediaSessionExists = false;
 
+// Which player the flyout and the bar button are showing. Windows reports one
+// session per player, and more than one can be loaded at once (Spotify in the
+// background, a video in a browser tab); everything here used to read
+// GetCurrentSession() and so could only ever see whichever one Windows
+// happened to consider current. Empty means "whatever is current".
+//
+// The UI thread writes both of these and the media worker reads them, so they
+// are only ever touched through the accessors below -- a torn read of a
+// std::wstring is not a theoretical problem.
+[[clang::no_destroy]] std::mutex g_mediaSelectionMutex;
+[[clang::no_destroy]] std::wstring g_selectedMediaSessionKey;
+// Sources the user dismissed, by AppUserModelId. Persisted in mediaHiddenApps.
+[[clang::no_destroy]] std::vector<std::wstring> g_hiddenMediaApps;
+bool g_mediaOutputExpanded = false;
+
+std::wstring SelectedMediaSessionKey() {
+    std::lock_guard<std::mutex> lock(g_mediaSelectionMutex);
+    return g_selectedMediaSessionKey;
+}
+
+void SetSelectedMediaSessionKey(const std::wstring& key) {
+    std::lock_guard<std::mutex> lock(g_mediaSelectionMutex);
+    g_selectedMediaSessionKey = key;
+}
+
+std::vector<std::wstring> HiddenMediaAppsCopy() {
+    std::lock_guard<std::mutex> lock(g_mediaSelectionMutex);
+    return g_hiddenMediaApps;
+}
+
+size_t HiddenMediaAppCount() {
+    std::lock_guard<std::mutex> lock(g_mediaSelectionMutex);
+    return g_hiddenMediaApps.size();
+}
+
+void ClearHiddenMediaApps() {
+    std::lock_guard<std::mutex> lock(g_mediaSelectionMutex);
+    g_hiddenMediaApps.clear();
+}
+
+// Returns false when it was already hidden, so the caller can skip the save.
+bool AddHiddenMediaApp(const std::wstring& appId) {
+    std::lock_guard<std::mutex> lock(g_mediaSelectionMutex);
+    if (std::find(g_hiddenMediaApps.begin(), g_hiddenMediaApps.end(), appId) !=
+        g_hiddenMediaApps.end()) {
+        return false;
+    }
+    g_hiddenMediaApps.push_back(appId);
+    return true;
+}
+
 #if TOPBAR_HAS_MEDIA_CONTROL
 
 namespace media {
 
 using namespace winrt::Windows::Media::Control;
+
+using Session = GlobalSystemMediaTransportControlsSession;
+using Manager = GlobalSystemMediaTransportControlsSessionManager;
+
+// One entry per player the source picker can step to.
+struct SessionEntry {
+    std::wstring key;    // appId plus an ordinal; see KeyedSessions
+    std::wstring appId;  // the raw AppUserModelId
+    std::wstring name;   // "Spotify", "Chrome", ...
+    std::wstring badge;  // "SP", "CH", ...
+    bool playing = false;
+};
 
 struct Snapshot {
     bool valid = false;
@@ -14178,7 +14286,130 @@ struct Snapshot {
     int64_t lastUpdated = 0;
     bool shuffleActive = false;
     bool repeatActive = false;
+    bool canShuffle = false;
+    bool canRepeat = false;
+    bool canSeek = false;
+    // Which player this snapshot came from, and every player available.
+    std::wstring sessionKey;
+    std::wstring sourceAppId;
+    std::wstring sourceName;
+    std::wstring sourceBadge;
+    std::vector<SessionEntry> sessions;
 };
+
+// Turns an AppUserModelId into something worth showing. The well-known
+// players are named outright; anything else falls back to the id with its
+// package prefix and extension trimmed off.
+std::wstring FriendlySourceName(std::wstring_view source) {
+    const std::wstring lower = ToLowerCopy(std::wstring(source));
+    if (lower.find(L"youtube") != std::wstring::npos) return L"YouTube";
+    if (lower.find(L"spotify") != std::wstring::npos) return L"Spotify";
+    if (lower.find(L"chrome") != std::wstring::npos) return L"Chrome";
+    if (lower.find(L"msedge") != std::wstring::npos ||
+        lower.find(L"edge") != std::wstring::npos) return L"Edge";
+    if (lower.find(L"firefox") != std::wstring::npos) return L"Firefox";
+    if (lower.find(L"vlc") != std::wstring::npos) return L"VLC";
+    if (lower.find(L"wmplayer") != std::wstring::npos) return L"Windows Media";
+    if (lower.find(L"zune") != std::wstring::npos ||
+        lower.find(L"media") != std::wstring::npos) return L"Media Player";
+
+    std::wstring text(source);
+    const size_t bang = text.find(L'!');
+    if (bang != std::wstring::npos && bang + 1 < text.size()) {
+        text.erase(0, bang + 1);
+    }
+    const size_t dot = text.find(L'.');
+    if (dot != std::wstring::npos) {
+        text.resize(dot);
+    }
+    return text.empty() ? std::wstring(L"Media") : text;
+}
+
+std::wstring SourceBadge(std::wstring_view sourceName) {
+    const std::wstring lower = ToLowerCopy(std::wstring(sourceName));
+    if (lower.find(L"youtube") != std::wstring::npos) return L"YT";
+    if (lower.find(L"spotify") != std::wstring::npos) return L"SP";
+    if (lower.find(L"chrome") != std::wstring::npos) return L"CH";
+    if (lower.find(L"edge") != std::wstring::npos) return L"ED";
+    if (lower.find(L"firefox") != std::wstring::npos) return L"FF";
+    if (lower.find(L"vlc") != std::wstring::npos) return L"VLC";
+    if (sourceName.empty()) return L"\u25B6";
+    std::wstring badge;
+    wchar_t c = sourceName[0];
+    if (c >= L'a' && c <= L'z') c = static_cast<wchar_t>(c - L'a' + L'A');
+    badge.push_back(c);
+    return badge;
+}
+
+// A browser hands every tab the same AppUserModelId, so the raw id cannot
+// tell two tabs apart and the picker could not step between them. Key each
+// session by its app id plus an ordinal among the sessions sharing that id.
+std::vector<std::pair<std::wstring, Session>> KeyedSessions(Manager const& manager) {
+    std::vector<std::pair<std::wstring, Session>> keyed;
+    if (!manager) return keyed;
+    // One snapshot of the dismissed list, rather than a lock per candidate.
+    const std::vector<std::wstring> hidden = HiddenMediaAppsCopy();
+    std::vector<std::pair<std::wstring, int>> seen;
+    try {
+        for (auto const& candidate : manager.GetSessions()) {
+            if (!candidate) continue;
+            std::wstring appId;
+            try {
+                appId = candidate.SourceAppUserModelId().c_str();
+            } catch (...) {
+                continue;
+            }
+            if (std::find(hidden.begin(), hidden.end(), appId) != hidden.end()) {
+                continue;
+            }
+            int ordinal = 0;
+            bool found = false;
+            for (auto& entry : seen) {
+                if (entry.first == appId) {
+                    ordinal = ++entry.second;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) seen.emplace_back(appId, 0);
+            std::wstring key = appId + L"#" + std::to_wstring(ordinal);
+            keyed.emplace_back(std::move(key), candidate);
+        }
+    } catch (...) {}
+    return keyed;
+}
+
+// Resolves the session a command or read should act on: the one the picker
+// selected if it is still there, otherwise whatever Windows calls current,
+// otherwise the first available.
+Session ResolveSession(Manager const& manager, const std::wstring& wantedKey,
+                       std::wstring* resolvedKey = nullptr) {
+    auto keyed = KeyedSessions(manager);
+    if (keyed.empty()) return nullptr;
+    if (!wantedKey.empty()) {
+        for (auto const& entry : keyed) {
+            if (entry.first == wantedKey) {
+                if (resolvedKey) *resolvedKey = entry.first;
+                return entry.second;
+            }
+        }
+    }
+    try {
+        if (auto current = manager.GetCurrentSession()) {
+            std::wstring appId = current.SourceAppUserModelId().c_str();
+            for (auto const& entry : keyed) {
+                if (entry.first.compare(0, appId.size(), appId) == 0 &&
+                    entry.first.size() > appId.size() &&
+                    entry.first[appId.size()] == L'#') {
+                    if (resolvedKey) *resolvedKey = entry.first;
+                    return entry.second;
+                }
+            }
+        }
+    } catch (...) {}
+    if (resolvedKey) *resolvedKey = keyed.front().first;
+    return keyed.front().second;
+}
 
 Snapshot Read() {
     Snapshot snapshot;
@@ -14188,9 +14419,37 @@ Snapshot Read() {
         if (!manager) {
             return snapshot;
         }
-        auto session = manager.GetCurrentSession();
+
+        // Every loaded player, so the picker has something to list, and the
+        // one it selected, so the rest of this reads from that player rather
+        // than from whichever one Windows calls current.
+        auto keyed = KeyedSessions(manager);
+        std::wstring resolvedKey;
+        auto session = ResolveSession(manager, SelectedMediaSessionKey(),
+                                      &resolvedKey);
         if (!session) {
             return snapshot;
+        }
+        snapshot.sessionKey = resolvedKey;
+        for (auto const& entry : keyed) {
+            SessionEntry info;
+            info.key = entry.first;
+            info.appId = entry.first.substr(0, entry.first.rfind(L'#'));
+            info.name = FriendlySourceName(info.appId);
+            info.badge = SourceBadge(info.name);
+            try {
+                if (auto pi = entry.second.GetPlaybackInfo()) {
+                    info.playing =
+                        pi.PlaybackStatus() ==
+                        GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing;
+                }
+            } catch (...) {}
+            if (info.key == resolvedKey) {
+                snapshot.sourceAppId = info.appId;
+                snapshot.sourceName = info.name;
+                snapshot.sourceBadge = info.badge;
+            }
+            snapshot.sessions.push_back(std::move(info));
         }
 
         auto properties = session.TryGetMediaPropertiesAsync().get();
@@ -14223,6 +14482,13 @@ Snapshot Read() {
             if (auto controls = info.Controls()) {
                 snapshot.canGoPrevious = controls.IsPreviousEnabled();
                 snapshot.canGoNext = controls.IsNextEnabled();
+                // Players report which of these they support, so the buttons
+                // can be greyed out rather than silently doing nothing.
+                try {
+                    snapshot.canSeek = controls.IsPlaybackPositionEnabled();
+                    snapshot.canShuffle = controls.IsShuffleEnabled();
+                    snapshot.canRepeat = controls.IsRepeatEnabled();
+                } catch (...) {}
             }
             if (auto shuffle = info.IsShuffleActive()) {
                 snapshot.shuffleActive = shuffle.Value();
@@ -14255,14 +14521,15 @@ Snapshot Read() {
 enum class Command { PlayPause, Previous, Next, Rewind, FastForward, Shuffle, Repeat };
 
 void Send(Command command) {
-    RunInBackground([command] {
+    const std::wstring wanted = SelectedMediaSessionKey();
+    RunInBackground([command, wanted] {
         try {
             auto manager =
                 GlobalSystemMediaTransportControlsSessionManager::RequestAsync().get();
             if (!manager) {
                 return;
             }
-            auto session = manager.GetCurrentSession();
+            auto session = ResolveSession(manager, wanted);
             if (!session) {
                 return;
             }
@@ -14337,7 +14604,7 @@ Position ReadPosition() {
         auto manager =
             GlobalSystemMediaTransportControlsSessionManager::RequestAsync().get();
         if (!manager) return p;
-        auto session = manager.GetCurrentSession();
+        auto session = ResolveSession(manager, SelectedMediaSessionKey());
         if (!session) return p;
         if (auto info = session.GetPlaybackInfo()) {
             p.playing = info.PlaybackStatus() ==
@@ -14360,6 +14627,34 @@ Position ReadPosition() {
 }  // namespace media
 
 [[clang::no_destroy]] std::optional<media::Snapshot> g_cachedMediaSnapshot;
+
+void SaveHiddenMediaApps() {
+    std::wstring joined;
+    for (const auto& app : HiddenMediaAppsCopy()) {
+        if (!joined.empty()) joined += L"|";
+        joined += app;
+    }
+    Wh_SetStringValue(L"mediaHiddenApps", joined.c_str());
+}
+
+// Steps the source picker by one, wrapping at either end. Takes the key list
+// rather than the whole snapshot so the arrow buttons do not each capture a
+// copy of the album art.
+void StepMediaSession(const std::vector<std::wstring>& keys,
+                      const std::wstring& currentKey, int direction) {
+    if (keys.size() < 2) return;
+    int index = -1;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (keys[i] == currentKey) {
+            index = static_cast<int>(i);
+            break;
+        }
+    }
+    if (index < 0) index = 0;
+    const int count = static_cast<int>(keys.size());
+    index = ((index + direction) % count + count) % count;
+    SetSelectedMediaSessionKey(keys[index]);
+}
 
 wuxc::Button MakeTransportButton(const wchar_t* kind, bool enabled,
                                  std::function<void()> onClick) {
@@ -14836,8 +15131,38 @@ void PopulateMediaPanel() {
             auto ch = g_mediaPanel.Children();
             ch.Clear();
 
+            // Dismissing a source has to be reversible, and it has to be
+            // reversible even when the dismissed one was the only player --
+            // which is exactly when the panel is otherwise empty. So this row
+            // is built before the early return, not after it.
+            auto appendRestoreRow = [&ch] {
+                const size_t hiddenCount = HiddenMediaAppCount();
+                if (hiddenCount == 0) return;
+                auto btn = MakeGhostButton(L"MediaRestoreSources", kRowCorner);
+                btn.HorizontalAlignment(HorizontalAlignment::Stretch);
+                btn.Margin(Thickness{ 8, 2, 8, 4 });
+                btn.Padding(Thickness{ 10, 6, 10, 6 });
+                btn.HorizontalContentAlignment(HorizontalAlignment::Center);
+                std::wstring label =
+                    L"Show " + std::to_wstring(hiddenCount) +
+                    (hiddenCount == 1 ? L" dismissed source" : L" dismissed sources");
+                auto text = MakeText(nullptr, label, 11, false, 0.7);
+                btn.Content(text);
+                btn.Click([](auto&&, auto&&) {
+                    ClearHiddenMediaApps();
+                    SaveHiddenMediaApps();
+                    SetSelectedMediaSessionKey(std::wstring());
+                    RunOnUiThread([] {
+                        try { PopulateMediaPanel(); } catch (...) {}
+                    });
+                    RefreshMediaButtonState();
+                });
+                ch.Append(btn);
+            };
+
             if (!snapshot.valid) {
                 ch.Append(MakeStatusText(L"Nothing is playing right now."));
+                appendRestoreRow();
                 return;
             }
 
@@ -14986,6 +15311,126 @@ void PopulateMediaPanel() {
                 g_visualizerBars.clear();
             }
 
+            // Source picker: which player this flyout is driving. Only worth
+            // showing when there is a name to show; the arrows appear only
+            // once a second player is loaded.
+            if (g_settings.mediaShowSourcePicker && !snapshot.sourceName.empty()) {
+                wuxc::Grid sourceRow;
+                sourceRow.ColumnSpacing(8);
+                sourceRow.Margin(Thickness{ 0, 0, 0, 2 });
+                for (int i = 0; i < 4; ++i) {
+                    wuxc::ColumnDefinition cd;
+                    cd.Width(GridLength{ i == 1 ? 1.0 : 0.0,
+                                         i == 1 ? GridUnitType::Star
+                                                : GridUnitType::Auto });
+                    sourceRow.ColumnDefinitions().Append(cd);
+                }
+
+                wuxc::Border badge;
+                badge.Width(22);
+                badge.Height(22);
+                badge.CornerRadius(MakeCorner(6));
+                badge.Background(MakeBrush(0x2E, 0xFF, 0xFF, 0xFF));
+                badge.VerticalAlignment(VerticalAlignment::Center);
+                auto badgeText = MakeText(nullptr, snapshot.sourceBadge, 10, true);
+                badgeText.HorizontalAlignment(HorizontalAlignment::Center);
+                badgeText.VerticalAlignment(VerticalAlignment::Center);
+                badgeText.TextAlignment(TextAlignment::Center);
+                badge.Child(badgeText);
+                wuxc::Grid::SetColumn(badge, 0);
+                sourceRow.Children().Append(badge);
+
+                std::wstring sourceLabel = snapshot.sourceName;
+                if (snapshot.sessions.size() > 1) {
+                    int index = 1;
+                    for (size_t i = 0; i < snapshot.sessions.size(); ++i) {
+                        if (snapshot.sessions[i].key == snapshot.sessionKey) {
+                            index = static_cast<int>(i) + 1;
+                            break;
+                        }
+                    }
+                    sourceLabel += L"  (" + std::to_wstring(index) + L"/" +
+                                   std::to_wstring(snapshot.sessions.size()) + L")";
+                }
+                auto sourceTb = MakeText(nullptr, sourceLabel, 11, false, 0.75);
+                sourceTb.VerticalAlignment(VerticalAlignment::Center);
+                wuxc::Grid::SetColumn(sourceTb, 1);
+                sourceRow.Children().Append(sourceTb);
+
+                auto repopulate = [] {
+                    RunOnUiThread([] {
+                        try { PopulateMediaPanel(); } catch (...) {}
+                    });
+                    RefreshMediaButtonState();
+                };
+
+                if (snapshot.sessions.size() > 1) {
+                    std::vector<std::wstring> sessionKeys;
+                    sessionKeys.reserve(snapshot.sessions.size());
+                    for (const auto& entry : snapshot.sessions) {
+                        sessionKeys.push_back(entry.key);
+                    }
+                    std::wstring currentKey = snapshot.sessionKey;
+
+                    wuxc::StackPanel arrows;
+                    arrows.Orientation(wuxc::Orientation::Horizontal);
+                    arrows.Spacing(2);
+                    arrows.VerticalAlignment(VerticalAlignment::Center);
+                    auto makeArrow = [&](PCWSTR stroke, int direction) {
+                        auto b = MakeGhostButton(L"MediaSourceArrow", 6);
+                        b.Width(24);
+                        b.Height(24);
+                        b.MinWidth(24);
+                        b.Padding(Thickness{ 0, 0, 0, 0 });
+                        if (auto ic = BuildVectorIcon(nullptr, L"", stroke, 24, 13, 1.9)) {
+                            ic.HorizontalAlignment(HorizontalAlignment::Center);
+                            ic.VerticalAlignment(VerticalAlignment::Center);
+                            b.Content(ic);
+                        }
+                        b.Click([sessionKeys, currentKey, direction,
+                                 repopulate](auto&&, auto&&) {
+                            StepMediaSession(sessionKeys, currentKey, direction);
+                            repopulate();
+                        });
+                        return b;
+                    };
+                    arrows.Children().Append(makeArrow(icons::kChevronLeft, -1));
+                    arrows.Children().Append(makeArrow(icons::kChevronRight, 1));
+                    wuxc::Grid::SetColumn(arrows, 2);
+                    sourceRow.Children().Append(arrows);
+                }
+
+                // Dismissing a source hides it from the picker until it is
+                // cleared again from the settings reset.
+                if (!snapshot.sourceAppId.empty()) {
+                    auto hideBtn = MakeGhostButton(L"MediaSourceHide", 6);
+                    hideBtn.Width(24);
+                    hideBtn.Height(24);
+                    hideBtn.MinWidth(24);
+                    hideBtn.Padding(Thickness{ 0, 0, 0, 0 });
+                    hideBtn.VerticalAlignment(VerticalAlignment::Center);
+                    if (auto ic = BuildVectorIcon(
+                            nullptr, L"", L"M7 7 L17 17 M17 7 L7 17", 24, 11, 1.8)) {
+                        ic.HorizontalAlignment(HorizontalAlignment::Center);
+                        ic.VerticalAlignment(VerticalAlignment::Center);
+                        ic.Opacity(0.6);
+                        hideBtn.Content(ic);
+                    }
+                    std::wstring appId = snapshot.sourceAppId;
+                    hideBtn.Click([appId, repopulate](auto&&, auto&&) {
+                        if (AddHiddenMediaApp(appId)) {
+                            SaveHiddenMediaApps();
+                        }
+                        SetSelectedMediaSessionKey(std::wstring());
+                        repopulate();
+                    });
+                    wuxc::Grid::SetColumn(hideBtn, 3);
+                    sourceRow.Children().Append(hideBtn);
+                }
+
+                body.Children().Append(sourceRow);
+            }
+
             body.Children().Append(header);
 
             {
@@ -15080,7 +15525,8 @@ void PopulateMediaPanel() {
                             auto manager = GlobalSystemMediaTransportControlsSessionManager
                                 ::RequestAsync().get();
                             if (!manager) return;
-                            auto session = manager.GetCurrentSession();
+                            auto session = media::ResolveSession(
+                                manager, SelectedMediaSessionKey());
                             if (!session) return;
                             auto info = session.GetTimelineProperties();
                             if (!info) return;
@@ -15136,7 +15582,8 @@ void PopulateMediaPanel() {
                             auto manager = GlobalSystemMediaTransportControlsSessionManager
                                 ::RequestAsync().get();
                             if (!manager) return;
-                            auto session = manager.GetCurrentSession();
+                            auto session = media::ResolveSession(
+                                manager, SelectedMediaSessionKey());
                             if (!session) return;
                             auto info = session.GetTimelineProperties();
                             if (!info) return;
@@ -15207,7 +15654,9 @@ void PopulateMediaPanel() {
             {
                 wuxc::StackPanel controls;
                 controls.Orientation(wuxc::Orientation::Horizontal);
-                controls.Spacing(14);
+                // Seven buttons do not fit at the old spacing, so it tightens
+                // when the extra controls are on.
+                controls.Spacing(g_settings.mediaShowExtraControls ? 6 : 14);
                 controls.HorizontalAlignment(HorizontalAlignment::Center);
                 controls.VerticalAlignment(VerticalAlignment::Center);
                 controls.Margin(Thickness{ 0, 4, 0, 0 });
@@ -15246,6 +15695,55 @@ void PopulateMediaPanel() {
                         });
                     });
                 };
+
+                // Secondary controls sit flush either side of the transport:
+                // smaller, no filled wrapper, and tinted with the accent
+                // colour while the mode they toggle is on.
+                auto makeSmallBtn = [](FrameworkElement iconElem, bool active,
+                                       bool enabled,
+                                       std::function<void()> onClick) {
+                    auto b = MakeGhostButton(nullptr, 7);
+                    b.Width(30);
+                    b.Height(30);
+                    b.MinWidth(30);
+                    b.Padding(Thickness{ 0, 0, 0, 0 });
+                    b.BorderThickness(Thickness{ 0, 0, 0, 0 });
+                    b.IsEnabled(enabled);
+                    b.HorizontalContentAlignment(HorizontalAlignment::Center);
+                    b.VerticalContentAlignment(VerticalAlignment::Center);
+                    if (active) {
+                        auto accent = GetSystemAccentColor();
+                        b.Background(MakeBrush(0x55, accent.R, accent.G, accent.B));
+                    } else {
+                        b.Background(MakeBrush(0, 0, 0, 0));
+                    }
+                    if (iconElem) {
+                        iconElem.HorizontalAlignment(HorizontalAlignment::Center);
+                        iconElem.VerticalAlignment(VerticalAlignment::Center);
+                        if (!enabled) iconElem.Opacity(0.35);
+                        b.Content(iconElem);
+                    }
+                    b.Click([onClick](auto&&, auto&&) { if (onClick) onClick(); });
+                    return b;
+                };
+
+                if (g_settings.mediaShowExtraControls) {
+                    controls.Children().Append(makeSmallBtn(
+                        BuildVectorIcon(nullptr, L"", icons::kShuffleStroke, 24, 15, 1.7),
+                        snapshot.shuffleActive, snapshot.canShuffle,
+                        [refreshSoon] {
+                            media::Send(media::Command::Shuffle);
+                            refreshSoon();
+                        }));
+                    auto back10 = MakeText(nullptr, L"-10", 10, true);
+                    back10.TextAlignment(TextAlignment::Center);
+                    controls.Children().Append(makeSmallBtn(
+                        back10, false, snapshot.canSeek,
+                        [refreshSoon] {
+                            media::Send(media::Command::Rewind);
+                            refreshSoon();
+                        }));
+                }
 
                 controls.Children().Append(makeIconBtn(
                     iconpacks::MediaPrev(18, L"#FFFFFF"),
@@ -15295,11 +15793,72 @@ void PopulateMediaPanel() {
                     iconpacks::MediaNext(18, L"#FFFFFF"),
                     [refreshSoon] { media::Send(media::Command::Next); refreshSoon(); }));
 
+                if (g_settings.mediaShowExtraControls) {
+                    auto fwd10 = MakeText(nullptr, L"+10", 10, true);
+                    fwd10.TextAlignment(TextAlignment::Center);
+                    controls.Children().Append(makeSmallBtn(
+                        fwd10, false, snapshot.canSeek,
+                        [refreshSoon] {
+                            media::Send(media::Command::FastForward);
+                            refreshSoon();
+                        }));
+                    controls.Children().Append(makeSmallBtn(
+                        BuildVectorIcon(nullptr, L"", icons::kRepeatStroke, 24, 15, 1.7),
+                        snapshot.repeatActive, snapshot.canRepeat,
+                        [refreshSoon] {
+                            media::Send(media::Command::Repeat);
+                            refreshSoon();
+                        }));
+                }
+
                 body.Children().Append(controls);
             }
 
             card.Child(body);
             ch.Append(card);
+
+            // Output device picker, the same control the Sound flyout carries:
+            // where the audio goes belongs next to what is playing.
+            if (g_settings.mediaShowOutputPicker) {
+                auto devices = audio::EnumerateOutputDevices();
+                std::wstring currentName = L"No output device";
+                for (const auto& device : devices) {
+                    if (device.isDefault) {
+                        currentName = device.name;
+                        break;
+                    }
+                }
+                auto expander = MakeExpander(
+                    L"Output device", currentName, &g_mediaOutputExpanded,
+                    [] { RepopulateLater(PopulateMediaPanel); });
+                if (devices.empty()) {
+                    expander.body.Children().Append(
+                        MakeStatusText(L"No output devices found."));
+                }
+                for (const auto& device : devices) {
+                    FrameworkElement check{nullptr};
+                    if (device.isDefault) {
+                        check = BuildVectorIcon(nullptr, L"", icons::kCheckStroke,
+                                                24, 15, 2.0);
+                    }
+                    auto deviceIcon = BuildVectorIcon(
+                        nullptr, icons::kHeadphoneFill, icons::kHeadphoneStroke,
+                        24, 17, 1.6);
+                    std::wstring deviceId = device.id;
+                    expander.body.Children().Append(MakeListRow(
+                        deviceIcon, device.name, L"", check, [deviceId] {
+                            if (!audio::SetDefaultOutputDevice(deviceId)) {
+                                Wh_Log(L"Failed to set the default output device");
+                            }
+                            RefreshSoundButtonIcon();
+                            RepopulateLater(PopulateMediaPanel);
+                        }, L"OutputDeviceRow"));
+                }
+                ch.Append(expander.root);
+            }
+
+            appendRestoreRow();
+
             StartMediaProgressTimer();
             RunOnUiThread([] {
                 try { UpdateMediaFlyoutProgress(); } catch (...) {}
@@ -27745,6 +28304,17 @@ void BuildLayoutPage(wuxc::StackPanel& p) {
     p.Children().Append(MakeHeading(L"Media Player"));
     AddBoolRow(p, L"Show media visualizer in flyout", L"showMediaVisualizer",
                L"Real-time audio-reactive bars inside the Media Player flyout.");
+    AddBoolRow(p, L"Show source picker", L"mediaShowSourcePicker",
+               L"Names the app the flyout is controlling, with arrows to step "
+               L"between every player that is loaded. Browser tabs count "
+               L"separately.");
+    AddBoolRow(p, L"Show shuffle, repeat and skip", L"mediaShowExtraControls",
+               L"Shuffle and repeat toggles either side of the transport, and "
+               L"10-second skips. Greyed out for players that do not support "
+               L"them.");
+    AddBoolRow(p, L"Show output device picker", L"mediaShowOutputPicker",
+               L"Switch the default playback device from inside the Media "
+               L"Player flyout, the same control the Sound flyout has.");
 
     p.Children().Append(MakeHeading(L"Media Player Button"));
     AddBoolRow(p, L"Show thumbnail",         L"mediaButtonShowIcon",
@@ -28193,6 +28763,10 @@ static std::wstring BuildSettingsJson() {
     addInt(L"mediaButtonShowName");
     addInt(L"mediaButtonShowControls");
     addInt(L"mediaButtonShowVisualizer");
+    addInt(L"mediaShowSourcePicker");
+    addInt(L"mediaShowExtraControls");
+    addInt(L"mediaShowOutputPicker");
+    addStr(L"mediaHiddenApps");
     addStr(L"weatherUnit");
     addStr(L"topBarScaleMode");
     addInt(L"topBarScale");
@@ -28424,6 +28998,8 @@ static void ApplySettingsPairs(
         L"showMediaButton", L"showMediaVisualizer",
         L"mediaButtonShowIcon", L"mediaButtonShowName",
         L"mediaButtonShowControls", L"mediaButtonShowVisualizer",
+        L"mediaShowSourcePicker", L"mediaShowExtraControls",
+        L"mediaShowOutputPicker", L"mediaHiddenApps",
         L"defaultStartMenu", L"defaultSearch",
         L"startButtonAction", L"searchButtonAction",
         L"showPinnedSection", L"searchQuickControls", L"startSearchAlignment", L"startFolderExplorer", L"startFolderDocuments", L"startFolderDownloads", L"startFolderSettings",
@@ -28471,6 +29047,9 @@ static void ApplySettingsPairs(
         { L"mediaButtonShowName",       {   0,   1 } },
         { L"mediaButtonShowControls",   {   0,   1 } },
         { L"mediaButtonShowVisualizer", {   0,   1 } },
+        { L"mediaShowSourcePicker",     {   0,   1 } },
+        { L"mediaShowExtraControls",    {   0,   1 } },
+        { L"mediaShowOutputPicker",     {   0,   1 } },
         { L"showPinnedSection", {0,1} },
         { L"searchQuickControls", {0,1} }, // Ignored legacy backup field; controls are always enabled.
         { L"startFolderExplorer", {0,1} }, { L"startFolderDocuments", {0,1} }, { L"startFolderDownloads", {0,1} }, { L"startFolderSettings", {0,1} },
@@ -29395,6 +29974,8 @@ wuxc::Grid BuildWindowContent() {
                 L"showMediaButton", L"showMediaVisualizer",
                 L"mediaButtonShowIcon", L"mediaButtonShowName",
                 L"mediaButtonShowControls", L"mediaButtonShowVisualizer",
+                L"mediaShowSourcePicker", L"mediaShowExtraControls",
+                L"mediaShowOutputPicker", L"mediaHiddenApps",
                 L"weatherUnit",
             };
             for (auto* k : keys) Wh_SetStringValue(k, L"");
@@ -41715,6 +42296,25 @@ void LoadSettings() {
     g_settings.mediaButtonShowName = ReadIntSetting(L"mediaButtonShowName", 1) != 0;
     g_settings.mediaButtonShowControls = ReadIntSetting(L"mediaButtonShowControls", 1) != 0;
     g_settings.mediaButtonShowVisualizer = ReadIntSetting(L"mediaButtonShowVisualizer", 1) != 0;
+    g_settings.mediaShowSourcePicker = ReadIntSetting(L"mediaShowSourcePicker", 1) != 0;
+    g_settings.mediaShowExtraControls = ReadIntSetting(L"mediaShowExtraControls", 1) != 0;
+    g_settings.mediaShowOutputPicker = ReadIntSetting(L"mediaShowOutputPicker", 1) != 0;
+    // Sources the user dismissed from the picker, stored pipe-separated
+    // because an AppUserModelId may contain commas but never a pipe.
+    {
+        std::lock_guard<std::mutex> lock(g_mediaSelectionMutex);
+        g_hiddenMediaApps.clear();
+        std::wstring hidden = GetStringSettingCopy(L"mediaHiddenApps");
+        size_t start = 0;
+        while (start <= hidden.size() && !hidden.empty()) {
+            size_t bar = hidden.find(L'|', start);
+            std::wstring piece = hidden.substr(
+                start, bar == std::wstring::npos ? std::wstring::npos : bar - start);
+            if (!piece.empty()) g_hiddenMediaApps.push_back(piece);
+            if (bar == std::wstring::npos) break;
+            start = bar + 1;
+        }
+    }
     g_settings.labelCpu = GetStringSettingCopy(L"labelCpu");
     if (g_settings.labelCpu.empty()) g_settings.labelCpu = L"CPU:";
     g_settings.labelRam = GetStringSettingCopy(L"labelRam");
