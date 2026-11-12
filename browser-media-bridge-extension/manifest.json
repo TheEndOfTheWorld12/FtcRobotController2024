@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "Browser Media Bridge",
+  "version": "1.0",
+  "description": "Reports each tab's media to the Browser Media Bridge Windhawk mod over a loopback WebSocket.",
+  "permissions": ["storage", "tabs"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "all_frames": true,
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["<all_urls>"],
+      "all_frames": true,
+      "js": ["page.js"],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    }
+  ]
+}

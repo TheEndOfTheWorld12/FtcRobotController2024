@@ -1,0 +1,24 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Browser Media Bridge</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { margin: 0; padding: 24px; max-width: 46rem; line-height: 1.5; }
+  h1 { font-size: 1.25rem; margin: 0 0 1rem; }
+  label { display: block; font-weight: 600; margin-bottom: .35rem; }
+  input { width: 100%; box-sizing: border-box; padding: .55rem .6rem;
+          font: inherit; font-family: ui-monospace, monospace; }
+  p { margin: .6rem 0 1.2rem; opacity: .8; }
+  button { padding: .5rem 1rem; font: inherit; }
+  #status { margin-left: .75rem; font-weight: 600; }
+</style>
+<h1>Browser Media Bridge</h1>
+<label for="url">Connection URL</label>
+<input id="url" placeholder="ws://127.0.0.1:49872/?token=..." spellcheck="false">
+<p>
+  Right-click the Browser Media Bridge tray icon in Windows and choose
+  <strong>Copy connection URL</strong>, then paste it here. The URL carries a
+  token, so keep it to yourself.
+</p>
+<button id="save">Save</button><span id="status"></span>
+<script src="options.js"></script>
