@@ -1,0 +1,620 @@
+Browser Media Bridge - extension source, all files in one place
+===============================================================
+
+Use this only if the .zip would not download either. Every file is below,
+separated by a banner line. To rebuild the extension by hand:
+
+  1. Make a folder, e.g.  Documents\browser-media-bridge-extension
+  2. For each banner below, make a file with EXACTLY that name in that folder
+     and paste in everything between it and the next banner.
+  3. Save every file as UTF-8. In Notepad: Save as, Encoding = UTF-8.
+  4. chrome://extensions  ->  Developer mode  ->  Load unpacked  ->  that folder.
+
+The file names matter: manifest.json refers to the others by name, so a typo
+makes the extension load with no error and simply do nothing.
+
+
+
+================================================================
+===== FILE: manifest.json
+================================================================
+
+{
+  "manifest_version": 3,
+  "name": "Browser Media Bridge",
+  "version": "1.0",
+  "description": "Reports each tab's media to the Browser Media Bridge Windhawk mod over a loopback WebSocket.",
+  "permissions": ["storage", "tabs"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "all_frames": true,
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["<all_urls>"],
+      "all_frames": true,
+      "js": ["page.js"],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    }
+  ]
+}
+
+
+================================================================
+===== FILE: background.js
+================================================================
+
+// The single WebSocket to the Windhawk mod, and the per-tab state behind it.
+//
+// MV3 service workers are killed when idle, which would quietly end the whole
+// feature. WebSocket activity resets that idle timer, so the live socket is
+// what keeps this alive; the heartbeat below guarantees there is always
+// activity well inside the window even when nothing is playing.
+
+const RECONNECT_MIN_MS = 1000;
+const RECONNECT_MAX_MS = 30000;
+const HEARTBEAT_MS = 20000;
+
+let socket = null;
+let reconnectDelay = RECONNECT_MIN_MS;
+let reconnectTimer = null;
+let heartbeatTimer = null;
+
+// tabId -> { frames: Map(frameId -> state), updated: number }
+const tabs = new Map();
+
+// Nothing has to be configured: the mod listens on this port by default and
+// keeps web pages out by checking the handshake's Origin, so there is no token
+// to copy from anywhere. The options page can override the port, and set a
+// token if one was configured on the mod's side.
+const DEFAULT_PORT = 49872;
+
+async function connectionUrl() {
+  const stored = await chrome.storage.local.get(["port", "token"]);
+  const port = (stored && stored.port) || DEFAULT_PORT;
+  const token = (stored && stored.token) || "";
+  return "ws://127.0.0.1:" + port + "/" +
+         (token ? "?token=" + encodeURIComponent(token) : "");
+}
+
+function clearTimers() {
+  if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connect();
+  }, reconnectDelay);
+  // Backing off matters: the mod may simply be turned off, and a tight retry
+  // loop would keep the worker awake forever for nothing.
+  reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
+}
+
+async function connect() {
+  if (socket && (socket.readyState === WebSocket.OPEN ||
+                 socket.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+  const url = await connectionUrl();
+  try {
+    socket = new WebSocket(url);
+  } catch (e) {
+    scheduleReconnect();
+    return;
+  }
+
+  socket.onopen = () => {
+    reconnectDelay = RECONNECT_MIN_MS;
+    sendReport();
+    clearTimers();
+    heartbeatTimer = setInterval(sendReport, HEARTBEAT_MS);
+  };
+
+  socket.onmessage = (event) => {
+    const lines = String(event.data).split("\n");
+    for (const line of lines) {
+      const f = line.split("\t");
+      if (f[0] !== "CMD") continue;
+      const verb = f[1];
+      const tabId = parseInt(f[2], 10);
+      const value = parseFloat(f[3]);
+      if (!isFinite(tabId)) continue;
+      if (verb === "focus") {
+        chrome.tabs.update(tabId, { active: true }).catch(() => {});
+        chrome.tabs.get(tabId)
+          .then((t) => chrome.windows.update(t.windowId, { focused: true }))
+          .catch(() => {});
+        continue;
+      }
+      chrome.tabs.sendMessage(
+        tabId, { kind: "bmb-command", verb, value }
+      ).catch(() => {});
+    }
+  };
+
+  socket.onclose = () => { socket = null; clearTimers(); scheduleReconnect(); };
+  socket.onerror = () => { /* onclose follows */ };
+}
+
+// One report line per tab. Of a tab's frames, the playing one wins, then the
+// longest -- an embedded player should beat the page it sits in.
+function bestFrameState(frames) {
+  let best = null;
+  for (const state of frames.values()) {
+    if (!state) continue;
+    if (!best) { best = state; continue; }
+    if (state.playing !== best.playing) {
+      if (state.playing) best = state;
+      continue;
+    }
+    if ((state.duration || 0) > (best.duration || 0)) best = state;
+  }
+  return best;
+}
+
+function sendReport() {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  let text = "";
+  for (const [tabId, entry] of tabs) {
+    const state = bestFrameState(entry.frames);
+    if (!state) continue;
+    text += [
+      "TAB", tabId,
+      state.playing ? 1 : 0,
+      state.muted ? 1 : 0,
+      state.volume,
+      state.position.toFixed(1),
+      state.duration.toFixed(1),
+      state.title, state.artist, state.site
+    ].join("\t") + "\n";
+  }
+  // The mod treats a batch without END as a partial read and keeps its
+  // previous state, so this marker is what makes an empty report mean
+  // "nothing is playing" rather than "the message got cut".
+  text += "END\n";
+  try {
+    socket.send(text);
+  } catch (e) {
+    socket = null;
+    scheduleReconnect();
+  }
+}
+
+// The options page asks for this. With no tray icon on the Windows side, this
+// is where you find out whether the bridge is reachable -- and it is the more
+// useful side anyway, because it can tell "nothing is listening on that port"
+// apart from "connected".
+chrome.runtime.onMessage.addListener((message, sender, respond) => {
+  if (!message || message.kind !== "bmb-status") return;
+  let tabCount = 0;
+  let playing = 0;
+  for (const entry of tabs.values()) {
+    const state = bestFrameState(entry.frames);
+    if (!state) continue;
+    tabCount++;
+    if (state.playing) playing++;
+  }
+  connectionUrl().then((url) => {
+    respond({
+      open: !!socket && socket.readyState === WebSocket.OPEN,
+      url: url,
+      tabCount: tabCount,
+      playing: playing
+    });
+  });
+  return true;  // responding asynchronously
+});
+
+chrome.runtime.onMessage.addListener((message, sender) => {
+  if (!message || message.kind !== "bmb-state") return;
+  if (!sender.tab) return;
+  const tabId = sender.tab.id;
+  const frameId = sender.frameId || 0;
+
+  if (!message.state) {
+    const entry = tabs.get(tabId);
+    if (entry) {
+      entry.frames.delete(frameId);
+      if (entry.frames.size === 0) tabs.delete(tabId);
+    }
+  } else {
+    let entry = tabs.get(tabId);
+    if (!entry) { entry = { frames: new Map() }; tabs.set(tabId, entry); }
+    entry.frames.set(frameId, message.state);
+  }
+  sendReport();
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (tabs.delete(tabId)) sendReport();
+});
+
+// A service worker can be started fresh at any time, so connecting is wired to
+// every entry point rather than to one of them.
+chrome.runtime.onStartup.addListener(connect);
+chrome.runtime.onInstalled.addListener(connect);
+chrome.storage.onChanged.addListener((changes) => {
+  if (!changes.port && !changes.token) return;
+  // A new port or token means the old socket is pointed at the wrong place.
+  if (socket) { try { socket.close(); } catch (e) {} socket = null; }
+  reconnectDelay = RECONNECT_MIN_MS;
+  connect();
+});
+connect();
+
+
+================================================================
+===== FILE: content.js
+================================================================
+
+// Runs once per frame, in the isolated world.
+//
+// Watches this frame's <audio>/<video> and reports the interesting one to the
+// background worker. Media is very often inside an iframe (an embedded
+// player), which is why this runs in all frames; the background picks one
+// report per tab.
+(function () {
+  var metadata = null;
+
+  window.addEventListener("message", function (event) {
+    if (event.source !== window) return;
+    var payload = event.data;
+    if (!payload || payload.__bmb_metadata !== true) return;
+    metadata = payload.data;
+  });
+
+  // The element worth reporting: something actually playing, else the longest
+  // one, so a page full of muted preview clips does not win over the player.
+  function pickElement() {
+    var all = Array.prototype.slice.call(
+      document.querySelectorAll("audio, video")
+    );
+    var playing = all.filter(function (el) {
+      return !el.paused && !el.ended && el.readyState > 2;
+    });
+    var pool = playing.length ? playing : all;
+    if (!pool.length) return null;
+    pool.sort(function (a, b) {
+      return (b.duration || 0) - (a.duration || 0);
+    });
+    return pool[0];
+  }
+
+  // Tabs and newlines are the wire protocol's separators, so no field may
+  // contain one.
+  function clean(text) {
+    return String(text == null ? "" : text)
+      .replace(/[\t\r\n]+/g, " ")
+      .trim()
+      .slice(0, 120);
+  }
+
+  function describe() {
+    var el = pickElement();
+    if (!el) return null;
+    var title = (metadata && metadata.title) || document.title || "";
+    var artist = (metadata && metadata.artist) || "";
+    return {
+      playing: !el.paused && !el.ended && el.readyState > 2,
+      muted: !!el.muted,
+      volume: Math.round((el.volume == null ? 1 : el.volume) * 100),
+      position: isFinite(el.currentTime) ? el.currentTime : 0,
+      duration: isFinite(el.duration) ? el.duration : 0,
+      title: clean(title),
+      artist: clean(artist),
+      site: clean(location.hostname)
+    };
+  }
+
+  var lastKey = "";
+  function report(force) {
+    var state = describe();
+    // A frame with no media at all reports once, so the background can drop
+    // any stale entry for it.
+    var key = state
+      ? [state.playing, state.muted, state.volume, Math.floor(state.position),
+         Math.floor(state.duration), state.title, state.artist].join("|")
+      : "none";
+    if (!force && key === lastKey) return;
+    lastKey = key;
+    try {
+      chrome.runtime.sendMessage({ kind: "bmb-state", state: state });
+    } catch (e) {
+      // The worker was asleep or the extension reloaded; the next tick retries.
+    }
+  }
+
+  // Commands arrive from the mod via the background worker. Only things a
+  // media element can actually do: next and previous track are the page's own
+  // business and there is no general way to drive them from outside, so they
+  // are not handled here rather than silently doing nothing.
+  chrome.runtime.onMessage.addListener(function (message, sender, respond) {
+    if (!message || message.kind !== "bmb-command") return;
+    var el = pickElement();
+    if (!el) {
+      respond && respond({ ok: false });
+      return;
+    }
+    try {
+      switch (message.verb) {
+        case "toggle": el.paused ? el.play() : el.pause(); break;
+        case "play": el.play(); break;
+        case "pause": el.pause(); break;
+        case "mute": el.muted = !el.muted; break;
+        case "seek":
+          if (isFinite(el.duration) && el.duration > 0) {
+            el.currentTime = Math.max(
+              0, Math.min(el.duration, message.value || 0));
+          }
+          break;
+        case "volume":
+          el.volume = Math.max(0, Math.min(100, message.value || 0)) / 100;
+          break;
+      }
+    } catch (e) {
+      // Autoplay policy can refuse play(); nothing useful to do about it here.
+    }
+    report(true);
+    respond && respond({ ok: true });
+  });
+
+  document.addEventListener("play", function () { report(false); }, true);
+  document.addEventListener("pause", function () { report(false); }, true);
+  document.addEventListener("volumechange", function () { report(false); }, true);
+  setInterval(function () { report(false); }, 1000);
+  report(true);
+})();
+
+
+================================================================
+===== FILE: page.js
+================================================================
+
+// Runs in the page's own world.
+//
+// navigator.mediaSession.metadata is what the page hands to Windows, so it is
+// by far the best title and artist available -- better than document.title,
+// which on a music site is usually the site name. A content script in the
+// isolated world shares the DOM but not reliably this object, so this tiny
+// script lives in the MAIN world and relays it across. If the isolated world
+// turns out to see mediaSession fine on your browser, this is harmless
+// duplication rather than a problem.
+(function () {
+  function snapshot() {
+    try {
+      var m = navigator.mediaSession && navigator.mediaSession.metadata;
+      if (!m) return null;
+      return { title: m.title || "", artist: m.artist || "", album: m.album || "" };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  var lastSent = "";
+  function tick() {
+    var data = snapshot();
+    var key = data ? data.title + "\u0000" + data.artist : "";
+    if (key !== lastSent) {
+      lastSent = key;
+      // Same-window postMessage; content.js filters on the marker.
+      window.postMessage({ __bmb_metadata: true, data: data }, "*");
+    }
+  }
+
+  setInterval(tick, 1000);
+  tick();
+})();
+
+
+================================================================
+===== FILE: options.html
+================================================================
+
+<!doctype html>
+<meta charset="utf-8">
+<title>Browser Media Bridge</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { margin: 0; padding: 24px; max-width: 44rem; line-height: 1.5; }
+  h1 { font-size: 1.2rem; margin: 0 0 1.2rem; }
+  h2 { font-size: .95rem; margin: 1.8rem 0 .5rem; }
+  .card { border: 1px solid color-mix(in srgb, currentColor 22%, transparent);
+          border-radius: 10px; padding: 14px 16px; }
+  .dot { display: inline-block; width: .6rem; height: .6rem; border-radius: 50%;
+         margin-right: .5rem; vertical-align: baseline; }
+  .up { background: #34c759; } .down { background: #e8503a; }
+  #state { font-weight: 600; }
+  #detail, .hint { opacity: .75; font-size: .9rem; }
+  code { font-family: ui-monospace, monospace; font-size: .88em; }
+  label { display: block; font-weight: 600; margin: 0 0 .3rem; }
+  input { width: 10rem; box-sizing: border-box; padding: .45rem .5rem;
+          font: inherit; font-family: ui-monospace, monospace; }
+  input.wide { width: 22rem; }
+  button { padding: .45rem 1rem; font: inherit; margin-top: 1rem; }
+  #saved { margin-left: .7rem; font-size: .9rem; opacity: .8; }
+</style>
+
+<h1>Browser Media Bridge</h1>
+
+<div class="card">
+  <div><span id="dot" class="dot down"></span><span id="state">Checking…</span></div>
+  <div id="detail"></div>
+</div>
+
+<p class="hint">
+  Nothing needs to be set up here. Turn the <code>browser-media-bridge</code>
+  mod on in Windhawk and this connects on its own.
+</p>
+
+<h2>If it says not connected</h2>
+<p class="hint">
+  Either the mod is off, or something else already has the port. Change it in
+  both places to match — the mod's <strong>Port</strong> setting and the box
+  below. Only set a token if you set one on the mod's side too.
+</p>
+
+<label for="port">Port</label>
+<input id="port" type="number" min="1024" max="65535" placeholder="49872">
+
+<label for="token" style="margin-top:1rem">Token (optional)</label>
+<input id="token" class="wide" placeholder="leave blank" spellcheck="false">
+
+<br><button id="save">Save</button><span id="saved"></span>
+
+<script src="options.js"></script>
+
+
+================================================================
+===== FILE: options.js
+================================================================
+
+const dot = document.getElementById("dot");
+const state = document.getElementById("state");
+const detail = document.getElementById("detail");
+const portField = document.getElementById("port");
+const tokenField = document.getElementById("token");
+const saved = document.getElementById("saved");
+
+chrome.storage.local.get(["port", "token"]).then((stored) => {
+  if (stored && stored.port) portField.value = stored.port;
+  if (stored && stored.token) tokenField.value = stored.token;
+});
+
+function refresh() {
+  chrome.runtime.sendMessage({ kind: "bmb-status" }).then((status) => {
+    if (!status) throw new Error("no reply");
+    dot.className = "dot " + (status.open ? "up" : "down");
+    state.textContent = status.open ? "Connected to the bridge"
+                                    : "Not connected";
+    const where = status.url.replace(/\?token=.*$/, "");
+    detail.textContent = status.open
+      ? status.tabCount + (status.tabCount === 1 ? " tab" : " tabs") +
+        " reporting, " + status.playing + " playing  ·  " + where
+      : "Nothing is listening on " + where;
+  }).catch(() => {
+    // The worker was asleep; sending the message wakes it, so the next tick
+    // usually succeeds.
+    dot.className = "dot down";
+    state.textContent = "Starting…";
+    detail.textContent = "";
+  });
+}
+
+document.getElementById("save").addEventListener("click", async () => {
+  const port = parseInt(portField.value, 10);
+  if (portField.value && (!isFinite(port) || port < 1024 || port > 65535)) {
+    saved.textContent = "Port must be between 1024 and 65535.";
+    return;
+  }
+  await chrome.storage.local.set({
+    port: portField.value ? port : null,
+    token: tokenField.value.trim()
+  });
+  saved.textContent = "Saved. Reconnecting…";
+  setTimeout(refresh, 600);
+});
+
+refresh();
+setInterval(refresh, 2000);
+
+
+================================================================
+===== FILE: README.md
+================================================================
+
+# Browser Media Bridge — extension
+
+The browser half of the `browser-media-bridge` Windhawk mod. It reports what
+each tab is playing over a loopback WebSocket, and applies commands coming
+back the other way.
+
+Written for **Chrome and Edge** (identical — both are Chromium, Manifest V3).
+See *Firefox* at the bottom.
+
+## Install
+
+Chrome will not permanently install an extension from outside its Store, so
+this is loaded unpacked. That is normal for a personal extension; the cost is
+a "disable developer mode extensions" nag on some startups.
+
+1. Turn the `browser-media-bridge` mod on in Windhawk.
+2. Open `chrome://extensions` (or `edge://extensions`).
+3. Turn on **Developer mode**.
+4. Click **Load unpacked** and pick this folder.
+
+That is the whole of it — nothing to copy, nothing to paste. The extension
+connects to the mod's default port by itself, and the mod keeps web pages out
+by checking the handshake's `Origin` rather than by a shared token.
+
+To check it worked: **Details** → **Extension options**. The card at the top
+says whether the connection is up and how many tabs are reporting.
+
+Keep the folder where it is — Chrome loads an unpacked extension from its path
+every startup, so moving or deleting it uninstalls it.
+
+## If it says not connected
+
+Either the mod is off, or something else already holds port 49872. Set the
+same port in both places: the mod's **Port** setting, and the box on the
+options page. A token is only needed if you chose to set one on the mod's
+side.
+
+## What gets reported
+
+Per tab: whether it is playing, muted, volume, position, duration, title,
+artist and hostname. Title and artist come from
+`navigator.mediaSession.metadata` when the page sets it — the same thing the
+page hands to Windows — and fall back to the tab title.
+
+Media is very often inside an iframe, so the content script runs in all
+frames. The background worker sends one line per *tab*: of that tab's frames,
+the playing one wins, then the longest, so an embedded player beats the page
+around it.
+
+## What it can and cannot control
+
+Supported: `toggle`, `play`, `pause`, `mute`, `seek`, `volume` (all driven on
+the tab's media element) and `focus` (switches to the tab).
+
+**Not** supported: next and previous track. Those are the page's own
+behaviour, reachable only through the media-key handling that the browser
+keeps to itself; there is no general way to drive them from an extension. They
+are not wired to anything rather than being buttons that silently do nothing.
+
+`play()` can also be refused by the browser's autoplay policy if the tab has
+had no user interaction. Nothing to be done about that from here.
+
+## Privacy and security
+
+- The only thing it talks to is `127.0.0.1` on the bridge's port. Nothing is
+  sent anywhere else, and there is no telemetry.
+- `<all_urls>` is required to see media on any site. The content script reads
+  media element state, the page title and `mediaSession` metadata — not page
+  content, not form fields, not cookies.
+- What stops a random web page connecting to the mod's port is the `Origin`
+  header, which the browser sets and page script cannot touch. The mod accepts
+  an extension scheme or no `Origin` at all, and refuses everything else.
+
+## Firefox
+
+Firefox needs three changes:
+
+- `background`: use `"scripts": ["background.js"]` instead of
+  `"service_worker"`.
+- The `"world": "MAIN"` content script is not supported; drop that entry.
+  `page.js` is only an optimisation for titles, and `content.js` already falls
+  back to the tab title without it.
+- `browser_specific_settings.gecko.id` must be set to load it unpacked
+  persistently; otherwise use `about:debugging` → **Load Temporary Add-on**,
+  which lasts until the browser restarts.
+
+The `chrome.*` calls all work in Firefox as-is.
