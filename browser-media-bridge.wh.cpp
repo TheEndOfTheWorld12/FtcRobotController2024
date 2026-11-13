@@ -37,15 +37,19 @@ result to shared memory where any other mod can read it.
 
 ## Setting it up
 
-1. Turn this mod on. A tray icon appears.
-2. Right-click the tray icon and choose **Copy connection URL**.
-3. Load the extension from `browser-media-bridge-extension/` (its `README.md`
-   has the unpacked-install steps), open its options, and paste the URL in.
-4. The tray icon turns solid once the extension connects, and its tooltip
-   lists the tabs.
+1. Turn this mod on.
+2. Load the extension from `browser-media-bridge-extension/` (its `README.md`
+   has the unpacked-install steps).
 
-The tray menu lists every reporting tab; clicking one toggles play/pause in
-that tab, which is there to prove the reverse channel end to end.
+That is all of it. There is nothing to copy and nothing to paste: the
+extension connects to the default port on its own. Its options page shows
+whether the connection is up, which is also where to change the port if
+something else already has 49872.
+
+No tray icon by default. Turn **Show tray icon** on if you want to watch the
+state from the Windows side: the icon is hollow until the extension connects,
+solid once it reports, green while something is playing, and its menu lists
+every reporting tab and toggles play/pause in one.
 
 ## Why a socket rather than native messaging
 
@@ -62,20 +66,34 @@ This is a listening socket, so it is worth being plain about the threats.
 - It binds **127.0.0.1 only**, never `0.0.0.0`, so nothing off this machine
   can reach it.
 - **A web page can also reach a loopback port.** CORS stops a page reading the
-  reply, but the request still arrives. So the connection URL carries a random
-  token, generated on first run, and a connection without it is closed
-  immediately.
+  reply, but the request still arrives. What keeps pages out is the `Origin`
+  header: the browser sets it and page script cannot touch it. Accepted are an
+  extension scheme (`chrome-extension://`, `moz-extension://`,
+  `safari-web-extension://`, `ms-browser-extension://`) and **no `Origin` at
+  all**, since Chrome omits it for an extension holding host permissions for
+  the target - so demanding a non-empty extension origin would reject the real
+  extension. Everything else is refused.
+  This is an allowlist on purpose. Blocking `http://` and `https://` by name
+  would miss a page that puts its socket in a sandboxed iframe, whose opaque
+  origin serialises to the literal string `null`.
+- A **token** is available as well but blank by default, because it buys
+  nothing against the threat the Origin check already covers, and a token has
+  to be copied from somewhere to somewhere.
+- Neither check stops another program already running as you, which could
+  forge any header it likes. Nothing can: a program running as you can already
+  do far more than this socket offers, and it could have read a token out of
+  the settings anyway.
 - The protocol carries media state and media commands and nothing else. There
   is no verb that touches the filesystem, runs anything, or is forwarded
-  anywhere. The worst a leaked token buys is pausing your music and reading
-  what is playing.
+  anywhere. The worst anyone gets is pausing your music and reading what is
+  playing.
 - Turn **Allow control** off to make the socket read-only.
 
 ## Settings
 
 * **Port** - which loopback port to listen on.
-* **Token** - leave blank and one is generated on first run. Changing it
-  disconnects the extension until the new URL is pasted in again.
+* **Token** - optional extra shared secret, blank by default. If you set one,
+  set the same value in the extension's options.
 * **Allow control** - whether commands may be sent back to the browser.
 * **Show tray icon** - the icon and its menu.
 */
@@ -88,12 +106,13 @@ This is a listening socket, so it is worth being plain about the threats.
   $description: The loopback port to listen on. Change it only if something else already uses this one.
 - token: ""
   $name: Token
-  $description: Shared secret the extension must present. Leave blank to have one generated on first run.
+  $description: Optional extra shared secret. Leave blank - the Origin check below already keeps web pages out, and a blank token means there is nothing to copy anywhere. Set the same value here and in the extension's options if you want one anyway.
 - allowControl: true
   $name: Allow control
   $description: Let other mods send play, pause, next, previous, seek, volume and focus commands to a tab. Turn off to make the bridge read-only.
-- showTrayIcon: true
+- showTrayIcon: false
   $name: Show tray icon
+  $description: Off by default - there is nothing to set up from it. Turn it on to see the reporting tabs, or to toggle one from Windows while working out whether the bridge is running.
 */
 // ==/WindhawkModSettings==
 
@@ -309,6 +328,17 @@ std::wstring FromUtf8(const char* data, size_t length) {
     std::wstring out((size_t)needed, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, data, (int)length, out.data(), needed);
     return out;
+}
+
+bool StartsWith(const std::string& text, const char* prefix) {
+    const size_t n = strlen(prefix);
+    return text.size() >= n && text.compare(0, n, prefix) == 0;
+}
+
+std::string ToLowerCopyAscii(std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(),
+                   [](unsigned char c) { return (char)tolower(c); });
+    return text;
 }
 
 std::string TrimAscii(const std::string& text) {
@@ -631,27 +661,14 @@ void QueueCommand(const std::wstring& verb, long long tab, int value) {
     g_outgoing.push_back(BuildCommand(verb, tab, value));
 }
 
-std::wstring GenerateToken() {
-    unsigned char bytes[16] = {};
-    if (!BCRYPT_SUCCESS(BCryptGenRandom(nullptr, bytes, sizeof(bytes),
-                                        BCRYPT_USE_SYSTEM_PREFERRED_RNG))) {
-        // Not reached in practice, and a predictable token is worse than none,
-        // so refuse rather than fall back to something guessable.
-        return std::wstring();
-    }
-    static const wchar_t kHex[] = L"0123456789abcdef";
-    std::wstring out;
-    out.reserve(sizeof(bytes) * 2);
-    for (unsigned char b : bytes) {
-        out.push_back(kHex[b >> 4]);
-        out.push_back(kHex[b & 0x0F]);
-    }
-    return out;
-}
-
 std::wstring ConnectionUrl() {
     std::wstring url = L"ws://127.0.0.1:" + std::to_wstring(g_settings.port) +
-                       L"/?token=" + g_settings.token;
+                       L"/";
+    // Only worth putting in the URL when there is one; with no token this is
+    // just the default address, which the extension already uses by itself.
+    if (!g_settings.token.empty()) {
+        url += L"?token=" + g_settings.token;
+    }
     return url;
 }
 
@@ -720,28 +737,72 @@ bool PerformHandshake(SOCKET sock) {
     size_t lineEnd = request.find("\r\n");
     const std::string requestLine = request.substr(0, lineEnd);
 
-    if (!TokenMatches(TokenFromRequestLine(requestLine))) {
-        Wh_Log(L"Rejected a connection with a missing or wrong token");
-        const char* refusal =
-            "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    // Header names are case-insensitive, so search a lower-cased copy and take
+    // values from the original.
+    std::string lower = request;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return (char)tolower(c); });
+
+    auto headerValue = [&](const char* nameWithColon) -> std::string {
+        size_t at = lower.find(nameWithColon);
+        if (at == std::string::npos) {
+            return std::string();
+        }
+        size_t start = at + strlen(nameWithColon);
+        size_t end = request.find("\r\n", start);
+        if (end == std::string::npos) {
+            return std::string();
+        }
+        return TrimAscii(request.substr(start, end - start));
+    };
+
+    const char* refusal =
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    // This is the real boundary. A browser always sets Origin on a WebSocket
+    // handshake and page script cannot touch it, so what Origin says is
+    // trustworthy as far as browsers go.
+    //
+    // Two things are accepted: an extension's own scheme, and no Origin header
+    // at all, because Chrome omits it for an extension that holds host
+    // permissions for the target. Requiring a non-empty extension origin would
+    // therefore reject the real extension.
+    //
+    // Everything else is refused, and an allowlist is used rather than
+    // blocking http:// and https:// by name: a page can put its socket in a
+    // sandboxed iframe, whose opaque origin serialises to the literal string
+    // "null", and a blocklist of web schemes would wave that straight through.
+    const std::string origin = ToLowerCopyAscii(headerValue("origin:"));
+    const bool originAllowed =
+        origin.empty() ||
+        StartsWith(origin, "chrome-extension://") ||
+        StartsWith(origin, "moz-extension://") ||
+        StartsWith(origin, "safari-web-extension://") ||
+        StartsWith(origin, "ms-browser-extension://");
+    if (!originAllowed) {
+        Wh_Log(L"Refused a handshake from a non-extension origin");
         SendAll(sock, refusal, strlen(refusal));
         return false;
     }
 
-    // Header names are case-insensitive, so search a lower-cased copy and take
-    // the value from the original.
-    std::string lower = request;
-    std::transform(lower.begin(), lower.end(), lower.begin(),
-                   [](unsigned char c) { return (char)tolower(c); });
+    // Only checked when one is configured; blank means no token is required.
+    if (!g_settings.token.empty() &&
+        !TokenMatches(TokenFromRequestLine(requestLine))) {
+        Wh_Log(L"Refused a handshake with a missing or wrong token");
+        SendAll(sock, refusal, strlen(refusal));
+        return false;
+    }
+
     size_t keyAt = lower.find("sec-websocket-key:");
     if (keyAt == std::string::npos) {
         Wh_Log(L"Connection was not a WebSocket upgrade");
         return false;
     }
-    size_t valueStart = keyAt + strlen("sec-websocket-key:");
-    size_t valueEnd = request.find("\r\n", valueStart);
-    const std::string clientKey =
-        TrimAscii(request.substr(valueStart, valueEnd - valueStart));
+    (void)keyAt;
+    const std::string clientKey = headerValue("sec-websocket-key:");
+    if (clientKey.empty()) {
+        return false;
+    }
 
     const std::string accept = AcceptKey(clientKey);
     if (accept.empty()) {
@@ -1243,17 +1304,10 @@ void LoadSettings() {
            (g_settings.token.back() == L' ' || g_settings.token.back() == L'\t')) {
         g_settings.token.pop_back();
     }
-    if (g_settings.token.empty()) {
-        g_settings.token = GenerateToken();
-        if (!g_settings.token.empty()) {
-            // Written back so it survives restarts and the user can read it
-            // out of the mod's settings as well as the tray menu.
-            Wh_SetStringValue(L"token", g_settings.token.c_str());
-            Wh_Log(L"Generated a connection token");
-        } else {
-            Wh_Log(L"Could not generate a token; refusing all connections");
-        }
-    }
+    // Deliberately not generated when blank. A generated token would have to
+    // be copied somewhere, which is the whole reason this needed a tray icon
+    // to copy it from; the Origin check in PerformHandshake covers the threat
+    // a token would have covered.
 
     g_settings.allowControl = Wh_GetIntSetting(L"allowControl") != 0;
     g_settings.showTrayIcon = Wh_GetIntSetting(L"showTrayIcon") != 0;

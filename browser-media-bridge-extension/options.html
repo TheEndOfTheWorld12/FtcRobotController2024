@@ -3,22 +3,50 @@
 <title>Browser Media Bridge</title>
 <style>
   :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
-  body { margin: 0; padding: 24px; max-width: 46rem; line-height: 1.5; }
-  h1 { font-size: 1.25rem; margin: 0 0 1rem; }
-  label { display: block; font-weight: 600; margin-bottom: .35rem; }
-  input { width: 100%; box-sizing: border-box; padding: .55rem .6rem;
+  body { margin: 0; padding: 24px; max-width: 44rem; line-height: 1.5; }
+  h1 { font-size: 1.2rem; margin: 0 0 1.2rem; }
+  h2 { font-size: .95rem; margin: 1.8rem 0 .5rem; }
+  .card { border: 1px solid color-mix(in srgb, currentColor 22%, transparent);
+          border-radius: 10px; padding: 14px 16px; }
+  .dot { display: inline-block; width: .6rem; height: .6rem; border-radius: 50%;
+         margin-right: .5rem; vertical-align: baseline; }
+  .up { background: #34c759; } .down { background: #e8503a; }
+  #state { font-weight: 600; }
+  #detail, .hint { opacity: .75; font-size: .9rem; }
+  code { font-family: ui-monospace, monospace; font-size: .88em; }
+  label { display: block; font-weight: 600; margin: 0 0 .3rem; }
+  input { width: 10rem; box-sizing: border-box; padding: .45rem .5rem;
           font: inherit; font-family: ui-monospace, monospace; }
-  p { margin: .6rem 0 1.2rem; opacity: .8; }
-  button { padding: .5rem 1rem; font: inherit; }
-  #status { margin-left: .75rem; font-weight: 600; }
+  input.wide { width: 22rem; }
+  button { padding: .45rem 1rem; font: inherit; margin-top: 1rem; }
+  #saved { margin-left: .7rem; font-size: .9rem; opacity: .8; }
 </style>
+
 <h1>Browser Media Bridge</h1>
-<label for="url">Connection URL</label>
-<input id="url" placeholder="ws://127.0.0.1:49872/?token=..." spellcheck="false">
-<p>
-  Right-click the Browser Media Bridge tray icon in Windows and choose
-  <strong>Copy connection URL</strong>, then paste it here. The URL carries a
-  token, so keep it to yourself.
+
+<div class="card">
+  <div><span id="dot" class="dot down"></span><span id="state">Checking…</span></div>
+  <div id="detail"></div>
+</div>
+
+<p class="hint">
+  Nothing needs to be set up here. Turn the <code>browser-media-bridge</code>
+  mod on in Windhawk and this connects on its own.
 </p>
-<button id="save">Save</button><span id="status"></span>
+
+<h2>If it says not connected</h2>
+<p class="hint">
+  Either the mod is off, or something else already has the port. Change it in
+  both places to match — the mod's <strong>Port</strong> setting and the box
+  below. Only set a token if you set one on the mod's side too.
+</p>
+
+<label for="port">Port</label>
+<input id="port" type="number" min="1024" max="65535" placeholder="49872">
+
+<label for="token" style="margin-top:1rem">Token (optional)</label>
+<input id="token" class="wide" placeholder="leave blank" spellcheck="false">
+
+<br><button id="save">Save</button><span id="saved"></span>
+
 <script src="options.js"></script>

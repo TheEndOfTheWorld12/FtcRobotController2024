@@ -17,9 +17,18 @@ let heartbeatTimer = null;
 // tabId -> { frames: Map(frameId -> state), updated: number }
 const tabs = new Map();
 
+// Nothing has to be configured: the mod listens on this port by default and
+// keeps web pages out by checking the handshake's Origin, so there is no token
+// to copy from anywhere. The options page can override the port, and set a
+// token if one was configured on the mod's side.
+const DEFAULT_PORT = 49872;
+
 async function connectionUrl() {
-  const stored = await chrome.storage.local.get("url");
-  return (stored && stored.url) || "";
+  const stored = await chrome.storage.local.get(["port", "token"]);
+  const port = (stored && stored.port) || DEFAULT_PORT;
+  const token = (stored && stored.token) || "";
+  return "ws://127.0.0.1:" + port + "/" +
+         (token ? "?token=" + encodeURIComponent(token) : "");
 }
 
 function clearTimers() {
@@ -44,8 +53,6 @@ async function connect() {
     return;
   }
   const url = await connectionUrl();
-  if (!url) return;  // nothing configured yet
-
   try {
     socket = new WebSocket(url);
   } catch (e) {
@@ -130,6 +137,31 @@ function sendReport() {
   }
 }
 
+// The options page asks for this. With no tray icon on the Windows side, this
+// is where you find out whether the bridge is reachable -- and it is the more
+// useful side anyway, because it can tell "nothing is listening on that port"
+// apart from "connected".
+chrome.runtime.onMessage.addListener((message, sender, respond) => {
+  if (!message || message.kind !== "bmb-status") return;
+  let tabCount = 0;
+  let playing = 0;
+  for (const entry of tabs.values()) {
+    const state = bestFrameState(entry.frames);
+    if (!state) continue;
+    tabCount++;
+    if (state.playing) playing++;
+  }
+  connectionUrl().then((url) => {
+    respond({
+      open: !!socket && socket.readyState === WebSocket.OPEN,
+      url: url,
+      tabCount: tabCount,
+      playing: playing
+    });
+  });
+  return true;  // responding asynchronously
+});
+
 chrome.runtime.onMessage.addListener((message, sender) => {
   if (!message || message.kind !== "bmb-state") return;
   if (!sender.tab) return;
@@ -159,8 +191,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 chrome.runtime.onStartup.addListener(connect);
 chrome.runtime.onInstalled.addListener(connect);
 chrome.storage.onChanged.addListener((changes) => {
-  if (!changes.url) return;
-  // A new URL means a new token or port; drop the old socket for it.
+  if (!changes.port && !changes.token) return;
+  // A new port or token means the old socket is pointed at the wrong place.
   if (socket) { try { socket.close(); } catch (e) {} socket = null; }
   reconnectDelay = RECONNECT_MIN_MS;
   connect();

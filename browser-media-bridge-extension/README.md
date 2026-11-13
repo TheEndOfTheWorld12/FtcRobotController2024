@@ -13,19 +13,27 @@ Chrome will not permanently install an extension from outside its Store, so
 this is loaded unpacked. That is normal for a personal extension; the cost is
 a "disable developer mode extensions" nag on some startups.
 
-1. Open `chrome://extensions` (or `edge://extensions`).
-2. Turn on **Developer mode**.
-3. Click **Load unpacked** and pick this folder.
-4. Turn the `browser-media-bridge` mod on in Windhawk. A tray icon appears.
-5. Right-click that tray icon → **Copy connection URL**.
-6. Back on the extensions page, click **Details** → **Extension options** on
-   Browser Media Bridge, paste the URL, and press **Save**.
+1. Turn the `browser-media-bridge` mod on in Windhawk.
+2. Open `chrome://extensions` (or `edge://extensions`).
+3. Turn on **Developer mode**.
+4. Click **Load unpacked** and pick this folder.
 
-The tray icon fills in solid once the extension connects, and goes green while
-something is playing. Hover it to see the tabs.
+That is the whole of it — nothing to copy, nothing to paste. The extension
+connects to the mod's default port by itself, and the mod keeps web pages out
+by checking the handshake's `Origin` rather than by a shared token.
+
+To check it worked: **Details** → **Extension options**. The card at the top
+says whether the connection is up and how many tabs are reporting.
 
 Keep the folder where it is — Chrome loads an unpacked extension from its path
 every startup, so moving or deleting it uninstalls it.
+
+## If it says not connected
+
+Either the mod is off, or something else already holds port 49872. Set the
+same port in both places: the mod's **Port** setting, and the box on the
+options page. A token is only needed if you chose to set one on the mod's
+side.
 
 ## What gets reported
 
@@ -54,13 +62,14 @@ had no user interaction. Nothing to be done about that from here.
 
 ## Privacy and security
 
-- The only thing it talks to is `127.0.0.1` on the port in the URL you paste.
-  Nothing is sent anywhere else, and there is no telemetry.
+- The only thing it talks to is `127.0.0.1` on the bridge's port. Nothing is
+  sent anywhere else, and there is no telemetry.
 - `<all_urls>` is required to see media on any site. The content script reads
   media element state, the page title and `mediaSession` metadata — not page
   content, not form fields, not cookies.
-- The token in the URL is what stops any random web page from connecting to
-  the mod's port. Treat the URL as a secret.
+- What stops a random web page connecting to the mod's port is the `Origin`
+  header, which the browser sets and page script cannot touch. The mod accepts
+  an extension scheme or no `Origin` at all, and refuses everything else.
 
 ## Firefox
 
