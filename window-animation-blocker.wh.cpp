@@ -2,7 +2,7 @@
 // @id              window-animation-blocker
 // @name            Window Animation Blocker
 // @description     Stop chosen apps animating when their windows open, close, minimise or restore - pick them in Explorer, no typing
-// @version         2.0
+// @version         2.1
 // @author          aariv
 // @include         windhawk.exe
 // @architecture    x86-64
@@ -22,8 +22,16 @@ There is no app list to type into and no picker window to find. Instead the
 mod watches a folder:
 
 ```
-Documents\Windhawk no-animation apps
+%LOCALAPPDATA%\Windhawk no-animation apps
 ```
+
+Paste that into Explorer's address bar and it opens. It is also the **Apps
+folder** setting below, so the real path is always readable there, and
+**Ctrl+Alt+Shift+P** opens it from anywhere.
+
+Not under Documents on purpose: a Documents folder is very often redirected
+into OneDrive, so the path is not where it looks like it is, and shortcuts
+would sync to machines they do not apply to.
 
 **Put a shortcut to an app in there and that app stops animating. Delete the
 shortcut and it animates again.** Changes are noticed within a few seconds -
@@ -36,10 +44,11 @@ The quickest way to fill it:
    Windows' own list of everything installed, Store apps included.
 3. Drag an app from there into the folder. Explorer makes the shortcut itself.
 
-The folder opens by itself the first time the mod runs, and there is a
+The folder opens by itself when it is first created, and there is a
 `What this folder is.txt` inside explaining the above. To open it again:
 **Ctrl+Alt+Shift+P**, or tick **Open the apps folder** in the settings and
-press Save.
+press Save. If you ever lose it, delete it and turn the mod off and on - it
+will be remade and shown.
 
 A copy of an `.exe` dropped in works too, and so does the **Extra apps** text
 box in the settings if you would rather type after all. Store apps are matched
@@ -80,14 +89,27 @@ was accepted and Windows animated anyway", which is the whole question above.
 
 ## What gets restored
 
-The global setting is read before anything is changed and put back when the
-mod is turned off, when Windhawk exits, and when no blocked app is in front.
-The per-window attribute dies with the window.
+The per-window attribute dies with the window, so that method leaves nothing
+behind.
+
+The **While in front** method changes a real Windows setting, so it is more
+careful. The original value is read before anything is changed and put back
+when the mod is turned off, when Windhawk exits, and whenever no blocked app
+is in front.
+
+It is also written down, because none of that runs if the process is killed
+outright - and the result would be window animations switched off
+system-wide with nothing obviously to blame, which looks remarkably like
+some other animation mod having stopped working. On every start the mod
+checks whether it left the setting suppressed and puts it back if so.
+
+If you ever suspect this happened, the switch is at **Settings →
+Accessibility → Visual effects → Animation effects**.
 
 ## Settings
 
-* **Apps folder** - where to watch. Blank means
-  `Documents\Windhawk no-animation apps`. Environment variables work.
+* **Apps folder** - where to watch. Environment variables work. Blank falls
+  back to `%LOCALAPPDATA%\Windhawk no-animation apps`.
 * **Extra apps** - optional, one per line, for typing instead of dragging. An
   executable name (`notepad.exe`), a full path, or an AppUserModelId.
 * **Method** - as above.
@@ -101,9 +123,9 @@ The per-window attribute dies with the window.
 
 // ==WindhawkModSettings==
 /*
-- dropFolder: ""
+- dropFolder: "%LOCALAPPDATA%\\Windhawk no-animation apps"
   $name: Apps folder
-  $description: The folder to watch for app shortcuts. Leave blank for Documents\Windhawk no-animation apps. Environment variables are expanded.
+  $description: The folder to watch for app shortcuts. Paste this path into Explorer's address bar to open it, or press Ctrl+Alt+Shift+P. Deliberately not under Documents, which OneDrive may redirect or sync. Environment variables are expanded.
 - apps: ""
   $name: Extra apps
   $description: Optional, one per line, if you would rather type than drag. An executable name such as notepad.exe, a full path, or an AppUserModelId.
@@ -158,6 +180,14 @@ static const PROPERTYKEY kPkeyAppUserModelId = {
      0x4b39,
      {0xa8, 0xd0, 0xe1, 0xd4, 0x2d, 0xe1, 0xd5, 0xf3}},
     5};
+
+// Same story for the known-folder id, from knownfolders.h's own
+// DEFINE_KNOWN_FOLDER line for it.
+static const GUID kFolderIdLocalAppData = {
+    0xf1b32785,
+    0x6fba,
+    0x4fcf,
+    {0x9d, 0x55, 0x7b, 0x8e, 0x7f, 0x15, 0x70, 0x91}};
 
 ////////////////////////////////////////////////////////////////////////////////
 // Text helpers
@@ -431,12 +461,21 @@ void SetGlobalSuppressed(bool suppressed) {
         }
         if (WriteGlobalAnimation(0)) {
             g_globalAnimationSuppressed = true;
-            Wh_Log(L"Global animation off");
+            // Recorded on disk as well. If this process is terminated outright
+            // rather than unloaded, nothing here gets to run, and the user is
+            // left with window animations switched off system-wide and no clue
+            // why - which looks exactly like an animation mod having stopped
+            // working. RecoverGlobalAnimation puts it back on next start.
+            Wh_SetIntValue(L"globalSuppressed", 1);
+            Wh_SetIntValue(L"globalOriginal", g_originalMinAnimate);
+            Wh_Log(L"Global animation off (original was %d)",
+                   g_originalMinAnimate);
         }
     } else {
         if (WriteGlobalAnimation(
                 g_originalAnimationCaptured ? g_originalMinAnimate : 1)) {
             g_globalAnimationSuppressed = false;
+            Wh_SetIntValue(L"globalSuppressed", 0);
             Wh_Log(L"Global animation restored");
         }
     }
@@ -444,6 +483,21 @@ void SetGlobalSuppressed(bool suppressed) {
 
 void RestoreGlobalAnimation() {
     SetGlobalSuppressed(false);
+}
+
+// Run at startup, before anything else touches the setting. If the last run
+// was killed while it had animations suppressed, this is what gives them back
+// instead of leaving the machine quietly altered.
+void RecoverGlobalAnimation() {
+    if (Wh_GetIntValue(L"globalSuppressed", 0) == 0) {
+        return;
+    }
+    const int original = Wh_GetIntValue(L"globalOriginal", 1);
+    Wh_Log(L"Last run left the global animation off; restoring it to %d",
+           original);
+    if (WriteGlobalAnimation(original)) {
+        Wh_SetIntValue(L"globalSuppressed", 0);
+    }
 }
 
 void UpdateForForeground(HWND foreground) {
@@ -468,8 +522,25 @@ void UpdateForForeground(HWND foreground) {
 // to undo it. Nothing to build, nothing to fail, and the blocklist is visible
 // in Explorer instead of hidden in a settings box.
 
+// Under LOCALAPPDATA rather than Documents on purpose. A Documents folder is
+// very often redirected into OneDrive, which means the path is not where it
+// looks like it is, may not exist under %USERPROFILE% at all, and would sync
+// shortcuts between machines where they do not apply.
 std::wstring DefaultDropFolder() {
-    return ExpandEnv(L"%USERPROFILE%\\Documents\\Windhawk no-animation apps");
+    std::wstring path = ExpandEnv(L"%LOCALAPPDATA%\\Windhawk no-animation apps");
+    if (path.find(L'%') != std::wstring::npos) {
+        // The variable did not expand, so ask the shell directly.
+        PWSTR known = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(kFolderIdLocalAppData, 0, nullptr,
+                                           &known)) &&
+            known) {
+            path = std::wstring(known) + L"\\Windhawk no-animation apps";
+        }
+        if (known) {
+            CoTaskMemFree(known);
+        }
+    }
+    return path;
 }
 
 // Reads a .lnk for both the things that can identify an app. A shortcut to a
@@ -599,12 +670,22 @@ void WriteDropFolderReadme() {
     CloseHandle(file);
 }
 
-bool PrepareDropFolder() {
-    // SHCreateDirectoryEx makes the intermediate folders too, so a path a few
-    // levels deep does not have to exist already.
+// Reports whether the folder had to be made, which is what decides whether to
+// show it. Keying that off a stored "first run" flag was a mistake: the flag
+// from the previous version had already been consumed by the picker it used to
+// summon, so the folder was silently never shown to the one person who needed
+// to find it. Folder-was-just-created is intrinsic, needs no stored state, and
+// corrects itself if the folder is ever deleted.
+bool PrepareDropFolder(bool* wasCreated = nullptr) {
+    if (wasCreated) {
+        *wasCreated = false;
+    }
     int created = SHCreateDirectoryExW(nullptr, g_dropFolder.c_str(), nullptr);
-    if (created != ERROR_SUCCESS && created != ERROR_ALREADY_EXISTS &&
-        created != ERROR_FILE_EXISTS) {
+    if (created == ERROR_SUCCESS) {
+        if (wasCreated) {
+            *wasCreated = true;
+        }
+    } else if (created != ERROR_ALREADY_EXISTS && created != ERROR_FILE_EXISTS) {
         Wh_Log(L"Could not create %s (%d)", g_dropFolder.c_str(), created);
         return false;
     }
@@ -1011,8 +1092,11 @@ DWORD WINAPI UiThreadProc(LPVOID) {
         }
     }
 
-    const bool folderReady = PrepareDropFolder();
-    Wh_Log(L"Watching %s", g_dropFolder.c_str());
+    RecoverGlobalAnimation();
+
+    bool folderWasCreated = false;
+    const bool folderReady = PrepareDropFolder(&folderWasCreated);
+    Wh_Log(L"Drop app shortcuts into: %s", g_dropFolder.c_str());
     ReloadEntries();
 
     StartHooks();
@@ -1025,20 +1109,13 @@ DWORD WINAPI UiThreadProc(LPVOID) {
     // ShellExecute is not always quick.
     SetEvent(g_readyEvent);
 
-    // The mod does nothing until an app is picked, so the first run is exactly
-    // when the folder wants showing - and it has the read-me in it. Once only.
-    bool nothingBlocked;
-    {
-        std::lock_guard<std::mutex> lock(g_stateMutex);
-        nothingBlocked = g_entries.empty();
-    }
+    // Shown when the folder has just been made, which is the one moment it is
+    // certain nobody knows where it is.
     if (FolderOpenRequestedBySetting()) {
         Wh_Log(L"Opening the folder: the setting asked for it");
         OpenDropFolder();
-    } else if (folderReady && nothingBlocked &&
-               Wh_GetIntValue(L"firstRunDone", 0) == 0) {
-        Wh_SetIntValue(L"firstRunDone", 1);
-        Wh_Log(L"Opening the folder: first run with nothing blocked");
+    } else if (folderReady && folderWasCreated) {
+        Wh_Log(L"Opening the folder: it has just been created");
         OpenDropFolder();
     }
 
