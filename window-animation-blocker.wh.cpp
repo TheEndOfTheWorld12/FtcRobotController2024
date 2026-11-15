@@ -2,7 +2,7 @@
 // @id              window-animation-blocker
 // @name            Window Animation Blocker
 // @description     Stop chosen apps animating when their windows open, close, minimise or restore - pick the apps from a list, no typing
-// @version         1.0
+// @version         1.1
 // @author          aariv
 // @include         windhawk.exe
 // @architecture    x86-64
@@ -16,10 +16,22 @@
 Windows gives you one switch for window animations and it is all-or-nothing.
 This turns them off for the apps you choose and leaves everything else alone.
 
-**You do not type app names.** Tick **Open the app picker** in the settings
-below and press Save: a window opens listing everything currently running,
-with a **Browse for an .exe** button for anything that is not. Tick the apps
-to block, close the picker, done.
+**You do not type app names.** A window lists everything currently running,
+with a **Browse for an .exe** button for anything that is not. Pick the apps,
+close it, done.
+
+Three ways to open that picker, because one of them failing should not leave
+you stuck:
+
+1. **It opens by itself the first time** the mod runs with nothing blocked
+   yet - the mod does nothing until you have picked something, so that is the
+   moment it is wanted.
+2. **Ctrl+Alt+Shift+P**, any time. This goes nowhere near the settings
+   window, so it works even if the route below does not.
+3. **Tick "Open the app picker" and press Save.** Untick it afterwards or it
+   opens again on every save.
+
+If the tray icon is on, clicking it opens the picker too.
 
 ## The two methods, and why there are two
 
@@ -63,6 +75,8 @@ per-window attribute dies with the window.
 * **Method** - as above.
 * **Open the app picker** - tick it and press Save to open the picker. Untick
   it afterwards, or it opens again on the next save.
+* **Ctrl+Alt+Shift+P opens the picker** - the route that does not involve the
+  settings window. Turn it off if it clashes with something.
 * **Show tray icon** - off by default. Turn it on for a quick way back to the
   picker without going through the settings.
 */
@@ -81,7 +95,10 @@ per-window attribute dies with the window.
   - both: Both
 - openPicker: false
   $name: Open the app picker
-  $description: Tick this and press Save to open the picker window. Untick it afterwards, or it opens again every time you save.
+  $description: Tick this and press Save to open the picker. Untick it afterwards, or it opens again on every save.
+- pickerHotkey: true
+  $name: Ctrl+Alt+Shift+P opens the picker
+  $description: A route to the picker that does not depend on the settings window at all. Turn it off if it clashes with something.
 - showTrayIcon: false
   $name: Show tray icon
   $description: Off by default. A quick way back to the picker, and a tooltip saying how many windows are currently held.
@@ -575,6 +592,7 @@ LRESULT CALLBACK PickerWndProc(HWND hwnd, UINT message, WPARAM wParam,
 
 void OpenPicker() {
     if (g_pickerWnd) {
+        Wh_Log(L"Picker already open; bringing it forward");
         SetForegroundWindow(g_pickerWnd);
         return;
     }
@@ -610,7 +628,7 @@ void OpenPicker() {
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, x, y, width,
         height, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!g_pickerWnd) {
-        Wh_Log(L"could not create the picker window");
+        Wh_Log(L"CreateWindowEx for the picker failed (%u)", GetLastError());
         return;
     }
 
@@ -646,6 +664,7 @@ void OpenPicker() {
 
     ShowWindow(g_pickerWnd, SW_SHOW);
     SetForegroundWindow(g_pickerWnd);
+    Wh_Log(L"Picker open at %d,%d (%dx%d)", x, y, width, height);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -658,6 +677,7 @@ constexpr UINT kTrayIconId = 1;
 constexpr UINT_PTR kSweepTimerId = 1;
 constexpr UINT kSweepIntervalMs = 4000;
 constexpr UINT kCmdOpenPicker = 100;
+constexpr int kPickerHotkeyId = 1;
 
 HINSTANCE g_hInst = nullptr;
 HWND g_hostWnd = nullptr;
@@ -868,9 +888,13 @@ void SaveBlockedApps() {
             joined += entry;
         }
     }
-    // Written to the mod's own storage, not back into the YAML setting, which
-    // a mod cannot rewrite. LoadSettings prefers whichever was touched last.
+    // Written to the mod's own storage, because a mod cannot write back into
+    // its YAML settings. The marker is what makes storage authoritative even
+    // when it is empty: without it, removing the last app in the picker left
+    // storage blank, LoadSettings fell back to the YAML box, and every app the
+    // user had just removed came straight back.
     Wh_SetStringValue(L"apps", joined.c_str());
+    Wh_SetIntValue(L"appsFromPicker", 1);
 }
 
 std::vector<std::wstring> SplitLines(const std::wstring& text) {
@@ -899,18 +923,18 @@ std::vector<std::wstring> SplitLines(const std::wstring& text) {
 }
 
 void LoadSettings() {
-    // The picker writes to storage and the YAML box is edited by hand; take
-    // storage when it has anything, so the picker's changes are not thrown
-    // away by the next Save in Windhawk.
+    // The picker writes to storage and the YAML box can be edited by hand.
+    // Once the picker has written anything, storage wins outright - including
+    // when it is empty, which is what "I just removed the last one" looks
+    // like. Before that, the YAML box is the only source there is.
     std::wstring text;
-    {
+    const bool storageAuthoritative = Wh_GetIntValue(L"appsFromPicker", 0) != 0;
+    if (storageAuthoritative) {
         wchar_t buffer[8192] = {};
-        size_t read = Wh_GetStringValue(L"apps", buffer, ARRAYSIZE(buffer));
-        if (read > 0) {
+        if (Wh_GetStringValue(L"apps", buffer, ARRAYSIZE(buffer)) > 0) {
             text.assign(buffer);
         }
-    }
-    if (text.empty()) {
+    } else {
         PCWSTR yaml = Wh_GetStringSetting(L"apps");
         if (yaml) {
             text = yaml;
@@ -939,15 +963,17 @@ void LoadSettings() {
     }
 }
 
-// The picker has no tray icon to open it from by default, so the settings
-// checkbox doubles as a button. A mod cannot untick it, so the transition is
-// what counts: it opens when the box goes from clear to ticked, not on every
-// save while it stays ticked.
-bool ShouldOpenPickerNow() {
-    const bool wanted = Wh_GetIntSetting(L"openPicker") != 0;
-    const bool wasWanted = Wh_GetIntValue(L"openPickerWas", 0) != 0;
-    Wh_SetIntValue(L"openPickerWas", wanted ? 1 : 0);
-    return wanted && !wasWanted;
+// Was edge-detected against a value stored at init, so that ticking the box
+// counted but leaving it ticked did not. That never fired. Windhawk restarts a
+// tool mod's process readily - this mod family already hit that with the
+// startup mutex - and a restart re-runs WhTool_ModInit, which re-seeded the
+// stored value from the setting and ate the edge before anything could see it.
+//
+// So: no stored state, no edge. Ticked means open, checked both at init and on
+// every settings change, which covers the notify-in-place lifecycle and the
+// restart one without having to know which happened.
+bool PickerRequestedBySetting() {
+    return Wh_GetIntSetting(L"openPicker") != 0;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -973,6 +999,12 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT message, WPARAM wParam,
         return 0;
     }
     switch (message) {
+        case WM_HOTKEY:
+            if (wParam == kPickerHotkeyId) {
+                Wh_Log(L"Picker hotkey pressed");
+                OpenPicker();
+            }
+            return 0;
         case WM_COMMAND:
             if (LOWORD(wParam) == kCmdOpenPicker) {
                 OpenPicker();
@@ -1014,12 +1046,43 @@ DWORD WINAPI UiThreadProc(LPVOID) {
     }
     g_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
 
+    if (Wh_GetIntSetting(L"pickerHotkey") != 0) {
+        if (RegisterHotKey(g_hostWnd, kPickerHotkeyId,
+                           MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT,
+                           'P')) {
+            Wh_Log(L"Ctrl+Alt+Shift+P will open the picker");
+        } else {
+            // Almost always something else already owns the combination.
+            Wh_Log(L"Could not register Ctrl+Alt+Shift+P (%u)", GetLastError());
+        }
+    }
+
     StartHooks();
     SweepAllWindows();
     UpdateForForeground(GetForegroundWindow());
     UpdateTrayIcon();
     SetTimer(g_hostWnd, kSweepTimerId, kSweepIntervalMs, nullptr);
+
+    // Signalled before the picker goes up: WhTool_ModInit waits on this, and
+    // showing a window involves SetForegroundWindow, which is not always
+    // quick. Nothing below needs init to still be waiting.
     SetEvent(g_readyEvent);
+
+    // The mod does nothing at all until something is blocked, so the first run
+    // with an empty list is exactly when the picker is wanted. Once only.
+    bool emptyList;
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        emptyList = g_settings.apps.empty();
+    }
+    if (PickerRequestedBySetting()) {
+        Wh_Log(L"Opening the picker: the setting asked for it");
+        OpenPicker();
+    } else if (emptyList && Wh_GetIntValue(L"firstRunDone", 0) == 0) {
+        Wh_SetIntValue(L"firstRunDone", 1);
+        Wh_Log(L"Opening the picker: first run with nothing blocked");
+        OpenPicker();
+    }
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -1038,7 +1101,9 @@ DWORD WINAPI UiThreadProc(LPVOID) {
             if (g_pickerWnd) {
                 RefreshBlockedList();
             }
-            if (ShouldOpenPickerNow()) {
+            Wh_Log(L"Settings changed; openPicker=%d",
+                   PickerRequestedBySetting() ? 1 : 0);
+            if (PickerRequestedBySetting()) {
                 OpenPicker();
             }
             continue;
@@ -1052,6 +1117,7 @@ DWORD WINAPI UiThreadProc(LPVOID) {
     }
 
     KillTimer(g_hostWnd, kSweepTimerId);
+    UnregisterHotKey(g_hostWnd, kPickerHotkeyId);
     StopHooks();
     RemoveTrayIcon();
     ReleaseAllWindows();
@@ -1083,9 +1149,6 @@ DWORD WINAPI UiThreadProc(LPVOID) {
 BOOL WhTool_ModInit() {
     g_hInst = GetModuleHandleW(nullptr);
     LoadSettings();
-    // Seeded so a mod that starts with the box already ticked does not open
-    // the picker unasked on every Windhawk restart.
-    Wh_SetIntValue(L"openPickerWas", Wh_GetIntSetting(L"openPicker") != 0 ? 1 : 0);
 
     g_readyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!g_readyEvent) {
