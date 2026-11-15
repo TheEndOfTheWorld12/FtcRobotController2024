@@ -2,7 +2,7 @@
 // @id              window-animation-blocker
 // @name            Window Animation Blocker
 // @description     Stop chosen apps animating when their windows open, close, minimise or restore - pick them in Explorer, no typing
-// @version         2.1
+// @version         2.2
 // @author          aariv
 // @include         windhawk.exe
 // @architecture    x86-64
@@ -49,6 +49,11 @@ The folder opens by itself when it is first created, and there is a
 **Ctrl+Alt+Shift+P**, or tick **Open the apps folder** in the settings and
 press Save. If you ever lose it, delete it and turn the mod off and on - it
 will be remade and shown.
+
+If the folder does not exist at all, the mod will say so in a message box
+rather than sit there looking enabled and doing nothing. It also tries
+`%LOCALAPPDATA%` and its own Windhawk storage folder before giving up, and
+logs which one it settled on.
 
 A copy of an `.exe` dropped in works too, and so does the **Extra apps** text
 box in the settings if you would rather type after all. Store apps are matched
@@ -123,7 +128,7 @@ Accessibility → Visual effects → Animation effects**.
 
 // ==WindhawkModSettings==
 /*
-- dropFolder: "%LOCALAPPDATA%\\Windhawk no-animation apps"
+- dropFolder: '%LOCALAPPDATA%\Windhawk no-animation apps'
   $name: Apps folder
   $description: The folder to watch for app shortcuts. Paste this path into Explorer's address bar to open it, or press Ctrl+Alt+Shift+P. Deliberately not under Documents, which OneDrive may redirect or sync. Environment variables are expanded.
 - apps: ""
@@ -189,6 +194,8 @@ static const GUID kFolderIdLocalAppData = {
     0x4fcf,
     {0x9d, 0x55, 0x7b, 0x8e, 0x7f, 0x15, 0x70, 0x91}};
 
+constexpr PCWSTR kFolderLeafName = L"Windhawk no-animation apps";
+
 ////////////////////////////////////////////////////////////////////////////////
 // Text helpers
 
@@ -204,12 +211,13 @@ std::wstring BaseName(const std::wstring& path) {
 }
 
 std::wstring TrimCopy(std::wstring text) {
-    while (!text.empty() && (text.front() == L' ' || text.front() == L'\t' ||
-                             text.front() == L'"')) {
+    auto strippable = [](wchar_t c) {
+        return c == L' ' || c == L'\t' || c == L'"' || c == L'\'';
+    };
+    while (!text.empty() && strippable(text.front())) {
         text.erase(0, 1);
     }
-    while (!text.empty() && (text.back() == L' ' || text.back() == L'\t' ||
-                             text.back() == L'"')) {
+    while (!text.empty() && strippable(text.back())) {
         text.pop_back();
     }
     return text;
@@ -522,23 +530,73 @@ void UpdateForForeground(HWND foreground) {
 // to undo it. Nothing to build, nothing to fail, and the blocklist is visible
 // in Explorer instead of hidden in a settings box.
 
-// Under LOCALAPPDATA rather than Documents on purpose. A Documents folder is
-// very often redirected into OneDrive, which means the path is not where it
-// looks like it is, may not exist under %USERPROFILE% at all, and would sync
-// shortcuts between machines where they do not apply.
-std::wstring DefaultDropFolder() {
-    std::wstring path = ExpandEnv(L"%LOCALAPPDATA%\\Windhawk no-animation apps");
+// SHCreateDirectoryEx refuses anything that is not a clean absolute path, and
+// fails with no further explanation, so the path is checked here rather than
+// discovered to be wrong by a folder that never appears.
+bool LooksAbsolute(const std::wstring& path) {
     if (path.find(L'%') != std::wstring::npos) {
-        // The variable did not expand, so ask the shell directly.
-        PWSTR known = nullptr;
-        if (SUCCEEDED(SHGetKnownFolderPath(kFolderIdLocalAppData, 0, nullptr,
-                                           &known)) &&
-            known) {
-            path = std::wstring(known) + L"\\Windhawk no-animation apps";
+        return false;  // a variable that did not expand
+    }
+    if (path.size() >= 2 && path[0] == L'\\' && path[1] == L'\\') {
+        return true;  // UNC
+    }
+    return path.size() >= 3 && iswalpha(path[0]) && path[1] == L':' &&
+           path[2] == L'\\';
+}
+
+// Doubled separators are tolerated by most of Windows and not by all of it.
+// They turn up here when a settings parser keeps the backslash escaping in a
+// quoted value, which is not something a mod gets to control.
+std::wstring CollapseSeparators(const std::wstring& path) {
+    std::wstring out;
+    out.reserve(path.size());
+    for (size_t i = 0; i < path.size(); ++i) {
+        const wchar_t c = path[i] == L'/' ? L'\\' : path[i];
+        // The leading pair of a UNC path is the one run worth keeping.
+        if (c == L'\\' && !out.empty() && out.back() == L'\\' && i > 1) {
+            continue;
         }
-        if (known) {
-            CoTaskMemFree(known);
-        }
+        out.push_back(c);
+    }
+    while (out.size() > 3 && out.back() == L'\\') {
+        out.pop_back();
+    }
+    return out;
+}
+
+// Under LOCALAPPDATA rather than Documents on purpose. A Documents folder is
+// very often redirected into OneDrive, so the path is not where it looks like
+// it is, may not exist under %USERPROFILE% at all, and would sync shortcuts
+// between machines where they do not apply.
+std::wstring KnownFolderDropPath() {
+    std::wstring path;
+    PWSTR known = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(kFolderIdLocalAppData, 0, nullptr,
+                                       &known)) &&
+        known) {
+        path = std::wstring(known) + L"\\" + kFolderLeafName;
+    }
+    if (known) {
+        CoTaskMemFree(known);
+    }
+    return path;
+}
+
+// Windhawk's own folder for this mod. Guaranteed to exist and be writable,
+// including in a portable install, so it is the one that cannot be wrong.
+std::wstring ModStorageDropPath() {
+    wchar_t buffer[MAX_PATH * 2] = {};
+    if (Wh_GetModStoragePath(buffer, ARRAYSIZE(buffer)) == 0 || !buffer[0]) {
+        return std::wstring();
+    }
+    return CollapseSeparators(std::wstring(buffer) + L"\\" + kFolderLeafName);
+}
+
+std::wstring DefaultDropFolder() {
+    std::wstring path = CollapseSeparators(
+        ExpandEnv(std::wstring(L"%LOCALAPPDATA%\\") + kFolderLeafName));
+    if (!LooksAbsolute(path)) {
+        path = CollapseSeparators(KnownFolderDropPath());
     }
     return path;
 }
@@ -676,21 +734,65 @@ void WriteDropFolderReadme() {
 // summon, so the folder was silently never shown to the one person who needed
 // to find it. Folder-was-just-created is intrinsic, needs no stored state, and
 // corrects itself if the folder is ever deleted.
+// Tries the resolved path, then the two that are hard to get wrong. Returning
+// false here means the mod has nowhere to read its list from, so it says so
+// out loud rather than sitting there looking enabled and doing nothing, which
+// is what the last three versions did.
 bool PrepareDropFolder(bool* wasCreated = nullptr) {
     if (wasCreated) {
         *wasCreated = false;
     }
-    int created = SHCreateDirectoryExW(nullptr, g_dropFolder.c_str(), nullptr);
-    if (created == ERROR_SUCCESS) {
-        if (wasCreated) {
-            *wasCreated = true;
+
+    std::vector<std::wstring> candidates;
+    candidates.push_back(g_dropFolder);
+    for (const std::wstring& extra :
+         {KnownFolderDropPath(), ModStorageDropPath()}) {
+        if (!extra.empty() &&
+            std::find(candidates.begin(), candidates.end(), extra) ==
+                candidates.end()) {
+            candidates.push_back(extra);
         }
-    } else if (created != ERROR_ALREADY_EXISTS && created != ERROR_FILE_EXISTS) {
-        Wh_Log(L"Could not create %s (%d)", g_dropFolder.c_str(), created);
-        return false;
     }
-    WriteDropFolderReadme();
-    return true;
+
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        const std::wstring& path = candidates[i];
+        if (path.empty() || !LooksAbsolute(path)) {
+            continue;
+        }
+        const int created =
+            SHCreateDirectoryExW(nullptr, path.c_str(), nullptr);
+        const bool exists = created == ERROR_ALREADY_EXISTS ||
+                            created == ERROR_FILE_EXISTS;
+        if (created == ERROR_SUCCESS || exists) {
+            if (i > 0) {
+                Wh_Log(L"Using %s instead; the configured folder could not be "
+                       L"created",
+                       path.c_str());
+            }
+            g_dropFolder = path;
+            if (wasCreated) {
+                *wasCreated = created == ERROR_SUCCESS;
+            }
+            WriteDropFolderReadme();
+            return true;
+        }
+        Wh_Log(L"Could not create %s (error %d)", path.c_str(), created);
+    }
+
+    // Nothing worked, and logging is off by default, so this is the one place
+    // a message is worth more than a log line: without it the mod is silently
+    // inert and there is no way to tell that from it being broken.
+    static bool complained = false;
+    if (!complained) {
+        complained = true;
+        std::wstring text =
+            L"Window Animation Blocker could not create its apps folder:\r\n\r\n" +
+            g_dropFolder +
+            L"\r\n\r\nSet a different path in the mod's \"Apps folder\" setting.";
+        MessageBoxW(nullptr, text.c_str(), L"Windhawk",
+                    MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+    }
+    return false;
 }
 
 // Opening a folder is Explorer's job, and it is the one part of this that is
@@ -774,8 +876,22 @@ void LoadSettings() {
     while (!configured.empty() && configured.back() == L'\\') {
         configured.pop_back();
     }
-    g_dropFolder =
-        configured.empty() ? DefaultDropFolder() : ExpandEnv(configured);
+    if (configured.empty()) {
+        g_dropFolder = DefaultDropFolder();
+    } else {
+        g_dropFolder = CollapseSeparators(ExpandEnv(configured));
+        if (!LooksAbsolute(g_dropFolder)) {
+            // v2.1 gave the setting a visible default, which meant this branch
+            // always ran and the fallback above never did. A path that cannot
+            // be created then had nowhere to fall back to, and the folder
+            // simply never appeared.
+            Wh_Log(L"'%s' is not a usable absolute path; falling back",
+                   g_dropFolder.c_str());
+            g_dropFolder = DefaultDropFolder();
+        }
+    }
+    Wh_Log(L"Apps folder setting '%s' resolved to '%s'",
+           configured.c_str(), g_dropFolder.c_str());
 
     PCWSTR method = Wh_GetStringSetting(L"method");
     Method parsed = Method::Dwm;
