@@ -65,27 +65,31 @@ name, so an entry keeps working after an update moves the program.
 > appeared on the machine it was for. Explorer is unquestionably good at
 > picking apps, so it does that job now and there is no window left to fail.
 
-## The two methods, and why there are two
+## The methods, and which one to use
 
 Windows has exactly one documented way to suppress animations for a single
 window: the `DWMWA_TRANSITIONS_FORCEDISABLED` attribute. It is still in the
-current API and it is the right tool. What is *not* certain is how much of it
-Windows 11 still honours - the attribute dates from Windows Vista, and
-Microsoft's own support answers about Windows 11 window transitions point at
-newer mechanisms it does not reach.
-
-So there is a fallback that cannot fail, because it uses the same global
-switch the Settings app does - it just flips it based on what you are looking
-at.
+current API and it looked like the right tool. **Tested on Windows 11, it does
+not stop open and close animations.** It is the only per-window lever there
+is, and it is not enough, so the global switch - the same one the Settings app
+writes - does the work instead, flipped according to what is open.
 
 | Method | What it does | Catch |
 | --- | --- | --- |
-| **Per window** (default) | Sets `DWMWA_TRANSITIONS_FORCEDISABLED` on each of the app's windows | Clean and precise. May not cover every Windows 11 animation. |
-| **While in front** | Turns the global animation setting off whenever a blocked app is in the foreground, and back on when it is not | Always works. While that app is in front, *nothing* animates. |
-| **Both** | Per-window always, global as well while a blocked app is in front | |
+| **While running** (default) | Global animation setting off for as long as any blocked app has a window open | While that app is open, *nothing* animates. |
+| **Per window** | Sets `DWMWA_TRANSITIONS_FORCEDISABLED` on the app's windows | Clean and precise, but does not stop open and close animations on Windows 11. |
+| **While in front** | Global setting off only while a blocked app is the focused window | Cannot catch an opening animation; see below. |
+| **Both** | Per window, and global while in front | |
 
-Start on **Per window**. If an animation you wanted gone is still there,
-switch to **Both**.
+**While running** is the default because focus-based suppression is
+structurally unable to catch an opening animation: the window is not focused
+yet while it animates in, and is not focused any more once it has animated
+out. Being *open* covers both ends.
+
+One honest limit: on a **cold start**, the window can already be animating by
+the time Windows reports that it exists. Opening a second window of an app
+that is already running is covered, and so is closing. If only the very first
+launch still flickers, that is the race rather than the method failing.
 
 **Turn logging on for this mod** (its Advanced tab) to see every app it
 resolved from the folder, every window it matched, and whether the call was
