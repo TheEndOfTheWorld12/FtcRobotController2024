@@ -2,7 +2,7 @@
 // @id              window-animation-blocker
 // @name            Window Animation Blocker
 // @description     Stop chosen apps animating when their windows open, close, minimise or restore - pick them in Explorer, no typing
-// @version         2.3
+// @version         2.4
 // @author          aariv
 // @include         windhawk.exe
 // @architecture    x86-64
@@ -142,12 +142,13 @@ Accessibility → Visual effects → Animation effects**.
 - apps: ""
   $name: Extra apps
   $description: Optional, one per line, if you would rather type than drag. An executable name such as notepad.exe, a full path, or an AppUserModelId.
-- method: dwm
+- method: running
   $name: Method
   $options:
-  - dwm: Per window - set the DWM no-transitions attribute (clean, try this first)
-  - global: While in front - flip the global animation setting when a blocked app is focused
-  - both: Both
+  - running: While running - animations stay off the whole time a blocked app is open (start here)
+  - dwm: Per window - the DWM no-transitions attribute. Clean, but reported not to stop open and close animations on Windows 11
+  - global: While in front - only while a blocked app is the focused window
+  - both: Per window and while in front
 - openFolder: false
   $name: Open the apps folder
   $description: Tick this and press Save to open the folder in Explorer. Untick it afterwards, or it opens again on every save.
@@ -250,7 +251,7 @@ std::wstring ExpandEnv(const std::wstring& text) {
 // matching - several share a generic host - so it is identified by the
 // AppUserModelId that its shortcut carries and that its windows report.
 
-enum class Method { Dwm, Global, Both };
+enum class Method { Dwm, Global, Running, Both };
 
 struct BlockEntry {
     std::wstring exeName;   // lower-cased file name, or empty
@@ -520,12 +521,53 @@ void RecoverGlobalAnimation() {
     }
 }
 
-void UpdateForForeground(HWND foreground) {
+struct BlockedScan {
+    bool found = false;
+};
+
+BOOL CALLBACK AnyBlockedProc(HWND hwnd, LPARAM param) {
+    auto* scan = reinterpret_cast<BlockedScan*>(param);
+    if (!IsWindowVisible(hwnd) || !IsInterestingWindow(hwnd)) {
+        return TRUE;
+    }
+    if (IsBlockedWindow(hwnd)) {
+        scan->found = true;
+        return FALSE;  // one is enough
+    }
+    return TRUE;
+}
+
+bool AnyBlockedWindowOpen() {
+    BlockedScan scan;
+    EnumWindows(AnyBlockedProc, reinterpret_cast<LPARAM>(&scan));
+    return scan.found;
+}
+
+// Which window matters depends on the method, and the difference is the whole
+// reason the Running method exists. Tying suppression to the focused window
+// cannot catch an opening animation: the window is not focused yet when it
+// animates in, and it is not focused any more once it has animated out. Tying
+// it to a blocked app merely being open covers both ends.
+void UpdateGlobalSuppression(HWND foreground) {
     bool wantSuppressed = false;
-    if (g_method == Method::Global || g_method == Method::Both) {
-        wantSuppressed = foreground && IsBlockedWindow(foreground);
+    switch (g_method) {
+        case Method::Global:
+        case Method::Both:
+            wantSuppressed = foreground && IsBlockedWindow(foreground);
+            break;
+        case Method::Running:
+            wantSuppressed = AnyBlockedWindowOpen();
+            break;
+        case Method::Dwm:
+            break;
     }
     SetGlobalSuppressed(wantSuppressed);
+}
+
+// Kept so the existing call sites read the same; the name no longer tells the
+// whole story, which is what the wrapper is for.
+void UpdateForForeground(HWND foreground) {
+    UpdateGlobalSuppression(foreground);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -922,12 +964,14 @@ void LoadSettings() {
            configured.c_str(), g_dropFolder.c_str());
 
     PCWSTR method = Wh_GetStringSetting(L"method");
-    Method parsed = Method::Dwm;
+    Method parsed = Method::Running;
     if (method) {
         if (wcscmp(method, L"global") == 0) {
             parsed = Method::Global;
         } else if (wcscmp(method, L"both") == 0) {
             parsed = Method::Both;
+        } else if (wcscmp(method, L"running") == 0) {
+            parsed = Method::Running;
         }
     }
     Wh_FreeStringSetting(method);
@@ -944,7 +988,7 @@ constexpr UINT WM_APP_QUIT = WM_APP + 2;
 constexpr UINT WM_APP_SETTINGS = WM_APP + 3;
 constexpr UINT kTrayIconId = 1;
 constexpr UINT_PTR kSweepTimerId = 1;
-constexpr UINT kSweepIntervalMs = 3000;
+constexpr UINT kSweepIntervalMs = 1500;
 constexpr UINT kCmdOpenFolder = 100;
 constexpr int kFolderHotkeyId = 1;
 
@@ -1129,9 +1173,18 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
         return;
     }
     if (event == EVENT_SYSTEM_FOREGROUND) {
-        UpdateForForeground(hwnd);
+        UpdateGlobalSuppression(hwnd);
     }
-    if (g_method == Method::Dwm || g_method == Method::Both) {
+    // On create and show, suppress straight away if this window is one of
+    // ours, rather than waiting for the next sweep. Create is the earliest
+    // notice Windows gives that the window exists, which is the best shot at
+    // getting in before it animates itself in.
+    if ((event == EVENT_OBJECT_CREATE || event == EVENT_OBJECT_SHOW) &&
+        g_method == Method::Running && IsBlockedWindow(hwnd)) {
+        SetGlobalSuppressed(true);
+    }
+    if (g_method == Method::Dwm || g_method == Method::Both ||
+        g_method == Method::Running) {
         ApplyToWindow(hwnd);
     }
 }
@@ -1139,7 +1192,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
 void StartHooks() {
     if (!g_showHook) {
         g_showHook = SetWinEventHook(
-            EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, nullptr, WinEventProc, 0, 0,
+            EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, nullptr, WinEventProc, 0, 0,
             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     }
     if (!g_foregroundHook) {
@@ -1204,7 +1257,7 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT message, WPARAM wParam,
                 // Re-reading the folder every tick is what makes dragging a
                 // shortcut in take effect on its own, with nothing to save.
                 ReloadEntries();
-                if (g_method == Method::Dwm || g_method == Method::Both) {
+                if (g_method != Method::Global) {
                     SweepAllWindows();
                 }
                 UpdateForForeground(GetForegroundWindow());
