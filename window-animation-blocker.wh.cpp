@@ -2,7 +2,7 @@
 // @id              window-animation-blocker
 // @name            Window Animation Blocker
 // @description     Stop chosen apps animating when their windows open, close, minimise or restore - pick them in Explorer, no typing
-// @version         2.2
+// @version         2.3
 // @author          aariv
 // @include         windhawk.exe
 // @architecture    x86-64
@@ -113,8 +113,16 @@ Accessibility → Visual effects → Animation effects**.
 
 ## Settings
 
-* **Apps folder** - where to watch. Environment variables work. Blank falls
-  back to `%LOCALAPPDATA%\Windhawk no-animation apps`.
+* **Apps folder** - where to watch. **Set this to whatever you like**, such as
+  `C:\Users\you\NoAnimation`, or a folder you already have. It is created if
+  missing, intermediate folders included; environment variables, forward
+  slashes and trailing backslashes are all fine. Blank falls back to
+  `%LOCALAPPDATA%\Windhawk no-animation apps`.
+
+  Prefer somewhere under your user folder. The root of `C:\` often refuses a
+  new folder without administrator rights, and if the path you set cannot be
+  used the mod will tell you which one it fell back to rather than quietly
+  putting your shortcuts somewhere else.
 * **Extra apps** - optional, one per line, for typing instead of dragging. An
   executable name (`notepad.exe`), a full path, or an AppUserModelId.
 * **Method** - as above.
@@ -257,6 +265,10 @@ std::set<HWND> g_held;
 Method g_method = Method::Dwm;
 bool g_showTrayIcon = false;
 std::wstring g_dropFolder;
+// Whether the path came from the setting or from the built-in default. A path
+// the user chose gets said out loud when it cannot be used; falling back from
+// it in silence would put their shortcuts somewhere they never asked for.
+bool g_dropFolderWasConfigured = false;
 bool g_globalAnimationSuppressed = false;
 bool g_originalAnimationCaptured = false;
 int g_originalMinAnimate = 1;
@@ -765,9 +777,24 @@ bool PrepareDropFolder(bool* wasCreated = nullptr) {
                             created == ERROR_FILE_EXISTS;
         if (created == ERROR_SUCCESS || exists) {
             if (i > 0) {
-                Wh_Log(L"Using %s instead; the configured folder could not be "
-                       L"created",
+                Wh_Log(L"Using %s instead; the first choice failed",
                        path.c_str());
+                // Only worth interrupting over when the path that failed is
+                // one the user typed in. Falling back from the built-in
+                // default is this mod's own business.
+                static bool warnedAboutFallback = false;
+                if (g_dropFolderWasConfigured && !warnedAboutFallback) {
+                    warnedAboutFallback = true;
+                    std::wstring text =
+                        L"Window Animation Blocker could not use the folder "
+                        L"you set:\r\n\r\n" + candidates[0] +
+                        L"\r\n\r\nIt is using this instead:\r\n\r\n" + path +
+                        L"\r\n\r\nA path under your user folder, such as "
+                        L"C:\\Users\\<you>\\NoAnimation, needs no special "
+                        L"rights. The drive root often does.";
+                    MessageBoxW(nullptr, text.c_str(), L"Windhawk",
+                                MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+                }
             }
             g_dropFolder = path;
             if (wasCreated) {
@@ -876,6 +903,7 @@ void LoadSettings() {
     while (!configured.empty() && configured.back() == L'\\') {
         configured.pop_back();
     }
+    g_dropFolderWasConfigured = !configured.empty();
     if (configured.empty()) {
         g_dropFolder = DefaultDropFolder();
     } else {
@@ -1031,6 +1059,25 @@ void UpdateTrayIcon() {
                        (heldCount == 1 ? L" held" : L"s held");
     if (globalOff) {
         tip += L"\r\nGlobal animation currently off";
+    }
+    // The folder that was actually used, so there is a way to read it back
+    // without turning logging on. Trimmed from the left, since the end of a
+    // path is the part worth seeing.
+    {
+        std::wstring folder;
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            folder = g_dropFolder;
+        }
+        if (!folder.empty()) {
+            const size_t room = 123 - tip.size();
+            if (folder.size() > room && room > 4) {
+                folder = L"..." + folder.substr(folder.size() - (room - 3));
+            }
+            if (folder.size() <= room) {
+                tip += L"\r\n" + folder;
+            }
+        }
     }
     if (tip.size() > 127) {
         tip.resize(127);
