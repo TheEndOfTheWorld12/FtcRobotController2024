@@ -2,11 +2,11 @@
 // @id              window-animation-blocker
 // @name            Window Animation Blocker
 // @description     Stop chosen apps animating when their windows open, close, minimise or restore - pick them in Explorer, no typing
-// @version         2.5
+// @version         2.6
 // @author          aariv
 // @include         windhawk.exe
 // @architecture    x86-64
-// @compilerOptions -ldwmapi -luser32 -lshell32 -lpropsys -lgdi32 -lgdiplus -ladvapi32 -lole32 -loleaut32 -lpsapi
+// @compilerOptions -ldwmapi -luser32 -lshell32 -lgdi32 -lgdiplus -ladvapi32 -lole32
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -200,8 +200,6 @@ Accessibility → Visual effects → Animation effects**.
 #include <windows.h>
 #include <dwmapi.h>
 #include <propkey.h>
-#include <propvarutil.h>
-#include <psapi.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
@@ -362,12 +360,9 @@ std::wstring WindowAumid(HWND hwnd) {
     }
     PROPVARIANT value;
     PropVariantInit(&value);
-    if (SUCCEEDED(store->GetValue(kPkeyAppUserModelId, &value))) {
-        wchar_t text[512] = {};
-        if (SUCCEEDED(PropVariantToString(value, text, ARRAYSIZE(text))) &&
-            text[0]) {
-            result = ToLowerCopy(text);
-        }
+    if (SUCCEEDED(store->GetValue(kPkeyAppUserModelId, &value)) &&
+        value.vt == VT_LPWSTR && value.pwszVal && value.pwszVal[0]) {
+        result = ToLowerCopy(value.pwszVal);
     }
     PropVariantClear(&value);
     store->Release();
@@ -811,14 +806,11 @@ bool ResolveShortcut(const std::wstring& path, BlockEntry* out) {
             if (SUCCEEDED(link->QueryInterface(IID_PPV_ARGS(&store))) && store) {
                 PROPVARIANT value;
                 PropVariantInit(&value);
-                if (SUCCEEDED(store->GetValue(kPkeyAppUserModelId, &value))) {
-                    wchar_t text[512] = {};
-                    if (SUCCEEDED(
-                            PropVariantToString(value, text, ARRAYSIZE(text))) &&
-                        text[0]) {
-                        out->aumid = ToLowerCopy(text);
-                        ok = true;
-                    }
+                if (SUCCEEDED(store->GetValue(kPkeyAppUserModelId, &value)) &&
+                    value.vt == VT_LPWSTR && value.pwszVal &&
+                    value.pwszVal[0]) {
+                    out->aumid = ToLowerCopy(value.pwszVal);
+                    ok = true;
                 }
                 PropVariantClear(&value);
                 store->Release();
@@ -1645,6 +1637,7 @@ DWORD WINAPI UiThreadProc(LPVOID) {
     SweepAllWindows();
     UpdateForForeground(GetForegroundWindow());
     UpdateTrayIcon();
+    WriteStatusFile();
     SetTimer(g_hostWnd, kSweepTimerId, kSweepIntervalMs, nullptr);
 
     // Signalled before anything is shown: WhTool_ModInit waits on this, and
