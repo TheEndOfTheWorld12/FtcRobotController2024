@@ -5,6 +5,7 @@
 // @version         1.0
 // @author          aariv
 // @include         windhawk.exe
+// @architecture    x86
 // @architecture    x86-64
 // @compilerOptions -lws2_32 -lbcrypt -lcrypt32 -luser32 -lshell32 -ladvapi32 -lgdi32 -lgdiplus
 // ==/WindhawkMod==
@@ -34,6 +35,13 @@ result to shared memory where any other mod can read it.
   (one per tab)       (one connection)    127.0.0.1       memory  ->  TopBar,
                                                                       etc.
 ```
+
+> **Both `@architecture` lines above are load-bearing.** Windhawk's own
+> `windhawk.exe` is a 32-bit process, and this mod is hosted in it. Declaring
+> only `x86-64` means Windhawk never injects the mod into that host, so the
+> tool process is never started - and because nothing was attempted, there is
+> no error and no log output either. It looks exactly like a mod that does
+> nothing.
 
 ## Setting it up
 

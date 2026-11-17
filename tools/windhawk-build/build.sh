@@ -33,10 +33,25 @@ fi
 # go or the last -l argument becomes "-luxtheme<CR>" and is not found.
 LIBS=$(sed -n 's|^// *@compilerOptions *||p' "$SRC" | head -1 | tr -d '\r')
 
+MODE="syntax"
+# Windhawk's own windhawk.exe host is 32-bit, so a tool mod that targets it is
+# compiled as x86. --x86 checks that target; everything else defaults to x64.
+TARGET="x86_64-w64-mingw32"
+EXTRA=()
+for a in "$@"; do
+    case "$a" in
+        --obj)  MODE="obj" ;;
+        --dll)  MODE="dll" ;;
+        --warn) MODE="warn" ;;
+        --x86)  TARGET="i686-w64-mingw32" ;;
+        *)      EXTRA+=("$a") ;;
+    esac
+done
+
 # Exactly the defines Windhawk's own c_cpp_properties.json uses. WH_EDITING
 # makes windhawk_api.h self-contained, the way the mod editor sees it.
 COMMON=(
-  --target=x86_64-w64-mingw32 -std=c++23
+  --target="$TARGET" -std=c++23
   -DUNICODE -D_UNICODE -DWINVER=0x0A00 -D_WIN32_WINNT=0x0A00 -D_WIN32_IE=0x0A00
   -DNTDDI_VERSION=0x0A000008 -D__USE_MINGW_ANSI_STDIO=0
   -DWH_MOD -DWH_EDITING -DNOMINMAX
@@ -45,16 +60,6 @@ COMMON=(
   -Wno-nonportable-include-path -ferror-limit=0
 )
 
-MODE="syntax"
-EXTRA=()
-for a in "$@"; do
-    case "$a" in
-        --obj)  MODE="obj" ;;
-        --dll)  MODE="dll" ;;
-        --warn) MODE="warn" ;;
-        *)      EXTRA+=("$a") ;;
-    esac
-done
 
 case "$MODE" in
   syntax)
@@ -70,9 +75,9 @@ case "$MODE" in
     ;;
   dll)
     clang++ "${COMMON[@]}" -c -O2 -o "$OUT.o" "${EXTRA[@]+"${EXTRA[@]}"}" "$SRC" || exit $?
-    clang++ --target=x86_64-w64-mingw32 -c -O2 \
+    clang++ --target="$TARGET" -c -O2 \
         -o "$ROOT/once_stub.o" "$ROOT/once_stub.cpp" || exit $?
-    clang++ --target=x86_64-w64-mingw32 -shared -o "$OUT.dll" \
+    clang++ --target="$TARGET" -shared -o "$OUT.dll" \
         "$OUT.o" "$ROOT/once_stub.o" $LIBS || exit $?
     echo "linked: $OUT.dll"
     ;;
