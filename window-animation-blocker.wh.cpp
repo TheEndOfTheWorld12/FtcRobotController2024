@@ -2,7 +2,7 @@
 // @id              window-animation-blocker
 // @name            Window Animation Blocker
 // @description     Stop chosen apps animating when their windows open, close, minimise or restore - pick them in Explorer, no typing
-// @version         2.4
+// @version         2.5
 // @author          aariv
 // @include         windhawk.exe
 // @architecture    x86-64
@@ -91,10 +91,40 @@ the time Windows reports that it exists. Opening a second window of an app
 that is already running is covered, and so is closing. If only the very first
 launch still flickers, that is the race rather than the method failing.
 
-**Turn logging on for this mod** (its Advanced tab) to see every app it
-resolved from the folder, every window it matched, and whether the call was
-accepted. That distinguishes "the attribute was refused" from "the attribute
-was accepted and Windows animated anyway", which is the whole question above.
+## Checking whether it actually read your shortcuts
+
+Open **`_status.txt`** in the apps folder. The mod rewrites it whenever
+anything changes, and it answers exactly that question:
+
+```
+Apps read from this folder: 3
+
+  Grammarly.lnk
+      matches process: grammarly.exe   <-- RUNNING NOW
+      note: launcher stub ignored
+
+  Zoom Workplace.lnk
+      matches process: zoom.exe   (not running)
+```
+
+Underneath it lists **every program that owns a window right now**. That is
+the part worth reading: the usual failure is a shortcut resolving to a name
+nothing actually runs under, and seeing the two lists together makes it
+obvious. If the app you want is in the lower list but not matched above, copy
+the name from there into **Extra apps**.
+
+`NO APPS FOUND` at the top means nothing in the folder resolved, so the mod is
+doing nothing at all.
+
+One case worth knowing about: Electron and Squirrel apps - Grammarly, Teams,
+Discord and many others - point their Start shortcut at a shared `Update.exe`
+stub and name the real program in the arguments. The mod reads the arguments
+and the shortcut's icon as well as its target for exactly this reason, and
+discards the shared stub so that blocking one such app does not block them
+all.
+
+**Turn logging on for this mod** (its Advanced tab) for the same information
+plus every window it matched and whether the call was accepted.
 
 ## What gets restored
 
@@ -258,11 +288,35 @@ std::wstring ExpandEnv(const std::wstring& text) {
 enum class Method { Dwm, Global, Running, Both };
 
 struct BlockEntry {
-    std::wstring exeName;   // lower-cased file name, or empty
-    std::wstring exePath;   // lower-cased full path, or empty
-    std::wstring aumid;     // lower-cased AppUserModelId, or empty
-    std::wstring source;    // where it came from, for the log
+    // More than one name per entry, because a Start-menu shortcut does not
+    // reliably point at the executable that ends up owning the window.
+    // Electron and Squirrel apps - Grammarly, Teams, Discord and plenty more -
+    // point their shortcut at a shared Update.exe stub and name the real
+    // program in the arguments, so matching the target alone matches nothing.
+    std::vector<std::wstring> exeNames;  // lower-cased file names
+    std::wstring exePath;                // lower-cased full path, or empty
+    std::wstring aumid;                  // lower-cased AUMID, or empty
+    std::wstring source;                 // where it came from, for the log
+    std::wstring note;                   // anything odd, for the status file
 };
+
+// Launcher stubs and shells. Blocking one of these would match every other app
+// that uses the same stub, so they are only kept when nothing better was
+// found.
+bool IsLauncherStub(const std::wstring& lowerExeName) {
+    static const wchar_t* kStubs[] = {
+        L"update.exe",    L"explorer.exe", L"cmd.exe",
+        L"rundll32.exe",  L"conhost.exe",  L"dllhost.exe",
+        L"powershell.exe", L"pwsh.exe",    L"wscript.exe",
+        L"cscript.exe",   L"squirrel.exe", L"stub.exe",
+    };
+    for (const wchar_t* stub : kStubs) {
+        if (lowerExeName == stub) {
+            return true;
+        }
+    }
+    return false;
+}
 
 std::mutex g_stateMutex;
 std::vector<BlockEntry> g_entries;
@@ -334,10 +388,13 @@ bool IsBlockedWindow(HWND hwnd, std::wstring* whichOut = nullptr) {
                 if (whichOut) *whichOut = entry.source;
                 return true;
             }
-            if (!entry.exeName.empty() && !name.empty() &&
-                name == entry.exeName) {
-                if (whichOut) *whichOut = entry.source;
-                return true;
+            if (!name.empty()) {
+                for (const auto& candidate : entry.exeNames) {
+                    if (name == candidate) {
+                        if (whichOut) *whichOut = entry.source;
+                        return true;
+                    }
+                }
             }
             if (!entry.aumid.empty()) {
                 needAumid = true;
@@ -673,13 +730,81 @@ bool ResolveShortcut(const std::wstring& path, BlockEntry* out) {
     IPersistFile* file = nullptr;
     if (SUCCEEDED(link->QueryInterface(IID_PPV_ARGS(&file))) && file) {
         if (SUCCEEDED(file->Load(path.c_str(), STGM_READ))) {
+            std::vector<std::wstring> candidates;
+            auto addCandidate = [&candidates](const std::wstring& raw) {
+                std::wstring name = ToLowerCopy(BaseName(ExpandEnv(TrimCopy(raw))));
+                if (name.size() <= 4 ||
+                    name.compare(name.size() - 4, 4, L".exe") != 0) {
+                    return;
+                }
+                if (std::find(candidates.begin(), candidates.end(), name) ==
+                    candidates.end()) {
+                    candidates.push_back(name);
+                }
+            };
+
             wchar_t target[MAX_PATH * 2] = {};
             if (SUCCEEDED(link->GetPath(target, ARRAYSIZE(target), nullptr,
                                         SLGP_RAWPATH)) &&
                 target[0]) {
                 // Matched on the file name, so the entry survives an update
                 // moving the program into a new version folder.
-                out->exeName = ToLowerCopy(BaseName(ExpandEnv(target)));
+                addCandidate(target);
+            }
+
+            // Squirrel, which is what most Electron apps ship with, points the
+            // shortcut at a shared Update.exe and names the real program in
+            // "--processStart Whatever.exe". Without this the entry matches a
+            // stub that never owns a window.
+            wchar_t args[2048] = {};
+            if (SUCCEEDED(link->GetArguments(args, ARRAYSIZE(args))) && args[0]) {
+                std::wstring text = args;
+                std::wstring lowerArgs = ToLowerCopy(text);
+                size_t at = lowerArgs.find(L"--processstart");
+                if (at != std::wstring::npos) {
+                    size_t from = lowerArgs.find_first_not_of(L" \t", 
+                        lowerArgs.find_first_of(L" \t", at));
+                    if (from != std::wstring::npos) {
+                        size_t to = text[from] == L'"'
+                                        ? text.find(L'"', from + 1)
+                                        : text.find_first_of(L" \t", from);
+                        if (to == std::wstring::npos) {
+                            to = text.size();
+                        }
+                        addCandidate(text.substr(from, to - from));
+                    }
+                }
+            }
+
+            // The icon very often points at the real program even when the
+            // target does not, so it is worth a look as a last candidate.
+            wchar_t icon[MAX_PATH * 2] = {};
+            int iconIndex = 0;
+            if (SUCCEEDED(link->GetIconLocation(icon, ARRAYSIZE(icon),
+                                                &iconIndex)) &&
+                icon[0]) {
+                addCandidate(icon);
+            }
+
+            // Drop the shared stubs, but only if something better turned up.
+            std::vector<std::wstring> real;
+            for (const auto& candidate : candidates) {
+                if (!IsLauncherStub(candidate)) {
+                    real.push_back(candidate);
+                }
+            }
+            if (!real.empty()) {
+                if (real.size() != candidates.size()) {
+                    out->note = L"launcher stub ignored";
+                }
+                out->exeNames = std::move(real);
+            } else {
+                if (!candidates.empty()) {
+                    out->note = L"only a shared launcher stub was found";
+                }
+                out->exeNames = std::move(candidates);
+            }
+            if (!out->exeNames.empty()) {
                 ok = true;
             }
             IPropertyStore* store = nullptr;
@@ -737,12 +862,12 @@ std::vector<BlockEntry> ScanDropFolder() {
             }
         } else if (endsWith(L".exe")) {
             BlockEntry entry;
-            entry.exeName = lower;
+            entry.exeNames.push_back(lower);
             entry.source = name;
             apps.push_back(std::move(entry));
         }
-        // Anything else is ignored, so the read-me can sit alongside the
-        // shortcuts without being mistaken for one.
+        // Anything else is ignored, so the read-me and _status.txt can sit
+        // alongside the shortcuts without being mistaken for them.
     } while (FindNextFileW(handle, &found));
     FindClose(handle);
     return apps;
@@ -868,6 +993,195 @@ bool PrepareDropFolder(bool* wasCreated = nullptr) {
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// _status.txt
+//
+// Written into the apps folder, which is where someone wondering whether this
+// works is already looking. It answers the question that matters - did the
+// shortcuts resolve to anything, and does anything running right now match
+// them - without turning logging on or enabling a tray icon.
+//
+// It lists the executables of the windows open at that moment too, because the
+// usual failure is a shortcut resolving to a name that nothing actually runs
+// under, and seeing the two lists side by side makes that obvious.
+
+struct WindowCensus {
+    std::set<std::wstring> exeNames;
+    std::set<std::wstring> aumids;
+    int windows = 0;
+};
+
+BOOL CALLBACK CensusProc(HWND hwnd, LPARAM param) {
+    auto* census = reinterpret_cast<WindowCensus*>(param);
+    if (!IsWindowVisible(hwnd) || !IsInterestingWindow(hwnd)) {
+        return TRUE;
+    }
+    census->windows++;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    std::wstring name = BaseName(ToLowerCopy(ProcessImagePath(pid)));
+    if (!name.empty()) {
+        census->exeNames.insert(name);
+    }
+    std::wstring aumid = WindowAumid(hwnd);
+    if (!aumid.empty()) {
+        census->aumids.insert(aumid);
+    }
+    return TRUE;
+}
+
+PCWSTR MethodName(Method method) {
+    switch (method) {
+        case Method::Dwm:     return L"Per window";
+        case Method::Global:  return L"While in front";
+        case Method::Running: return L"While running";
+        case Method::Both:    return L"Both";
+    }
+    return L"?";
+}
+
+std::wstring BuildStatusText() {
+    WindowCensus census;
+    EnumWindows(CensusProc, reinterpret_cast<LPARAM>(&census));
+
+    std::vector<BlockEntry> entries;
+    size_t heldCount = 0;
+    bool globalOff = false;
+    Method method = Method::Running;
+    std::wstring folder;
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        entries = g_entries;
+        heldCount = g_held.size();
+        globalOff = g_globalAnimationSuppressed;
+        method = g_method;
+        folder = g_dropFolder;
+    }
+
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    wchar_t stamp[64];
+    swprintf_s(stamp, L"%04d-%02d-%02d %02d:%02d:%02d", now.wYear, now.wMonth,
+               now.wDay, now.wHour, now.wMinute, now.wSecond);
+
+    std::wstring text;
+    text += L"Window Animation Blocker - status\r\n";
+    text += L"=================================\r\n\r\n";
+    text += L"Rewritten automatically whenever something changes.\r\n";
+    text += L"Last written: ";
+    text += stamp;
+    text += L"\r\n\r\nMethod: ";
+    text += MethodName(method);
+    text += L"\r\nGlobal animation setting: ";
+    text += globalOff ? L"OFF right now (this mod is suppressing it)"
+                      : L"left alone right now";
+    text += L"\r\nFolder: ";
+    text += folder;
+    text += L"\r\n\r\n";
+
+    if (entries.empty()) {
+        text +=
+            L"NO APPS FOUND.\r\n\r\n"
+            L"Nothing in this folder resolved to an app, so the mod is doing\r\n"
+            L"nothing at all. Drop a shortcut in - drag one out of\r\n"
+            L"shell:AppsFolder - and this file will be rewritten within a\r\n"
+            L"couple of seconds.\r\n\r\n";
+    } else {
+        text += L"Apps read from this folder: " +
+                std::to_wstring(entries.size()) + L"\r\n\r\n";
+        for (const auto& entry : entries) {
+            text += L"  " + entry.source + L"\r\n";
+            if (entry.exeNames.empty() && entry.aumid.empty() &&
+                entry.exePath.empty()) {
+                text += L"      resolved to: NOTHING - this shortcut could not "
+                        L"be read\r\n";
+            }
+            bool matched = false;
+            for (const auto& candidate : entry.exeNames) {
+                const bool open = census.exeNames.count(candidate) > 0;
+                matched = matched || open;
+                text += L"      matches process: " + candidate +
+                        (open ? L"   <-- RUNNING NOW\r\n" : L"   (not running)\r\n");
+            }
+            if (!entry.exePath.empty()) {
+                text += L"      matches full path: " + entry.exePath + L"\r\n";
+            }
+            if (!entry.aumid.empty()) {
+                const bool open = census.aumids.count(entry.aumid) > 0;
+                matched = matched || open;
+                text += L"      matches app id: " + entry.aumid +
+                        (open ? L"   <-- RUNNING NOW\r\n" : L"   (not running)\r\n");
+            }
+            if (!entry.note.empty()) {
+                text += L"      note: " + entry.note + L"\r\n";
+            }
+            if (!matched) {
+                text += L"      -> nothing open right now matches this one.\r\n";
+            }
+            text += L"\r\n";
+        }
+    }
+
+    text += L"Windows held by the per-window attribute: " +
+            std::to_wstring(heldCount) + L"\r\n\r\n";
+
+    text +=
+        L"Programs owning a window right now, for comparison:\r\n"
+        L"(if the app you want is in this list but not matched above, copy the\r\n"
+        L" name from here into the mod's \"Extra apps\" setting)\r\n\r\n";
+    for (const auto& name : census.exeNames) {
+        text += L"  " + name + L"\r\n";
+    }
+    if (!census.aumids.empty()) {
+        text += L"\r\nApp ids reported by those windows:\r\n\r\n";
+        for (const auto& aumid : census.aumids) {
+            text += L"  " + aumid + L"\r\n";
+        }
+    }
+    return text;
+}
+
+void WriteStatusFile() {
+    if (g_dropFolder.empty()) {
+        return;
+    }
+    std::wstring text = BuildStatusText();
+
+    // Compared without the timestamp line, so a folder open in Explorer is not
+    // refreshed every couple of seconds for no reason.
+    static std::wstring lastBody;
+    size_t bodyAt = text.find(L"Method: ");
+    std::wstring body = bodyAt == std::wstring::npos ? text : text.substr(bodyAt);
+    if (body == lastBody) {
+        return;
+    }
+    lastBody = body;
+
+    const std::wstring path = g_dropFolder + L"\\_status.txt";
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                              nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                              nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    // UTF-8 with a BOM, so Notepad renders any non-ASCII path correctly.
+    int needed = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(),
+                                     nullptr, 0, nullptr, nullptr);
+    std::string utf8;
+    if (needed > 0) {
+        utf8.resize((size_t)needed);
+        WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(),
+                            utf8.data(), needed, nullptr, nullptr);
+    }
+    DWORD written = 0;
+    const unsigned char bom[] = {0xEF, 0xBB, 0xBF};
+    WriteFile(file, bom, sizeof(bom), &written, nullptr);
+    if (!utf8.empty()) {
+        WriteFile(file, utf8.data(), (DWORD)utf8.size(), &written, nullptr);
+    }
+    CloseHandle(file);
+}
+
 // Opening a folder is Explorer's job, and it is the one part of this that is
 // certain to work - unlike the window that used to be here.
 void OpenDropFolder() {
@@ -901,7 +1215,7 @@ std::vector<BlockEntry> ParseExtraApps(const std::wstring& text) {
                 entry.exePath = ToLowerCopy(ExpandEnv(line));
             } else if (lower.size() > 4 &&
                        lower.compare(lower.size() - 4, 4, L".exe") == 0) {
-                entry.exeName = lower;
+                entry.exeNames.push_back(lower);
             } else {
                 entry.aumid = lower;
             }
@@ -936,9 +1250,16 @@ void ReloadEntries() {
     std::lock_guard<std::mutex> lock(g_stateMutex);
     Wh_Log(L"%d app(s) blocked", (int)g_entries.size());
     for (const auto& entry : g_entries) {
-        Wh_Log(L"  %s -> exe='%s' path='%s' aumid='%s'", entry.source.c_str(),
-               entry.exeName.c_str(), entry.exePath.c_str(),
-               entry.aumid.c_str());
+        std::wstring names;
+        for (const auto& candidate : entry.exeNames) {
+            if (!names.empty()) {
+                names += L", ";
+            }
+            names += candidate;
+        }
+        Wh_Log(L"  %s -> exe=[%s] path='%s' aumid='%s' %s",
+               entry.source.c_str(), names.c_str(), entry.exePath.c_str(),
+               entry.aumid.c_str(), entry.note.c_str());
     }
 }
 
@@ -1266,6 +1587,7 @@ LRESULT CALLBACK HostWndProc(HWND hwnd, UINT message, WPARAM wParam,
                 }
                 UpdateForForeground(GetForegroundWindow());
                 UpdateTrayIcon();
+                WriteStatusFile();
                 return 0;
             }
             break;
