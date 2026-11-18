@@ -10,6 +10,16 @@
 #   gaps.sh <output header>
 set -uo pipefail
 OUT="${1:?usage: gaps.sh <output header>}"
+
+# The argument is written to, not read. Every other script here takes a mod as
+# its first argument, so refuse the one mistake that would destroy source.
+case "$OUT" in
+    *.wh.cpp)
+        echo "gaps.sh: '$OUT' looks like a mod. This argument is the OUTPUT" >&2
+        echo "         header and would be overwritten. Refusing." >&2
+        exit 2
+        ;;
+esac
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 
 probe() {  # probe <expression using the symbol>

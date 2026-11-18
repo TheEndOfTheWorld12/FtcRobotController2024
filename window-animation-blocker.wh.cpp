@@ -1,49 +1,34 @@
 // ==WindhawkMod==
 // @id              window-animation-blocker
 // @name            Window Animation Blocker
-// @description     Stop chosen apps animating when their windows open, close, minimise or restore - pick them in Explorer, no typing
-// @version         2.8
+// @description     Stop chosen apps animating when their windows open and close - pick them in Explorer, no typing
+// @version         3.0
 // @author          aariv
-// @include         windhawk.exe
+// @include         *
 // @architecture    x86
 // @architecture    x86-64
-// @compilerOptions -ldwmapi -luser32 -lshell32 -lgdi32 -lgdiplus -ladvapi32 -lole32
+// @compilerOptions -ldwmapi -luser32 -lshell32 -lole32
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
 /*
 # Window Animation Blocker
 
-Windows gives you one switch for window animations and it is all-or-nothing.
-This turns them off for the apps you choose and leaves everything else alone.
-
-> **Both `@architecture` lines above are load-bearing.** Windhawk's own
-> `windhawk.exe` is a 32-bit process, and this mod is hosted in it. Declaring
-> only `x86-64` means Windhawk never injects the mod into that host, so the
-> tool process is never started - and because nothing was attempted, there is
-> no error and no log output either. It looks exactly like a mod that does
-> nothing.
+Stops the open and close animation for the apps you choose, and leaves every
+other app, and every other animation, alone. Minimising, restoring, maximising
+and snapping still animate normally.
 
 ## Picking apps: drag them into a folder
 
-There is no app list to type into and no picker window to find. Instead the
-mod watches a folder:
+There is nothing to type. The mod watches a folder:
 
 ```
 %LOCALAPPDATA%\Windhawk no-animation apps
 ```
 
-Paste that into Explorer's address bar and it opens. It is also the **Apps
-folder** setting below, so the real path is always readable there, and
-**Ctrl+Alt+Shift+P** opens it from anywhere.
-
-Not under Documents on purpose: a Documents folder is very often redirected
-into OneDrive, so the path is not where it looks like it is, and shortcuts
-would sync to machines they do not apply to.
-
 **Put a shortcut to an app in there and that app stops animating. Delete the
-shortcut and it animates again.** Changes are noticed within a few seconds -
-nothing to save, no need to reopen Windhawk.
+shortcut and it animates again.** Changes are picked up within a few seconds -
+the app does not need restarting, and nor does Windhawk.
 
 The quickest way to fill it:
 
@@ -52,127 +37,46 @@ The quickest way to fill it:
    Windows' own list of everything installed, Store apps included.
 3. Drag an app from there into the folder. Explorer makes the shortcut itself.
 
-The folder opens by itself when it is first created, and there is a
-`What this folder is.txt` inside explaining the above. To open it again:
-**Ctrl+Alt+Shift+P**, or tick **Open the apps folder** in the settings and
-press Save. If you ever lose it, delete it and turn the mod off and on - it
-will be remade and shown.
+Open the folder any time with **Ctrl+Alt+Shift+P**, or tick **Open the apps
+folder** in the settings. `_status.txt` inside it shows what was read, what it
+resolved to, and which apps are currently covered.
 
-If the folder does not exist at all, the mod will say so in a message box
-rather than sit there looking enabled and doing nothing. It also tries
-`%LOCALAPPDATA%` and its own Windhawk storage folder before giving up, and
-logs which one it settled on.
+## How it works, and why the earlier versions did not
 
-A copy of an `.exe` dropped in works too, and so does the **Extra apps** text
-box in the settings if you would rather type after all. Store apps are matched
-on the AppUserModelId their shortcut carries, since they have no executable of
-their own to match on; everything else is matched on the executable's file
-name, so an entry keeps working after an update moves the program.
+Windows draws the open and close animation itself. The one documented way to
+stop it for a single window is the `DWMWA_TRANSITIONS_FORCEDISABLED`
+attribute - but **when** it is set turns out to matter more than anything
+else. Setting it from outside the app, in response to Windows announcing that
+a window exists, is already too late: the animation has begun. Leaving it set
+permanently does not stop the open and close animation either.
 
-> An earlier version of this mod built its own picker window, which never
-> appeared on the machine it was for. Explorer is unquestionably good at
-> picking apps, so it does that job now and there is no window left to fail.
+It has to be set inside the app's own process, in the same breath as the call
+that shows or hides the window, and then released again a moment later so the
+other animations keep working. So this mod hooks `ShowWindow`, `SetWindowPos`,
+`DestroyWindow` and `AnimateWindow` in the apps you picked, sets the attribute
+immediately before each call and restores it 50 ms afterwards.
 
-## The methods, and which one to use
+The technique is from **Disable Window Open/Close Animations** by Lockframe,
+in the Windhawk catalogue, which does this for every app. This mod is that
+approach with a per-app list on the front.
 
-Windows has exactly one documented way to suppress animations for a single
-window: the `DWMWA_TRANSITIONS_FORCEDISABLED` attribute. It is still in the
-current API and it looked like the right tool. **Tested on Windows 11, it does
-not stop open and close animations.** It is the only per-window lever there
-is, and it is not enough, so the global switch - the same one the Settings app
-writes - does the work instead, flipped according to what is open.
+Nothing system-wide is touched. Earlier versions flipped the global animation
+setting, which is why the Start menu lost its animation too; that is gone.
 
-| Method | What it does | Catch |
-| --- | --- | --- |
-| **While running** (default) | Global animation setting off for as long as any blocked app has a window open | While that app is open, *nothing* animates. |
-| **Per window** | Sets `DWMWA_TRANSITIONS_FORCEDISABLED` on the app's windows | Clean and precise, but does not stop open and close animations on Windows 11. |
-| **While in front** | Global setting off only while a blocked app is the focused window | Cannot catch an opening animation; see below. |
-| **Both** | Per window, and global while in front | |
-
-**While running** is the default because focus-based suppression is
-structurally unable to catch an opening animation: the window is not focused
-yet while it animates in, and is not focused any more once it has animated
-out. Being *open* covers both ends.
-
-One honest limit: on a **cold start**, the window can already be animating by
-the time Windows reports that it exists. Opening a second window of an app
-that is already running is covered, and so is closing. If only the very first
-launch still flickers, that is the race rather than the method failing.
-
-## Checking whether it actually read your shortcuts
-
-Open **`_status.txt`** in the apps folder. The mod rewrites it whenever
-anything changes, and it answers exactly that question:
-
-```
-Apps read from this folder: 3
-
-  Grammarly.lnk
-      matches process: grammarly.exe   <-- RUNNING NOW
-      note: launcher stub ignored
-
-  Zoom Workplace.lnk
-      matches process: zoom.exe   (not running)
-```
-
-Underneath it lists **every program that owns a window right now**. That is
-the part worth reading: the usual failure is a shortcut resolving to a name
-nothing actually runs under, and seeing the two lists together makes it
-obvious. If the app you want is in the lower list but not matched above, copy
-the name from there into **Extra apps**.
-
-`NO APPS FOUND` at the top means nothing in the folder resolved, so the mod is
-doing nothing at all.
-
-One case worth knowing about: Electron and Squirrel apps - Grammarly, Teams,
-Discord and many others - point their Start shortcut at a shared `Update.exe`
-stub and name the real program in the arguments. The mod reads the arguments
-and the shortcut's icon as well as its target for exactly this reason, and
-discards the shared stub so that blocking one such app does not block them
-all.
-
-**Turn logging on for this mod** (its Advanced tab) for the same information
-plus every window it matched and whether the call was accepted.
-
-## What gets restored
-
-The per-window attribute dies with the window, so that method leaves nothing
-behind.
-
-The **While in front** method changes a real Windows setting, so it is more
-careful. The original value is read before anything is changed and put back
-when the mod is turned off, when Windhawk exits, and whenever no blocked app
-is in front.
-
-It is also written down, because none of that runs if the process is killed
-outright - and the result would be window animations switched off
-system-wide with nothing obviously to blame, which looks remarkably like
-some other animation mod having stopped working. On every start the mod
-checks whether it left the setting suppressed and puts it back if so.
-
-If you ever suspect this happened, the switch is at **Settings →
-Accessibility → Visual effects → Animation effects**.
+One consequence of working inside the app: the mod has to be loaded into every
+process, because a hook cannot be added after a process has started. In a
+process you did not pick it does nothing at all beyond reading one word of
+shared memory, but it is loaded, so this version has a wider footprint than the
+earlier ones. Explorer additionally runs a thread that watches the folder and
+resolves the shortcuts, so that the other processes never have to.
 
 ## Settings
 
-* **Apps folder** - where to watch. **Set this to whatever you like**, such as
-  `C:\Users\you\NoAnimation`, or a folder you already have. It is created if
-  missing, intermediate folders included; environment variables, forward
-  slashes and trailing backslashes are all fine. Blank falls back to
-  `%LOCALAPPDATA%\Windhawk no-animation apps`.
-
-  Prefer somewhere under your user folder. The root of `C:\` often refuses a
-  new folder without administrator rights, and if the path you set cannot be
-  used the mod will tell you which one it fell back to rather than quietly
-  putting your shortcuts somewhere else.
-* **Extra apps** - optional, one per line, for typing instead of dragging. An
-  executable name (`notepad.exe`), a full path, or an AppUserModelId.
-* **Method** - as above.
+* **Apps folder** - where to watch. Environment variables work.
+* **Extra apps** - optional, one per line, if you would rather type. An
+  executable name (`notepad.exe`) or an AppUserModelId.
 * **Open the apps folder** - tick and press Save to open it in Explorer.
-* **Ctrl+Alt+Shift+P opens the apps folder** - the route that does not involve
-  the settings window at all.
-* **Show tray icon** - off by default. A quick way back to the folder, and a
-  tooltip saying how many windows are currently held.
+* **Ctrl+Alt+Shift+P opens the apps folder**.
 */
 // ==/WindhawkModReadme==
 
@@ -180,26 +84,16 @@ Accessibility → Visual effects → Animation effects**.
 /*
 - dropFolder: '%LOCALAPPDATA%\Windhawk no-animation apps'
   $name: Apps folder
-  $description: The folder to watch for app shortcuts. Paste this path into Explorer's address bar to open it, or press Ctrl+Alt+Shift+P. Deliberately not under Documents, which OneDrive may redirect or sync. Environment variables are expanded.
+  $description: The folder to watch for app shortcuts. Paste this path into Explorer's address bar to open it, or press Ctrl+Alt+Shift+P. Avoid a Documents folder, which OneDrive may redirect or sync. Environment variables are expanded.
 - apps: ""
   $name: Extra apps
-  $description: Optional, one per line, if you would rather type than drag. An executable name such as notepad.exe, a full path, or an AppUserModelId.
-- method: running
-  $name: Method
-  $options:
-  - running: While running - animations stay off the whole time a blocked app is open (start here)
-  - dwm: Per window - the DWM no-transitions attribute. Clean, but reported not to stop open and close animations on Windows 11
-  - global: While in front - only while a blocked app is the focused window
-  - both: Per window and while in front
+  $description: Optional, one per line, if you would rather type than drag. An executable name such as notepad.exe, or an AppUserModelId.
 - openFolder: false
   $name: Open the apps folder
   $description: Tick this and press Save to open the folder in Explorer. Untick it afterwards, or it opens again on every save.
 - folderHotkey: true
   $name: Ctrl+Alt+Shift+P opens the apps folder
   $description: A route that does not depend on the settings window at all. Turn it off if it clashes with something.
-- showTrayIcon: false
-  $name: Show tray icon
-  $description: Off by default. A quick way back to the folder, and a tooltip saying how many windows are currently held.
 */
 // ==/WindhawkModSettings==
 
@@ -211,12 +105,9 @@ Accessibility → Visual effects → Animation effects**.
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
-#include <objidl.h>
-#include <gdiplus.h>
+#include <tlhelp32.h>
 
 #include <algorithm>
-#include <mutex>
-#include <set>
 #include <string>
 #include <vector>
 
@@ -224,10 +115,9 @@ Accessibility → Visual effects → Animation effects**.
 #define DWMWA_TRANSITIONS_FORCEDISABLED 3
 #endif
 
-// propkey.h declares the AppUserModel_ID property key but its definition
-// lives in uuid.lib, which this toolchain does not link, so the reference goes
-// unresolved at link time. Spelled out here instead, values copied from
-// propkey.h's own DEFINE_PROPERTYKEY line for it.
+// propkey.h declares this but its definition lives in uuid.lib, which this
+// toolchain does not link. Values copied from propkey.h's own
+// DEFINE_PROPERTYKEY line for it.
 static const PROPERTYKEY kPkeyAppUserModelId = {
     {0x9f4c2855,
      0x9f79,
@@ -235,15 +125,30 @@ static const PROPERTYKEY kPkeyAppUserModelId = {
      {0xa8, 0xd0, 0xe1, 0xd4, 0x2d, 0xe1, 0xd5, 0xf3}},
     5};
 
-// Same story for the known-folder id, from knownfolders.h's own
-// DEFINE_KNOWN_FOLDER line for it.
+// knownfolders.h declares this one in the same place, with the same problem.
 static const GUID kFolderIdLocalAppData = {
     0xf1b32785,
     0x6fba,
     0x4fcf,
     {0x9d, 0x55, 0x7b, 0x8e, 0x7f, 0x15, 0x70, 0x91}};
 
+// Same story for these three interface ids. Values copied from the toolchain's
+// own objidl.h and shobjidl.h, so they cannot drift from the real ones.
+static const IID kIidPersistFile = {
+    0x0000010b, 0x0000, 0x0000,
+    {0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
+static const IID kIidShellLinkW = {
+    0x000214f9, 0x0000, 0x0000,
+    {0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
+static const IID kIidShellItem2 = {
+    0x7e9fb0d3, 0x919f, 0x4307,
+    {0xab, 0x2e, 0x9b, 0x18, 0x60, 0x31, 0x0c, 0x93}};
+
 constexpr PCWSTR kFolderLeafName = L"Windhawk no-animation apps";
+// The resolved list, cached here so that the hundreds of processes this mod is
+// loaded into do not each have to spin up COM and read a folder of shortcuts.
+// One process does the resolving; the rest read this string.
+constexpr PCWSTR kResolvedValueName = L"resolvedApps";
 
 ////////////////////////////////////////////////////////////////////////////////
 // Text helpers
@@ -282,1812 +187,1120 @@ std::wstring ExpandEnv(const std::wstring& text) {
     return std::wstring(buffer);
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// What counts as a blocked app
-//
-// Two ways to name one, because Windows has two kinds of app. A Win32 program
-// is its executable, so the file name identifies it and survives the program
-// being moved or updated. A Store app has no executable of its own worth
-// matching - several share a generic host - so it is identified by the
-// AppUserModelId that its shortcut carries and that its windows report.
-
-enum class Method { Dwm, Global, Running, Both };
-
-struct BlockEntry {
-    // More than one name per entry, because a Start-menu shortcut does not
-    // reliably point at the executable that ends up owning the window.
-    // Electron and Squirrel apps - Grammarly, Teams, Discord and plenty more -
-    // point their shortcut at a shared Update.exe stub and name the real
-    // program in the arguments, so matching the target alone matches nothing.
-    std::vector<std::wstring> exeNames;  // lower-cased file names
-    std::wstring exePath;                // lower-cased full path, or empty
-    std::wstring aumid;                  // lower-cased AUMID, or empty
-    std::wstring source;                 // where it came from, for the log
-    std::wstring note;                   // anything odd, for the status file
-};
-
-// Launcher stubs and shells. Blocking one of these would match every other app
-// that uses the same stub, so they are only kept when nothing better was
-// found.
-bool IsLauncherStub(const std::wstring& lowerExeName) {
-    static const wchar_t* kStubs[] = {
-        L"update.exe",    L"explorer.exe", L"cmd.exe",
-        L"rundll32.exe",  L"conhost.exe",  L"dllhost.exe",
-        L"powershell.exe", L"pwsh.exe",    L"wscript.exe",
-        L"cscript.exe",   L"squirrel.exe", L"stub.exe",
-    };
-    for (const wchar_t* stub : kStubs) {
-        if (lowerExeName == stub) {
-            return true;
-        }
-    }
-    return false;
-}
-
-std::mutex g_stateMutex;
-std::vector<BlockEntry> g_entries;
-std::set<HWND> g_held;
-Method g_method = Method::Dwm;
-bool g_showTrayIcon = false;
-std::wstring g_dropFolder;
-// Whether the path came from the setting or from the built-in default. A path
-// the user chose gets said out loud when it cannot be used; falling back from
-// it in silence would put their shortcuts somewhere they never asked for.
-bool g_dropFolderWasConfigured = false;
-bool g_globalAnimationSuppressed = false;
-bool g_originalAnimationCaptured = false;
-int g_originalMinAnimate = 1;
-// Windows has more than one animation switch, and MinAnimate turned out to be
-// the wrong one: with it off, the logs showed suppression active and the open
-// and close animations carried on regardless. MinAnimate is the old
-// minimise/maximise setting. SPI_SETCLIENTAREAANIMATION is what the Windows 11
-// Accessibility "Animation effects" toggle drives, so both are taken now.
-BOOL g_originalClientAreaAnimation = TRUE;
-
-std::wstring ProcessImagePath(DWORD pid) {
-    if (!pid) {
-        return std::wstring();
-    }
-    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!process) {
-        return std::wstring();
-    }
-    wchar_t buffer[MAX_PATH * 2];
-    DWORD size = ARRAYSIZE(buffer);
-    std::wstring path;
-    if (QueryFullProcessImageNameW(process, 0, buffer, &size)) {
-        path.assign(buffer, size);
-    }
-    CloseHandle(process);
-    return path;
-}
-
-// A window's own AppUserModelId, which is how a Store app is recognised. Only
-// asked for when there are AUMID entries to compare against, since it is a
-// shell call per window and most setups will have none.
-std::wstring WindowAumid(HWND hwnd) {
-    std::wstring result;
-    IPropertyStore* store = nullptr;
-    if (FAILED(SHGetPropertyStoreForWindow(hwnd, IID_PPV_ARGS(&store))) ||
-        !store) {
-        return result;
-    }
-    PROPVARIANT value;
-    PropVariantInit(&value);
-    if (SUCCEEDED(store->GetValue(kPkeyAppUserModelId, &value)) &&
-        value.vt == VT_LPWSTR && value.pwszVal && value.pwszVal[0]) {
-        result = ToLowerCopy(value.pwszVal);
-    }
-    PropVariantClear(&value);
-    store->Release();
-    return result;
-}
-
-bool IsBlockedWindow(HWND hwnd, std::wstring* whichOut = nullptr) {
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
-    const std::wstring path = ToLowerCopy(ProcessImagePath(pid));
-    const std::wstring name = BaseName(path);
-
-    bool needAumid = false;
-    {
-        std::lock_guard<std::mutex> lock(g_stateMutex);
-        for (const auto& entry : g_entries) {
-            if (!entry.exePath.empty() && path == entry.exePath) {
-                if (whichOut) *whichOut = entry.source;
-                return true;
-            }
-            if (!name.empty()) {
-                for (const auto& candidate : entry.exeNames) {
-                    if (name == candidate) {
-                        if (whichOut) *whichOut = entry.source;
-                        return true;
-                    }
-                }
-            }
-            if (!entry.aumid.empty()) {
-                needAumid = true;
-            }
-        }
-    }
-    if (!needAumid) {
-        return false;
-    }
-
-    const std::wstring aumid = WindowAumid(hwnd);
-    if (aumid.empty()) {
-        return false;
-    }
-    std::lock_guard<std::mutex> lock(g_stateMutex);
-    for (const auto& entry : g_entries) {
-        if (!entry.aumid.empty() && aumid == entry.aumid) {
-            if (whichOut) *whichOut = entry.source;
-            return true;
-        }
-    }
-    return false;
-}
-
-// Only real top-level windows are worth touching: tooltips, the invisible
-// message windows every app has, and owned popups are not what animates.
-bool IsInterestingWindow(HWND hwnd) {
-    if (!IsWindow(hwnd) || GetAncestor(hwnd, GA_ROOT) != hwnd) {
-        return false;
-    }
-    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-    if (!(style & WS_CAPTION) && !(style & WS_THICKFRAME)) {
-        return false;
-    }
-    if (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) {
-        return false;
-    }
-    return true;
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Method 1: the per-window DWM attribute
-
-void ApplyToWindow(HWND hwnd) {
-    if (!IsInterestingWindow(hwnd)) {
-        return;
-    }
-    {
-        std::lock_guard<std::mutex> lock(g_stateMutex);
-        if (g_held.count(hwnd)) {
-            return;  // already done
-        }
-    }
-    std::wstring which;
-    if (!IsBlockedWindow(hwnd, &which)) {
-        return;
-    }
-
-    BOOL disable = TRUE;
-    HRESULT hr = DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED,
-                                       &disable, sizeof(disable));
-    // Logged either way: a refused call and an accepted-but-ignored call look
-    // identical from the outside, and that is exactly what needs telling apart
-    // when an animation stubbornly keeps playing.
-    if (SUCCEEDED(hr)) {
-        std::lock_guard<std::mutex> lock(g_stateMutex);
-        g_held.insert(hwnd);
-        Wh_Log(L"Transitions disabled on %p (%s)", (void*)hwnd, which.c_str());
-    } else {
-        Wh_Log(L"DwmSetWindowAttribute refused %p (%s): 0x%08X", (void*)hwnd,
-               which.c_str(), (unsigned int)hr);
-    }
-}
-
-void ReleaseWindow(HWND hwnd) {
-    if (IsWindow(hwnd)) {
-        BOOL disable = FALSE;
-        DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, &disable,
-                              sizeof(disable));
-    }
-}
-
-BOOL CALLBACK SweepProc(HWND hwnd, LPARAM) {
-    ApplyToWindow(hwnd);
-    return TRUE;
-}
-
-// Catches anything the event hook missed, and re-applies after the list
-// changes. Also drops windows that have since closed, or g_held would grow for
-// the life of the process.
-void SweepAllWindows() {
-    EnumWindows(SweepProc, 0);
-    std::lock_guard<std::mutex> lock(g_stateMutex);
-    for (auto it = g_held.begin(); it != g_held.end();) {
-        it = IsWindow(*it) ? std::next(it) : g_held.erase(it);
-    }
-}
-
-void ReleaseAllWindows() {
-    std::set<HWND> held;
-    {
-        std::lock_guard<std::mutex> lock(g_stateMutex);
-        held.swap(g_held);
-    }
-    for (HWND hwnd : held) {
-        ReleaseWindow(hwnd);
-    }
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Method 2: the global switch, flipped by what is in front
-//
-// Inelegant on purpose. It is the same setting the Settings app writes, so
-// unlike the attribute above there is no question about whether Windows
-// honours it.
-
-bool ReadGlobalAnimation(int* minAnimate, BOOL* clientArea) {
-    ANIMATIONINFO info = {sizeof(info), 0};
-    bool any = false;
-    if (SystemParametersInfoW(SPI_GETANIMATION, sizeof(info), &info, 0)) {
-        *minAnimate = info.iMinAnimate;
-        any = true;
-    }
-    BOOL value = TRUE;
-    if (SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &value, 0)) {
-        *clientArea = value;
-        any = true;
-    }
-    return any;
-}
-
-bool WriteGlobalAnimation(int minAnimate, BOOL clientArea) {
-    ANIMATIONINFO info = {sizeof(info), minAnimate};
-    bool okMin = SystemParametersInfoW(SPI_SETANIMATION, sizeof(info), &info,
-                                       SPIF_SENDCHANGE) != FALSE;
-    // pvParam carries the value itself for this one, not a pointer to it.
-    bool okClient =
-        SystemParametersInfoW(SPI_SETCLIENTAREAANIMATION, 0,
-                              (PVOID)(INT_PTR)clientArea, SPIF_SENDCHANGE) !=
-        FALSE;
-    if (!okClient) {
-        Wh_Log(L"SPI_SETCLIENTAREAANIMATION failed (%u)", GetLastError());
-    }
-    return okMin || okClient;
-}
-
-void SetGlobalSuppressed(bool suppressed) {
-    std::lock_guard<std::mutex> lock(g_stateMutex);
-    if (suppressed == g_globalAnimationSuppressed) {
-        return;
-    }
-    if (suppressed) {
-        // Read the user's own value the first time, so turning this off puts
-        // back what they had rather than what this mod assumes they had.
-        if (!g_originalAnimationCaptured) {
-            if (!ReadGlobalAnimation(&g_originalMinAnimate,
-                                     &g_originalClientAreaAnimation)) {
-                Wh_Log(L"Could not read the global animation settings");
-                return;
-            }
-            g_originalAnimationCaptured = true;
-        }
-        if (WriteGlobalAnimation(0, FALSE)) {
-            g_globalAnimationSuppressed = true;
-            // Recorded on disk as well. If this process is terminated outright
-            // rather than unloaded, nothing here gets to run, and the user is
-            // left with window animations switched off system-wide and no clue
-            // why - which looks exactly like an animation mod having stopped
-            // working. RecoverGlobalAnimation puts it back on next start.
-            Wh_SetIntValue(L"globalSuppressed", 1);
-            Wh_SetIntValue(L"globalOriginal", g_originalMinAnimate);
-            Wh_SetIntValue(L"globalOriginalClientArea",
-                           g_originalClientAreaAnimation ? 1 : 0);
-            Wh_Log(L"Animations off (MinAnimate was %d, ClientArea was %d)",
-                   g_originalMinAnimate,
-                   g_originalClientAreaAnimation ? 1 : 0);
-        }
-    } else {
-        if (WriteGlobalAnimation(
-                g_originalAnimationCaptured ? g_originalMinAnimate : 1,
-                g_originalAnimationCaptured ? g_originalClientAreaAnimation
-                                            : TRUE)) {
-            g_globalAnimationSuppressed = false;
-            Wh_SetIntValue(L"globalSuppressed", 0);
-            Wh_Log(L"Animations restored");
-        }
-    }
-}
-
-void RestoreGlobalAnimation() {
-    SetGlobalSuppressed(false);
-}
-
-// Run at startup, before anything else touches the setting. If the last run
-// was killed while it had animations suppressed, this is what gives them back
-// instead of leaving the machine quietly altered.
-void RecoverGlobalAnimation() {
-    if (Wh_GetIntValue(L"globalSuppressed", 0) == 0) {
-        return;
-    }
-    const int original = Wh_GetIntValue(L"globalOriginal", 1);
-    const BOOL originalClient =
-        Wh_GetIntValue(L"globalOriginalClientArea", 1) != 0 ? TRUE : FALSE;
-    Wh_Log(L"Last run left animations off; restoring %d / %d", original,
-           originalClient ? 1 : 0);
-    if (WriteGlobalAnimation(original, originalClient)) {
-        Wh_SetIntValue(L"globalSuppressed", 0);
-    }
-}
-
-struct BlockedScan {
-    bool found = false;
-};
-
-BOOL CALLBACK AnyBlockedProc(HWND hwnd, LPARAM param) {
-    auto* scan = reinterpret_cast<BlockedScan*>(param);
-    if (!IsWindowVisible(hwnd) || !IsInterestingWindow(hwnd)) {
-        return TRUE;
-    }
-    if (IsBlockedWindow(hwnd)) {
-        scan->found = true;
-        return FALSE;  // one is enough
-    }
-    return TRUE;
-}
-
-bool AnyBlockedWindowOpen() {
-    BlockedScan scan;
-    EnumWindows(AnyBlockedProc, reinterpret_cast<LPARAM>(&scan));
-    return scan.found;
-}
-
-// Which window matters depends on the method, and the difference is the whole
-// reason the Running method exists. Tying suppression to the focused window
-// cannot catch an opening animation: the window is not focused yet when it
-// animates in, and it is not focused any more once it has animated out. Tying
-// it to a blocked app merely being open covers both ends.
-void UpdateGlobalSuppression(HWND foreground) {
-    bool wantSuppressed = false;
-    switch (g_method) {
-        case Method::Global:
-        case Method::Both:
-            wantSuppressed = foreground && IsBlockedWindow(foreground);
-            break;
-        case Method::Running:
-            wantSuppressed = AnyBlockedWindowOpen();
-            break;
-        case Method::Dwm:
-            break;
-    }
-    SetGlobalSuppressed(wantSuppressed);
-}
-
-// Kept so the existing call sites read the same; the name no longer tells the
-// whole story, which is what the wrapper is for.
-void UpdateForForeground(HWND foreground) {
-    UpdateGlobalSuppression(foreground);
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Picking apps: a folder, and Explorer
-//
-// This used to be a window of list boxes built with CreateWindow. It never
-// appeared on the machine it was meant for, twice, and a custom window is not
-// something that can be debugged from here. So it is gone, and the job goes to
-// the one app that is unquestionably good at picking apps.
-//
-// Drop a shortcut into a folder and the app stops animating. Drag it straight
-// out of shell:AppsFolder, which is Explorer's list of everything installed,
-// Store apps included; Explorer makes the shortcut itself. Delete the shortcut
-// to undo it. Nothing to build, nothing to fail, and the blocklist is visible
-// in Explorer instead of hidden in a settings box.
-
-// SHCreateDirectoryEx refuses anything that is not a clean absolute path, and
-// fails with no further explanation, so the path is checked here rather than
-// discovered to be wrong by a folder that never appears.
-bool LooksAbsolute(const std::wstring& path) {
-    if (path.find(L'%') != std::wstring::npos) {
-        return false;  // a variable that did not expand
-    }
-    if (path.size() >= 2 && path[0] == L'\\' && path[1] == L'\\') {
-        return true;  // UNC
-    }
-    return path.size() >= 3 && iswalpha(path[0]) && path[1] == L':' &&
-           path[2] == L'\\';
-}
-
-// Doubled separators are tolerated by most of Windows and not by all of it.
-// They turn up here when a settings parser keeps the backslash escaping in a
-// quoted value, which is not something a mod gets to control.
-std::wstring CollapseSeparators(const std::wstring& path) {
-    std::wstring out;
-    out.reserve(path.size());
-    for (size_t i = 0; i < path.size(); ++i) {
-        const wchar_t c = path[i] == L'/' ? L'\\' : path[i];
-        // The leading pair of a UNC path is the one run worth keeping.
-        if (c == L'\\' && !out.empty() && out.back() == L'\\' && i > 1) {
-            continue;
-        }
-        out.push_back(c);
-    }
-    while (out.size() > 3 && out.back() == L'\\') {
-        out.pop_back();
-    }
-    return out;
-}
-
-// Under LOCALAPPDATA rather than Documents on purpose. A Documents folder is
-// very often redirected into OneDrive, so the path is not where it looks like
-// it is, may not exist under %USERPROFILE% at all, and would sync shortcuts
-// between machines where they do not apply.
-std::wstring KnownFolderDropPath() {
-    std::wstring path;
-    PWSTR known = nullptr;
-    if (SUCCEEDED(SHGetKnownFolderPath(kFolderIdLocalAppData, 0, nullptr,
-                                       &known)) &&
-        known) {
-        path = std::wstring(known) + L"\\" + kFolderLeafName;
-    }
-    if (known) {
-        CoTaskMemFree(known);
-    }
-    return path;
-}
-
-// Windhawk's own folder for this mod. Guaranteed to exist and be writable,
-// including in a portable install, so it is the one that cannot be wrong.
-std::wstring ModStorageDropPath() {
-    wchar_t buffer[MAX_PATH * 2] = {};
-    if (Wh_GetModStoragePath(buffer, ARRAYSIZE(buffer)) == 0 || !buffer[0]) {
-        return std::wstring();
-    }
-    return CollapseSeparators(std::wstring(buffer) + L"\\" + kFolderLeafName);
-}
-
-std::wstring DefaultDropFolder() {
-    std::wstring path = CollapseSeparators(
-        ExpandEnv(std::wstring(L"%LOCALAPPDATA%\\") + kFolderLeafName));
-    if (!LooksAbsolute(path)) {
-        path = CollapseSeparators(KnownFolderDropPath());
-    }
-    return path;
-}
-
-// Reads a .lnk for both the things that can identify an app. A shortcut to a
-// Store app has no target path at all, only an AppUserModelId, which is
-// exactly why both are read rather than one.
-// Resolving an AppsFolder shortcut is not just reading its target. A Store
-// app's shortcut has no target path at all, and a shortcut made with
-// right-click > Create shortcut (the "- Shortcut" suffix) can point at another
-// shortcut rather than at a program. Both were failing, which is why two of
-// the three apps dropped in the folder resolved to nothing.
-//
-// So this walks every route: the target, the Squirrel --processStart argument,
-// the icon, the link's AppUserModelId property, and finally the shell item the
-// link points at, whose parsing name is the AppUserModelId for a Store app and
-// the Start-menu .lnk path for a Win32 one - which is then followed.
-bool ResolveShortcut(const std::wstring& path, BlockEntry* out, int depth = 0) {
-    if (depth > 2) {
-        return false;  // a shortcut chain that loops, or is silly
-    }
-    IShellLinkW* link = nullptr;
-    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
-                                IID_PPV_ARGS(&link))) ||
-        !link) {
-        return false;
-    }
-    bool ok = false;
-    IPersistFile* file = nullptr;
-    if (SUCCEEDED(link->QueryInterface(IID_PPV_ARGS(&file))) && file) {
-        const HRESULT loaded = file->Load(path.c_str(), STGM_READ);
-        if (FAILED(loaded)) {
-            // Worth separating from "read it but found nothing": a OneDrive
-            // file that is still cloud-only fails right here.
-            Wh_Log(L"  Load('%s') failed: 0x%08X", BaseName(path).c_str(),
-                   (unsigned int)loaded);
-        } else {
-            std::vector<std::wstring> candidates;
-            auto addCandidate = [&candidates](const std::wstring& raw) {
-                std::wstring name = ToLowerCopy(BaseName(ExpandEnv(TrimCopy(raw))));
-                if (name.size() <= 4 ||
-                    name.compare(name.size() - 4, 4, L".exe") != 0) {
-                    return;
-                }
-                if (std::find(candidates.begin(), candidates.end(), name) ==
-                    candidates.end()) {
-                    candidates.push_back(name);
-                }
-            };
-
-            std::wstring chase;  // another .lnk to follow, if that is all there is
-
-            wchar_t target[MAX_PATH * 2] = {};
-            if (SUCCEEDED(link->GetPath(target, ARRAYSIZE(target), nullptr,
-                                        SLGP_RAWPATH)) &&
-                target[0]) {
-                const std::wstring lowerTarget = ToLowerCopy(target);
-                if (lowerTarget.size() > 4 &&
-                    lowerTarget.compare(lowerTarget.size() - 4, 4, L".lnk") == 0) {
-                    chase = ExpandEnv(target);
-                } else {
-                    // Matched on the file name, so the entry survives an
-                    // update moving the program into a new version folder.
-                    addCandidate(target);
-                }
-            }
-
-            // Squirrel, which is what most Electron apps ship with, points the
-            // shortcut at a shared Update.exe and names the real program in
-            // "--processStart Whatever.exe".
-            wchar_t args[2048] = {};
-            if (SUCCEEDED(link->GetArguments(args, ARRAYSIZE(args))) && args[0]) {
-                std::wstring text = args;
-                std::wstring lowerArgs = ToLowerCopy(text);
-                size_t at = lowerArgs.find(L"--processstart");
-                if (at != std::wstring::npos) {
-                    size_t from = lowerArgs.find_first_not_of(
-                        L" \t", lowerArgs.find_first_of(L" \t", at));
-                    if (from != std::wstring::npos) {
-                        size_t to = text[from] == L'"'
-                                        ? text.find(L'"', from + 1)
-                                        : text.find_first_of(L" \t", from);
-                        if (to == std::wstring::npos) {
-                            to = text.size();
-                        }
-                        addCandidate(text.substr(from, to - from));
-                    }
-                }
-            }
-
-            // The icon very often points at the real program even when the
-            // target does not.
-            wchar_t icon[MAX_PATH * 2] = {};
-            int iconIndex = 0;
-            if (SUCCEEDED(link->GetIconLocation(icon, ARRAYSIZE(icon),
-                                                &iconIndex)) &&
-                icon[0]) {
-                addCandidate(icon);
-            }
-
-            IPropertyStore* store = nullptr;
-            if (SUCCEEDED(link->QueryInterface(IID_PPV_ARGS(&store))) && store) {
-                PROPVARIANT value;
-                PropVariantInit(&value);
-                if (SUCCEEDED(store->GetValue(kPkeyAppUserModelId, &value)) &&
-                    value.vt == VT_LPWSTR && value.pwszVal &&
-                    value.pwszVal[0]) {
-                    out->aumid = ToLowerCopy(value.pwszVal);
-                    ok = true;
-                }
-                PropVariantClear(&value);
-                store->Release();
-            }
-
-            // Last and most useful route: ask the shell what the link points
-            // at. For a Store app the parsing name *is* the AppUserModelId;
-            // for a Win32 app in AppsFolder it is the Start-menu .lnk.
-            if (candidates.empty() && out->aumid.empty()) {
-                PIDLIST_ABSOLUTE pidl = nullptr;
-                if (SUCCEEDED(link->GetIDList(&pidl)) && pidl) {
-                    IShellItem* item = nullptr;
-                    if (SUCCEEDED(SHCreateItemFromIDList(pidl,
-                                                         IID_PPV_ARGS(&item))) &&
-                        item) {
-                        PWSTR parsing = nullptr;
-                        if (SUCCEEDED(item->GetDisplayName(
-                                SIGDN_DESKTOPABSOLUTEPARSING, &parsing)) &&
-                            parsing) {
-                            std::wstring text = parsing;
-                            std::wstring lower = ToLowerCopy(text);
-                            Wh_Log(L"  '%s' points at '%s'",
-                                   BaseName(path).c_str(), text.c_str());
-                            if (lower.size() > 4 &&
-                                lower.compare(lower.size() - 4, 4, L".lnk") == 0) {
-                                chase = text;
-                            } else if (lower.size() > 4 &&
-                                       lower.compare(lower.size() - 4, 4,
-                                                     L".exe") == 0) {
-                                addCandidate(text);
-                            } else if (text.find(L'\\') == std::wstring::npos &&
-                                       text.find(L'/') == std::wstring::npos &&
-                                       !text.empty()) {
-                                // An AppUserModelId. The test used to require
-                                // a '!', which only Store apps have:
-                                // PackageFamilyName!AppId. A desktop app sets
-                                // its own, and those are plain dotted strings
-                                // - "Grammarly.Desktop",
-                                // "zoom.us.Zoom Video Meetings" - so the '!'
-                                // test threw away exactly the two apps it was
-                                // meant to resolve. Anything with no path
-                                // separator in it is an id, not a file.
-                                out->aumid = lower;
-                                ok = true;
-                            }
-                            CoTaskMemFree(parsing);
-                        }
-                        item->Release();
-                    }
-                    ILFree(pidl);
-                }
-            }
-
-            // Drop the shared stubs, but only if something better turned up.
-            std::vector<std::wstring> real;
-            for (const auto& candidate : candidates) {
-                if (!IsLauncherStub(candidate)) {
-                    real.push_back(candidate);
-                }
-            }
-            if (!real.empty()) {
-                if (real.size() != candidates.size()) {
-                    out->note = L"launcher stub ignored";
-                }
-                out->exeNames = std::move(real);
-            } else if (!candidates.empty()) {
-                out->note = L"only a shared launcher stub was found";
-                out->exeNames = std::move(candidates);
-            }
-            if (!out->exeNames.empty()) {
-                ok = true;
-            }
-
-            // Nothing of our own, but it points at another shortcut: follow it.
-            if (!ok && !chase.empty()) {
-                file->Release();
-                link->Release();
-                Wh_Log(L"  following '%s' -> '%s'", BaseName(path).c_str(),
-                       chase.c_str());
-                return ResolveShortcut(chase, out, depth + 1);
-            }
-            if (!ok) {
-                Wh_Log(L"  '%s': read fine, but no program, app id or further "
-                       L"shortcut in it",
-                       BaseName(path).c_str());
-            }
-        }
-        file->Release();
-    }
-    link->Release();
-    return ok;
-}
-
-std::vector<BlockEntry> ScanDropFolder() {
-    std::vector<BlockEntry> apps;
-    if (g_dropFolder.empty()) {
-        return apps;
-    }
-    const std::wstring pattern = g_dropFolder + L"\\*";
-    WIN32_FIND_DATAW found;
-    HANDLE handle = FindFirstFileW(pattern.c_str(), &found);
-    if (handle == INVALID_HANDLE_VALUE) {
-        return apps;
-    }
-    do {
-        if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            continue;
-        }
-        const std::wstring name = found.cFileName;
-        const std::wstring lower = ToLowerCopy(name);
-        auto endsWith = [&lower](const wchar_t* suffix) {
-            const size_t n = wcslen(suffix);
-            return lower.size() > n &&
-                   lower.compare(lower.size() - n, n, suffix) == 0;
-        };
-        if (endsWith(L".lnk")) {
-            BlockEntry entry;
-            entry.source = name;
-            if (ResolveShortcut(g_dropFolder + L"\\" + name, &entry)) {
-                apps.push_back(std::move(entry));
-            } else {
-                Wh_Log(L"Could not resolve the shortcut %s", name.c_str());
-            }
-        } else if (endsWith(L".exe")) {
-            BlockEntry entry;
-            entry.exeNames.push_back(lower);
-            entry.source = name;
-            apps.push_back(std::move(entry));
-        }
-        // Anything else is ignored, so the read-me and _status.txt can sit
-        // alongside the shortcuts without being mistaken for them.
-    } while (FindNextFileW(handle, &found));
-    FindClose(handle);
-    return apps;
-}
-
-// Written once, so the folder explains itself to whoever opens it later -
-// including whoever has forgotten what it was for.
-void WriteDropFolderReadme() {
-    const std::wstring path = g_dropFolder + L"\\What this folder is.txt";
-    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        return;
-    }
-    static const char kText[] =
-        "Windhawk - Window Animation Blocker\r\n"
-        "===================================\r\n"
-        "\r\n"
-        "Put a shortcut to an app in this folder and that app stops animating\r\n"
-        "when its windows open, close, minimise or restore.\r\n"
-        "\r\n"
-        "The quickest way to add one:\r\n"
-        "\r\n"
-        "  1. Open a new Explorer window.\r\n"
-        "  2. Type   shell:AppsFolder   in the address bar and press Enter.\r\n"
-        "     That is the list of everything installed, Store apps included.\r\n"
-        "  3. Drag an app from there into this folder. Explorer makes the\r\n"
-        "     shortcut itself.\r\n"
-        "\r\n"
-        "To stop blocking an app, delete its shortcut from here.\r\n"
-        "\r\n"
-        "Changes are picked up within a few seconds. Nothing needs saving and\r\n"
-        "Windhawk does not need reopening.\r\n"
-        "\r\n"
-        "A copy of an .exe works too. This text file is ignored.\r\n";
-    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
-                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        return;
-    }
-    DWORD written = 0;
-    WriteFile(file, kText, (DWORD)(sizeof(kText) - 1), &written, nullptr);
-    CloseHandle(file);
-}
-
-// Reports whether the folder had to be made, which is what decides whether to
-// show it. Keying that off a stored "first run" flag was a mistake: the flag
-// from the previous version had already been consumed by the picker it used to
-// summon, so the folder was silently never shown to the one person who needed
-// to find it. Folder-was-just-created is intrinsic, needs no stored state, and
-// corrects itself if the folder is ever deleted.
-// Tries the resolved path, then the two that are hard to get wrong. Returning
-// false here means the mod has nowhere to read its list from, so it says so
-// out loud rather than sitting there looking enabled and doing nothing, which
-// is what the last three versions did.
-bool PrepareDropFolder(bool* wasCreated = nullptr) {
-    if (wasCreated) {
-        *wasCreated = false;
-    }
-
-    std::vector<std::wstring> candidates;
-    candidates.push_back(g_dropFolder);
-    for (const std::wstring& extra :
-         {KnownFolderDropPath(), ModStorageDropPath()}) {
-        if (!extra.empty() &&
-            std::find(candidates.begin(), candidates.end(), extra) ==
-                candidates.end()) {
-            candidates.push_back(extra);
-        }
-    }
-
-    for (size_t i = 0; i < candidates.size(); ++i) {
-        const std::wstring& path = candidates[i];
-        if (path.empty() || !LooksAbsolute(path)) {
-            continue;
-        }
-        const int created =
-            SHCreateDirectoryExW(nullptr, path.c_str(), nullptr);
-        const bool exists = created == ERROR_ALREADY_EXISTS ||
-                            created == ERROR_FILE_EXISTS;
-        if (created == ERROR_SUCCESS || exists) {
-            if (i > 0) {
-                Wh_Log(L"Using %s instead; the first choice failed",
-                       path.c_str());
-                // Only worth interrupting over when the path that failed is
-                // one the user typed in. Falling back from the built-in
-                // default is this mod's own business.
-                static bool warnedAboutFallback = false;
-                if (g_dropFolderWasConfigured && !warnedAboutFallback) {
-                    warnedAboutFallback = true;
-                    std::wstring text =
-                        L"Window Animation Blocker could not use the folder "
-                        L"you set:\r\n\r\n" + candidates[0] +
-                        L"\r\n\r\nIt is using this instead:\r\n\r\n" + path +
-                        L"\r\n\r\nA path under your user folder, such as "
-                        L"C:\\Users\\<you>\\NoAnimation, needs no special "
-                        L"rights. The drive root often does.";
-                    MessageBoxW(nullptr, text.c_str(), L"Windhawk",
-                                MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
-                }
-            }
-            g_dropFolder = path;
-            if (wasCreated) {
-                *wasCreated = created == ERROR_SUCCESS;
-            }
-            WriteDropFolderReadme();
-            return true;
-        }
-        Wh_Log(L"Could not create %s (error %d)", path.c_str(), created);
-    }
-
-    // Nothing worked, and logging is off by default, so this is the one place
-    // a message is worth more than a log line: without it the mod is silently
-    // inert and there is no way to tell that from it being broken.
-    static bool complained = false;
-    if (!complained) {
-        complained = true;
-        std::wstring text =
-            L"Window Animation Blocker could not create its apps folder:\r\n\r\n" +
-            g_dropFolder +
-            L"\r\n\r\nSet a different path in the mod's \"Apps folder\" setting.";
-        MessageBoxW(nullptr, text.c_str(), L"Windhawk",
-                    MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
-    }
-    return false;
-}
-
-// ---------------------------------------------------------------------------
-// _status.txt
-//
-// Written into the apps folder, which is where someone wondering whether this
-// works is already looking. It answers the question that matters - did the
-// shortcuts resolve to anything, and does anything running right now match
-// them - without turning logging on or enabling a tray icon.
-//
-// It lists the executables of the windows open at that moment too, because the
-// usual failure is a shortcut resolving to a name that nothing actually runs
-// under, and seeing the two lists side by side makes that obvious.
-
-struct WindowCensus {
-    std::set<std::wstring> exeNames;
-    std::set<std::wstring> aumids;
-    int windows = 0;
-};
-
-BOOL CALLBACK CensusProc(HWND hwnd, LPARAM param) {
-    auto* census = reinterpret_cast<WindowCensus*>(param);
-    if (!IsWindowVisible(hwnd) || !IsInterestingWindow(hwnd)) {
-        return TRUE;
-    }
-    census->windows++;
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
-    std::wstring name = BaseName(ToLowerCopy(ProcessImagePath(pid)));
-    if (!name.empty()) {
-        census->exeNames.insert(name);
-    }
-    std::wstring aumid = WindowAumid(hwnd);
-    if (!aumid.empty()) {
-        census->aumids.insert(aumid);
-    }
-    return TRUE;
-}
-
-PCWSTR MethodName(Method method) {
-    switch (method) {
-        case Method::Dwm:     return L"Per window";
-        case Method::Global:  return L"While in front";
-        case Method::Running: return L"While running";
-        case Method::Both:    return L"Both";
-    }
-    return L"?";
-}
-
-std::wstring BuildStatusText() {
-    WindowCensus census;
-    EnumWindows(CensusProc, reinterpret_cast<LPARAM>(&census));
-
-    std::vector<BlockEntry> entries;
-    size_t heldCount = 0;
-    bool globalOff = false;
-    Method method = Method::Running;
-    std::wstring folder;
-    {
-        std::lock_guard<std::mutex> lock(g_stateMutex);
-        entries = g_entries;
-        heldCount = g_held.size();
-        globalOff = g_globalAnimationSuppressed;
-        method = g_method;
-        folder = g_dropFolder;
-    }
-
-    SYSTEMTIME now;
-    GetLocalTime(&now);
-    wchar_t stamp[64];
-    swprintf_s(stamp, L"%04d-%02d-%02d %02d:%02d:%02d", now.wYear, now.wMonth,
-               now.wDay, now.wHour, now.wMinute, now.wSecond);
-
-    std::wstring text;
-    text += L"Window Animation Blocker - status\r\n";
-    text += L"=================================\r\n\r\n";
-    text += L"Rewritten automatically whenever something changes.\r\n";
-    text += L"Last written: ";
-    text += stamp;
-    text += L"\r\n\r\nMethod: ";
-    text += MethodName(method);
-    text += L"\r\nSuppression active right now: ";
-    text += globalOff ? L"yes" : L"no";
-    {
-        // Read live rather than from what this mod believes it wrote, so a
-        // setting that refuses to change is visible here.
-        int minAnimate = -1;
-        BOOL clientArea = -1;
-        ANIMATIONINFO info = {sizeof(info), 0};
-        if (SystemParametersInfoW(SPI_GETANIMATION, sizeof(info), &info, 0)) {
-            minAnimate = info.iMinAnimate;
-        }
-        BOOL value = TRUE;
-        if (SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &value, 0)) {
-            clientArea = value;
-        }
-        text += L"\r\n  Minimise/maximise animation (MinAnimate): ";
-        text += minAnimate < 0 ? L"unreadable"
-                               : (minAnimate ? L"ON" : L"off");
-        text += L"\r\n  Window animations (ClientAreaAnimation): ";
-        text += clientArea < 0 ? L"unreadable" : (clientArea ? L"ON" : L"off");
-    }
-    text += L"\r\nFolder: ";
-    text += folder;
-    text += L"\r\n\r\n";
-
-    if (entries.empty()) {
-        text +=
-            L"NO APPS FOUND.\r\n\r\n"
-            L"Nothing in this folder resolved to an app, so the mod is doing\r\n"
-            L"nothing at all. Drop a shortcut in - drag one out of\r\n"
-            L"shell:AppsFolder - and this file will be rewritten within a\r\n"
-            L"couple of seconds.\r\n\r\n";
-    } else {
-        text += L"Apps read from this folder: " +
-                std::to_wstring(entries.size()) + L"\r\n\r\n";
-        for (const auto& entry : entries) {
-            text += L"  " + entry.source + L"\r\n";
-            if (entry.exeNames.empty() && entry.aumid.empty() &&
-                entry.exePath.empty()) {
-                text += L"      resolved to: NOTHING - this shortcut could not "
-                        L"be read\r\n";
-            }
-            bool matched = false;
-            for (const auto& candidate : entry.exeNames) {
-                const bool open = census.exeNames.count(candidate) > 0;
-                matched = matched || open;
-                text += L"      matches process: " + candidate +
-                        (open ? L"   <-- RUNNING NOW\r\n" : L"   (not running)\r\n");
-            }
-            if (!entry.exePath.empty()) {
-                text += L"      matches full path: " + entry.exePath + L"\r\n";
-            }
-            if (!entry.aumid.empty()) {
-                const bool open = census.aumids.count(entry.aumid) > 0;
-                matched = matched || open;
-                text += L"      matches app id: " + entry.aumid +
-                        (open ? L"   <-- RUNNING NOW\r\n" : L"   (not running)\r\n");
-            }
-            if (entry.exeNames.empty() && !entry.aumid.empty()) {
-                text += L"      (no executable name for this one - matched on "
-                        L"the app id only)\r\n";
-            }
-            if (!entry.note.empty()) {
-                text += L"      note: " + entry.note + L"\r\n";
-            }
-            if (!matched) {
-                text += L"      -> nothing open right now matches this one.\r\n";
-            }
-            text += L"\r\n";
-        }
-    }
-
-    text += L"Windows held by the per-window attribute: " +
-            std::to_wstring(heldCount) + L"\r\n\r\n";
-
-    text +=
-        L"Programs owning a window right now, for comparison:\r\n"
-        L"(if the app you want is in this list but not matched above, copy the\r\n"
-        L" name from here into the mod's \"Extra apps\" setting)\r\n\r\n";
-    for (const auto& name : census.exeNames) {
-        text += L"  " + name + L"\r\n";
-    }
-    if (!census.aumids.empty()) {
-        text += L"\r\nApp ids reported by those windows:\r\n\r\n";
-        for (const auto& aumid : census.aumids) {
-            text += L"  " + aumid + L"\r\n";
-        }
-    }
-    return text;
-}
-
-void WriteStatusFile() {
-    if (g_dropFolder.empty()) {
-        return;
-    }
-    std::wstring text = BuildStatusText();
-
-    // Compared without the timestamp line, so a folder open in Explorer is not
-    // refreshed every couple of seconds for no reason.
-    static std::wstring lastBody;
-    size_t bodyAt = text.find(L"Method: ");
-    std::wstring body = bodyAt == std::wstring::npos ? text : text.substr(bodyAt);
-    if (body == lastBody) {
-        return;
-    }
-    lastBody = body;
-
-    const std::wstring path = g_dropFolder + L"\\_status.txt";
-    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
-                              nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
-                              nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        return;
-    }
-    // UTF-8 with a BOM, so Notepad renders any non-ASCII path correctly.
-    int needed = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(),
-                                     nullptr, 0, nullptr, nullptr);
-    std::string utf8;
-    if (needed > 0) {
-        utf8.resize((size_t)needed);
-        WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(),
-                            utf8.data(), needed, nullptr, nullptr);
-    }
-    DWORD written = 0;
-    const unsigned char bom[] = {0xEF, 0xBB, 0xBF};
-    WriteFile(file, bom, sizeof(bom), &written, nullptr);
-    if (!utf8.empty()) {
-        WriteFile(file, utf8.data(), (DWORD)utf8.size(), &written, nullptr);
-    }
-    CloseHandle(file);
-}
-
-// Opening a folder is Explorer's job, and it is the one part of this that is
-// certain to work - unlike the window that used to be here.
-void OpenDropFolder() {
-    if (g_dropFolder.empty()) {
-        return;
-    }
-    Wh_Log(L"Opening %s", g_dropFolder.c_str());
-    ShellExecuteW(nullptr, L"open", g_dropFolder.c_str(), nullptr, nullptr,
-                  SW_SHOWNORMAL);
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Settings
-
-std::vector<BlockEntry> ParseExtraApps(const std::wstring& text) {
-    std::vector<BlockEntry> entries;
+std::vector<std::wstring> SplitOn(const std::wstring& text, wchar_t sep) {
+    std::vector<std::wstring> out;
     size_t start = 0;
     while (start <= text.size()) {
-        size_t end = text.find_first_of(L"\r\n", start);
-        std::wstring line = TrimCopy(text.substr(
+        size_t end = text.find(sep, start);
+        std::wstring piece = TrimCopy(text.substr(
             start, end == std::wstring::npos ? std::wstring::npos : end - start));
-        if (!line.empty()) {
-            BlockEntry entry;
-            entry.source = line;
-            const std::wstring lower = ToLowerCopy(line);
-            // A path if it has a separator, an executable if it ends .exe,
-            // otherwise assumed to be an AppUserModelId - which is what an
-            // entry copied out of a Store app's properties looks like.
-            if (lower.find(L'\\') != std::wstring::npos ||
-                lower.find(L'/') != std::wstring::npos) {
-                entry.exePath = ToLowerCopy(ExpandEnv(line));
-            } else if (lower.size() > 4 &&
-                       lower.compare(lower.size() - 4, 4, L".exe") == 0) {
-                entry.exeNames.push_back(lower);
-            } else {
-                entry.aumid = lower;
-            }
-            entries.push_back(std::move(entry));
+        if (!piece.empty()) {
+            out.push_back(ToLowerCopy(piece));
         }
         if (end == std::wstring::npos) {
             break;
         }
         start = end + 1;
     }
-    return entries;
+    return out;
 }
 
-void ReloadEntries() {
-    std::vector<BlockEntry> entries;
-
-    PCWSTR extra = Wh_GetStringSetting(L"apps");
-    if (extra) {
-        entries = ParseExtraApps(extra);
+std::wstring OwnExeName() {
+    wchar_t path[MAX_PATH * 2] = {};
+    if (GetModuleFileNameW(nullptr, path, ARRAYSIZE(path)) == 0) {
+        return std::wstring();
     }
-    Wh_FreeStringSetting(extra);
-
-    for (auto& entry : ScanDropFolder()) {
-        entries.push_back(std::move(entry));
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(g_stateMutex);
-        g_entries = std::move(entries);
-    }
-
-    std::lock_guard<std::mutex> lock(g_stateMutex);
-    Wh_Log(L"%d app(s) blocked", (int)g_entries.size());
-    for (const auto& entry : g_entries) {
-        std::wstring names;
-        for (const auto& candidate : entry.exeNames) {
-            if (!names.empty()) {
-                names += L", ";
-            }
-            names += candidate;
-        }
-        Wh_Log(L"  %s -> exe=[%s] path='%s' aumid='%s' %s",
-               entry.source.c_str(), names.c_str(), entry.exePath.c_str(),
-               entry.aumid.c_str(), entry.note.c_str());
-    }
+    return ToLowerCopy(BaseName(path));
 }
 
-void LoadSettings() {
-    PCWSTR folder = Wh_GetStringSetting(L"dropFolder");
-    std::wstring configured = TrimCopy(folder ? folder : L"");
-    Wh_FreeStringSetting(folder);
-    while (!configured.empty() && configured.back() == L'\\') {
-        configured.pop_back();
+// A desktop app that sets its own AppUserModelId can be matched on it, which
+// is how a Store-style shortcut resolves. Asking for our own costs nothing.
+std::wstring OwnAppUserModelId() {
+    using GetId_t = HRESULT(WINAPI*)(PWSTR*);
+    HMODULE shell = GetModuleHandleW(L"shell32.dll");
+    if (!shell) {
+        return std::wstring();
     }
-    g_dropFolderWasConfigured = !configured.empty();
-    if (configured.empty()) {
-        g_dropFolder = DefaultDropFolder();
-    } else {
-        g_dropFolder = CollapseSeparators(ExpandEnv(configured));
-        if (!LooksAbsolute(g_dropFolder)) {
-            // v2.1 gave the setting a visible default, which meant this branch
-            // always ran and the fallback above never did. A path that cannot
-            // be created then had nowhere to fall back to, and the folder
-            // simply never appeared.
-            Wh_Log(L"'%s' is not a usable absolute path; falling back",
-                   g_dropFolder.c_str());
-            g_dropFolder = DefaultDropFolder();
-        }
+    auto getId = (GetId_t)GetProcAddress(
+        shell, "GetCurrentProcessExplicitAppUserModelID");
+    if (!getId) {
+        return std::wstring();
     }
-    Wh_Log(L"Apps folder setting '%s' resolved to '%s'",
-           configured.c_str(), g_dropFolder.c_str());
-
-    PCWSTR method = Wh_GetStringSetting(L"method");
-    Method parsed = Method::Running;
-    if (method) {
-        if (wcscmp(method, L"global") == 0) {
-            parsed = Method::Global;
-        } else if (wcscmp(method, L"both") == 0) {
-            parsed = Method::Both;
-        } else if (wcscmp(method, L"running") == 0) {
-            parsed = Method::Running;
-        }
+    PWSTR id = nullptr;
+    std::wstring result;
+    if (SUCCEEDED(getId(&id)) && id) {
+        result = ToLowerCopy(id);
     }
-    Wh_FreeStringSetting(method);
-
-    g_method = parsed;
-    g_showTrayIcon = Wh_GetIntSetting(L"showTrayIcon") != 0;
+    if (id) {
+        CoTaskMemFree(id);
+    }
+    return result;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Tray icon (off by default)
-
-constexpr UINT WM_APP_TRAY = WM_APP + 1;
-constexpr UINT WM_APP_QUIT = WM_APP + 2;
-constexpr UINT WM_APP_SETTINGS = WM_APP + 3;
-constexpr UINT kTrayIconId = 1;
-constexpr UINT_PTR kSweepTimerId = 1;
-constexpr UINT kSweepIntervalMs = 1500;
-constexpr UINT kCmdOpenFolder = 100;
-constexpr int kFolderHotkeyId = 1;
-
-HINSTANCE g_hInst = nullptr;
-HWND g_hostWnd = nullptr;
-HICON g_trayIcon = nullptr;
-bool g_trayIconAdded = false;
-UINT g_taskbarCreatedMessage = 0;
-HANDLE g_uiThread = nullptr;
-DWORD g_uiThreadId = 0;
-HANDLE g_readyEvent = nullptr;
-ULONG_PTR g_gdiplusToken = 0;
-HWINEVENTHOOK g_showHook = nullptr;
-HWINEVENTHOOK g_foregroundHook = nullptr;
-
-HICON CreateTrayIconBitmap(int size, bool active) {
-    HDC screenDC = GetDC(nullptr);
-    if (!screenDC) {
-        return nullptr;
-    }
-    BITMAPINFO info = {};
-    info.bmiHeader.biSize = sizeof(info.bmiHeader);
-    info.bmiHeader.biWidth = size;
-    info.bmiHeader.biHeight = -size;
-    info.bmiHeader.biPlanes = 1;
-    info.bmiHeader.biBitCount = 32;
-    info.bmiHeader.biCompression = BI_RGB;
-    void* bits = nullptr;
-    HBITMAP colorBitmap =
-        CreateDIBSection(screenDC, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (!colorBitmap) {
-        ReleaseDC(nullptr, screenDC);
-        return nullptr;
-    }
-    HDC memDC = CreateCompatibleDC(screenDC);
-    HBITMAP oldBitmap = (HBITMAP)SelectObject(memDC, colorBitmap);
-    {
-        Gdiplus::Graphics graphics(memDC);
-        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
-        Gdiplus::Color color = active ? Gdiplus::Color(255, 240, 240, 240)
-                                      : Gdiplus::Color(255, 150, 150, 150);
-        float inset = size / 8.0f;
-        float thickness = size / 8.0f;
-        if (thickness < 1.5f) {
-            thickness = 1.5f;
-        }
-        Gdiplus::Pen pen(color, thickness);
-        Gdiplus::RectF box(inset + thickness / 2, inset + thickness / 2,
-                           size - inset * 2 - thickness,
-                           size - inset * 2 - thickness);
-        graphics.DrawRectangle(&pen, box);
-        if (active) {
-            // A bar through it: windows are being held still.
-            graphics.DrawLine(&pen, box.X, box.Y + box.Height / 2,
-                              box.X + box.Width, box.Y + box.Height / 2);
-        }
-    }
-    SelectObject(memDC, oldBitmap);
-    int maskStride = ((size + 15) / 16) * 2;
-    std::vector<BYTE> maskBits((size_t)maskStride * size, 0);
-    HBITMAP maskBitmap = CreateBitmap(size, size, 1, 1, maskBits.data());
-    ICONINFO iconInfo = {};
-    iconInfo.fIcon = TRUE;
-    iconInfo.hbmMask = maskBitmap;
-    iconInfo.hbmColor = colorBitmap;
-    HICON icon = CreateIconIndirect(&iconInfo);
-    if (maskBitmap) {
-        DeleteObject(maskBitmap);
-    }
-    DeleteObject(colorBitmap);
-    DeleteDC(memDC);
-    ReleaseDC(nullptr, screenDC);
-    return icon;
-}
-
-void RemoveTrayIcon() {
-    if (!g_trayIconAdded) {
-        return;
-    }
-    NOTIFYICONDATAW data = {};
-    data.cbSize = sizeof(data);
-    data.hWnd = g_hostWnd;
-    data.uID = kTrayIconId;
-    Shell_NotifyIconW(NIM_DELETE, &data);
-    g_trayIconAdded = false;
-}
-
-void UpdateTrayIcon() {
-    if (!g_showTrayIcon) {
-        RemoveTrayIcon();
-        return;
-    }
-    size_t heldCount = 0;
-    size_t appCount = 0;
-    bool globalOff = false;
-    {
-        std::lock_guard<std::mutex> lock(g_stateMutex);
-        heldCount = g_held.size();
-        appCount = g_entries.size();
-        globalOff = g_globalAnimationSuppressed;
-    }
-
-    HICON icon = CreateTrayIconBitmap(16, heldCount > 0 || globalOff);
-    if (!icon) {
-        return;
-    }
-    std::wstring tip = L"Window Animation Blocker\r\n" +
-                       std::to_wstring(appCount) +
-                       (appCount == 1 ? L" app blocked, " : L" apps blocked, ") +
-                       std::to_wstring(heldCount) + L" window" +
-                       (heldCount == 1 ? L" held" : L"s held");
-    if (globalOff) {
-        tip += L"\r\nGlobal animation currently off";
-    }
-    // The folder that was actually used, so there is a way to read it back
-    // without turning logging on. Trimmed from the left, since the end of a
-    // path is the part worth seeing.
-    {
-        std::wstring folder;
-        {
-            std::lock_guard<std::mutex> lock(g_stateMutex);
-            folder = g_dropFolder;
-        }
-        if (!folder.empty()) {
-            const size_t room = 123 - tip.size();
-            if (folder.size() > room && room > 4) {
-                folder = L"..." + folder.substr(folder.size() - (room - 3));
-            }
-            if (folder.size() <= room) {
-                tip += L"\r\n" + folder;
-            }
-        }
-    }
-    if (tip.size() > 127) {
-        tip.resize(127);
-    }
-
-    NOTIFYICONDATAW data = {};
-    data.cbSize = sizeof(data);
-    data.hWnd = g_hostWnd;
-    data.uID = kTrayIconId;
-    data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-    data.uCallbackMessage = WM_APP_TRAY;
-    data.hIcon = icon;
-    wcscpy_s(data.szTip, ARRAYSIZE(data.szTip), tip.c_str());
-    if (Shell_NotifyIconW(g_trayIconAdded ? NIM_MODIFY : NIM_ADD, &data)) {
-        g_trayIconAdded = true;
-    }
-    if (g_trayIcon) {
-        DestroyIcon(g_trayIcon);
-    }
-    g_trayIcon = icon;
-}
-
-void ShowTrayMenu() {
-    HMENU menu = CreatePopupMenu();
-    if (!menu) {
-        return;
-    }
-    AppendMenuW(menu, MF_STRING, kCmdOpenFolder, L"Open the apps folder");
-    POINT cursor;
-    GetCursorPos(&cursor);
-    SetForegroundWindow(g_hostWnd);
-    TrackPopupMenu(menu, TPM_RIGHTBUTTON, cursor.x, cursor.y, 0, g_hostWnd,
-                   nullptr);
-    PostMessageW(g_hostWnd, WM_NULL, 0, 0);
-    DestroyMenu(menu);
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Event hooks
+// Which process are we in, and does the user want it quiet?
 //
-// Out-of-process, so nothing is injected anywhere: DwmSetWindowAttribute takes
-// any window handle, and the global setting is per-user. That also means this
-// works on apps that would refuse injection, and needs nothing from DWM
-// itself, which a portable Windhawk cannot touch.
+// The hooks go into every process, because Wh_SetFunctionHook only works
+// during Wh_ModInit and the list of apps can change long afterwards. So each
+// hook asks ShouldBlockHere() first, and that has to be cheap and safe to call
+// from inside someone else's ShowWindow: no file access, no Windhawk calls, no
+// lock anybody else holds. A small shared section carries the list and a
+// counter, so the hook path only ever reads memory. One process - Explorer -
+// does the reading of the folder and the writing of the section.
 
-void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
-                           LONG idChild, DWORD, DWORD) {
-    if (!hwnd || idObject != OBJID_WINDOW || idChild != CHILDID_SELF) {
+// Two slots, so a reader is never looking at the bytes a writer is replacing.
+// The counter's low bit says which slot is live, and it only moves when the
+// list actually changes, which is seconds apart at the very fastest.
+constexpr size_t kNamesChars = 2048;
+
+struct SharedState {
+    volatile LONG generation;
+    wchar_t names[2][kNamesChars];
+};
+
+// 32-bit and 64-bit processes read the same bytes, so the layout must not
+// differ between them. Checked at compile time for both, because a mismatch
+// would not fail - it would quietly match the wrong apps.
+static_assert(sizeof(LONG) == 4, "LONG must be 4 bytes");
+static_assert(sizeof(wchar_t) == 2, "wchar_t must be 2 bytes");
+static_assert(offsetof(SharedState, names) == 4, "names must follow the counter");
+static_assert(sizeof(SharedState) == 4 + 2 * kNamesChars * 2,
+              "SharedState must have no padding");
+
+constexpr PCWSTR kSharedSectionName = L"Local\\WindhawkWindowAnimationBlocker";
+
+HANDLE g_sharedMapping;
+SharedState* g_shared;
+LONG g_seenGeneration = -1;
+CRITICAL_SECTION g_decisionLock;
+
+std::wstring g_ownExeName;
+std::wstring g_ownAumid;
+std::vector<std::wstring> g_typedNames;   // from the settings box
+std::vector<std::wstring> g_folderNames;  // from the folder of shortcuts
+bool g_blockThisProcess = false;
+bool g_isResolverProcess = false;
+
+void OpenSharedState() {
+    // Create-or-open, so no process has to go first.
+    g_sharedMapping =
+        CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+                           sizeof(SharedState), kSharedSectionName);
+    if (!g_sharedMapping) {
         return;
     }
-    if (event == EVENT_SYSTEM_FOREGROUND) {
-        UpdateGlobalSuppression(hwnd);
+    g_shared = (SharedState*)MapViewOfFile(g_sharedMapping, FILE_MAP_WRITE, 0, 0,
+                                           sizeof(SharedState));
+}
+
+void CloseSharedState() {
+    if (g_shared) {
+        UnmapViewOfFile(g_shared);
+        g_shared = nullptr;
     }
-    // On create and show, suppress straight away if this window is one of
-    // ours, rather than waiting for the next sweep. Create is the earliest
-    // notice Windows gives that the window exists, which is the best shot at
-    // getting in before it animates itself in.
-    if ((event == EVENT_OBJECT_CREATE || event == EVENT_OBJECT_SHOW) &&
-        g_method == Method::Running && IsBlockedWindow(hwnd)) {
-        SetGlobalSuppressed(true);
-    }
-    if (g_method == Method::Dwm || g_method == Method::Both ||
-        g_method == Method::Running) {
-        ApplyToWindow(hwnd);
+    if (g_sharedMapping) {
+        CloseHandle(g_sharedMapping);
+        g_sharedMapping = nullptr;
     }
 }
 
-void StartHooks() {
-    if (!g_showHook) {
-        g_showHook = SetWinEventHook(
-            EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, nullptr, WinEventProc, 0, 0,
-            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+// Resolver only.
+void PublishNames(const std::wstring& text) {
+    if (!g_shared) {
+        return;
     }
-    if (!g_foregroundHook) {
-        g_foregroundHook = SetWinEventHook(
-            EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
-            WinEventProc, 0, 0,
-            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    }
+    LONG current = g_shared->generation;
+    int slot = (int)((current + 1) & 1);
+    size_t count = text.size() < kNamesChars - 1 ? text.size()
+                                                 : kNamesChars - 1;
+    wchar_t* destination = (wchar_t*)g_shared->names[slot];
+    memcpy(destination, text.data(), count * sizeof(wchar_t));
+    destination[count] = L'\0';
+    // The list is in place before anyone is told to look at it.
+    InterlockedExchange(&g_shared->generation, current + 1);
 }
 
-void StopHooks() {
-    if (g_showHook) {
-        UnhookWinEvent(g_showHook);
-        g_showHook = nullptr;
+std::vector<std::wstring> SettingLines(PCWSTR settingName) {
+    std::vector<std::wstring> names;
+    PCWSTR value = Wh_GetStringSetting(settingName);
+    if (!value) {
+        return names;
     }
-    if (g_foregroundHook) {
-        UnhookWinEvent(g_foregroundHook);
-        g_foregroundHook = nullptr;
+    std::wstring text(value);
+    Wh_FreeStringSetting(value);
+    for (auto& ch : text) {
+        if (ch == L'\r') {
+            ch = L'\n';
+        }
     }
+    for (auto& name : SplitOn(text, L'\n')) {
+        names.push_back(BaseName(name));
+    }
+    return names;
+}
+
+// Pure: just works out whether this process is one the user picked.
+void RecomputeDecision() {
+    auto matches = [](const std::vector<std::wstring>& names,
+                      const std::wstring& candidate) {
+        return !candidate.empty() &&
+               std::find(names.begin(), names.end(), candidate) != names.end();
+    };
+
+    bool wanted = matches(g_folderNames, g_ownExeName) ||
+                  matches(g_folderNames, g_ownAumid) ||
+                  matches(g_typedNames, g_ownExeName) ||
+                  matches(g_typedNames, g_ownAumid);
+
+    if (wanted != g_blockThisProcess) {
+        Wh_Log(L"%s: open/close animations %s", g_ownExeName.c_str(),
+               wanted ? L"now blocked" : L"no longer blocked");
+    }
+    g_blockThisProcess = wanted;
+}
+
+// Memory only - safe to call from inside a hook.
+void ReadFolderNamesFromShared() {
+    g_folderNames.clear();
+    if (!g_shared) {
+        return;
+    }
+    int slot = (int)(g_seenGeneration & 1);
+    wchar_t buffer[kNamesChars];
+    memcpy(buffer, (const void*)g_shared->names[slot], sizeof(buffer));
+    buffer[kNamesChars - 1] = L'\0';
+    g_folderNames = SplitOn(buffer, L'\n');
+}
+
+// Uses the Windhawk API, so only from Wh_ModInit, Wh_ModSettingsChanged and the
+// resolver thread - never from a hook.
+void ReloadFromWindhawk() {
+    g_typedNames = SettingLines(L"apps");
+
+    if (g_ownAumid.empty()) {
+        // shell32 may not have been loaded yet when this process started.
+        g_ownAumid = OwnAppUserModelId();
+    }
+
+    if (g_shared) {
+        g_seenGeneration = g_shared->generation;
+        ReadFolderNamesFromShared();
+    }
+    if (g_folderNames.empty()) {
+        // Nothing in the section yet - Explorer's resolver may not have run.
+        // The published copy in Windhawk's own storage outlives it.
+        wchar_t stored[kNamesChars] = {};
+        if (Wh_GetStringValue(kResolvedValueName, stored, ARRAYSIZE(stored))) {
+            g_folderNames = SplitOn(stored, L'\n');
+        }
+    }
+
+    RecomputeDecision();
+}
+
+// On the hot path. A plain read unless the list actually changed.
+bool ShouldBlockHere() {
+    if (g_shared) {
+        LONG current = g_shared->generation;
+        if (current != g_seenGeneration) {
+            EnterCriticalSection(&g_decisionLock);
+            if (g_shared->generation != g_seenGeneration) {
+                g_seenGeneration = g_shared->generation;
+                ReadFolderNamesFromShared();
+                RecomputeDecision();
+            }
+            LeaveCriticalSection(&g_decisionLock);
+        }
+    }
+    return g_blockThisProcess;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// The UI thread and the mod's lifecycle
+// The actual suppression
+//
+// The technique is from "Disable Window Open/Close Animations" by Lockframe in
+// the Windhawk catalogue. DWMWA_TRANSITIONS_FORCEDISABLED only suppresses the
+// open and close animation if it is set in the same breath as the call that
+// shows or hides the window - from outside the process, reacting to a window
+// that already exists, it is always too late. So the four calls that make a
+// window appear or disappear are hooked here, inside the app, and the attribute
+// is set immediately before delegating and released 50 ms later so that
+// minimise, restore and snap keep their animations.
 
-bool FolderOpenRequestedBySetting() {
-    return Wh_GetIntSetting(L"openFolder") != 0;
+constexpr UINT kRestoreDelayMs = 50;
+constexpr UINT_PTR kRestoreTimerId = 0x57414231;  // 'WAB1'
+
+void SetTransitionsDisabled(HWND window, BOOL disable) {
+    if (IsWindow(window)) {
+        DwmSetWindowAttribute(window, DWMWA_TRANSITIONS_FORCEDISABLED, &disable,
+                              sizeof(disable));
+    }
 }
 
-LRESULT CALLBACK HostWndProc(HWND hwnd, UINT message, WPARAM wParam,
-                             LPARAM lParam) {
-    if (message == WM_APP_TRAY) {
-        switch (LOWORD(lParam)) {
-            case WM_LBUTTONUP:
-                OpenDropFolder();
-                return 0;
-            case WM_RBUTTONUP:
-            case WM_CONTEXTMENU:
-                ShowTrayMenu();
-                return 0;
+// Touching DWM attributes on the shell's own windows destabilises Explorer, and
+// a window with no frame has no open or close animation to suppress anyway.
+bool IsSuppressibleWindow(HWND window) {
+    if (!ShouldBlockHere()) {
+        return false;
+    }
+    if (!IsWindow(window)) {
+        return false;
+    }
+
+    LONG_PTR style = GetWindowLongPtrW(window, GWL_STYLE);
+    if (style & WS_CHILD) {
+        return false;
+    }
+    if (!(style & (WS_CAPTION | WS_THICKFRAME))) {
+        return false;
+    }
+
+    LONG_PTR exStyle = GetWindowLongPtrW(window, GWL_EXSTYLE);
+    if (exStyle & WS_EX_TOOLWINDOW) {
+        return false;
+    }
+
+    if (GetAncestor(window, GA_ROOT) != window) {
+        return false;
+    }
+
+    wchar_t className[64] = {};
+    if (GetClassNameW(window, className, ARRAYSIZE(className))) {
+        static PCWSTR kShellClasses[] = {
+            L"Shell_TrayWnd",
+            L"Progman",
+            L"WorkerW",
+            L"Windows.UI.Core.CoreWindow",
+            L"DV2ControlHost",
+        };
+        for (PCWSTR shellClass : kShellClasses) {
+            if (wcscmp(className, shellClass) == 0) {
+                return false;
+            }
         }
-        return 0;
     }
-    if (g_taskbarCreatedMessage && message == g_taskbarCreatedMessage) {
-        g_trayIconAdded = false;
-        UpdateTrayIcon();
-        return 0;
+
+    return true;
+}
+
+VOID CALLBACK RestoreTimerProc(HWND window, UINT, UINT_PTR timerId, DWORD) {
+    KillTimer(window, timerId);
+    SetTransitionsDisabled(window, FALSE);
+}
+
+void ScheduleRestore(HWND window) {
+    SetTimer(window, kRestoreTimerId, kRestoreDelayMs, RestoreTimerProc);
+}
+
+using ShowWindow_t = BOOL(WINAPI*)(HWND, int);
+using SetWindowPos_t = BOOL(WINAPI*)(HWND, HWND, int, int, int, int, UINT);
+using DestroyWindow_t = BOOL(WINAPI*)(HWND);
+using AnimateWindow_t = BOOL(WINAPI*)(HWND, DWORD, DWORD);
+
+ShowWindow_t ShowWindow_Original;
+SetWindowPos_t SetWindowPos_Original;
+DestroyWindow_t DestroyWindow_Original;
+AnimateWindow_t AnimateWindow_Original;
+
+BOOL WINAPI ShowWindow_Hook(HWND window, int command) {
+    if (!IsSuppressibleWindow(window)) {
+        return ShowWindow_Original(window, command);
     }
-    switch (message) {
-        case WM_HOTKEY:
-            if ((int)wParam == kFolderHotkeyId) {
-                Wh_Log(L"Hotkey pressed");
-                OpenDropFolder();
-            }
-            return 0;
-        case WM_COMMAND:
-            if (LOWORD(wParam) == kCmdOpenFolder) {
-                OpenDropFolder();
-            }
-            return 0;
-        case WM_TIMER:
-            if (wParam == kSweepTimerId) {
-                // Re-reading the folder every tick is what makes dragging a
-                // shortcut in take effect on its own, with nothing to save.
-                ReloadEntries();
-                if (g_method != Method::Global) {
-                    SweepAllWindows();
+
+    // Minimise, restore and maximise are animations the user did not ask to
+    // lose, so make sure a pending restore does not leave them suppressed.
+    if (command == SW_MINIMIZE || command == SW_SHOWMINIMIZED ||
+        command == SW_RESTORE || command == SW_MAXIMIZE) {
+        KillTimer(window, kRestoreTimerId);
+        SetTransitionsDisabled(window, FALSE);
+        return ShowWindow_Original(window, command);
+    }
+
+    if (command == SW_HIDE) {
+        if (IsWindowVisible(window)) {
+            SetTransitionsDisabled(window, TRUE);
+        }
+        BOOL result = ShowWindow_Original(window, command);
+        ScheduleRestore(window);
+        return result;
+    }
+
+    // Any other command on a window that is not on screen yet is the open.
+    if (!IsWindowVisible(window)) {
+        SetTransitionsDisabled(window, TRUE);
+        BOOL result = ShowWindow_Original(window, command);
+        ScheduleRestore(window);
+        return result;
+    }
+
+    return ShowWindow_Original(window, command);
+}
+
+BOOL WINAPI SetWindowPos_Hook(HWND window,
+                              HWND insertAfter,
+                              int x,
+                              int y,
+                              int cx,
+                              int cy,
+                              UINT flags) {
+    if (!(flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW)) ||
+        !IsSuppressibleWindow(window)) {
+        return SetWindowPos_Original(window, insertAfter, x, y, cx, cy, flags);
+    }
+
+    bool showing = (flags & SWP_SHOWWINDOW) != 0;
+    if (showing != (IsWindowVisible(window) != FALSE)) {
+        SetTransitionsDisabled(window, TRUE);
+        BOOL result =
+            SetWindowPos_Original(window, insertAfter, x, y, cx, cy, flags);
+        ScheduleRestore(window);
+        return result;
+    }
+
+    return SetWindowPos_Original(window, insertAfter, x, y, cx, cy, flags);
+}
+
+BOOL WINAPI DestroyWindow_Hook(HWND window) {
+    if (IsWindowVisible(window) && IsSuppressibleWindow(window)) {
+        SetTransitionsDisabled(window, TRUE);
+    }
+    return DestroyWindow_Original(window);
+}
+
+BOOL WINAPI AnimateWindow_Hook(HWND window, DWORD duration, DWORD flags) {
+    // This call exists only to animate, so for a chosen app replace it with the
+    // plain show or hide it was asking for.
+    if (IsSuppressibleWindow(window)) {
+        if (flags & AW_HIDE) {
+            return ShowWindow_Original(window, SW_HIDE);
+        }
+        return ShowWindow_Original(window, SW_SHOW);
+    }
+    return AnimateWindow_Original(window, duration, flags);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// The folder of shortcuts
+
+struct ResolvedApp {
+    std::wstring shortcutName;            // Glaido.lnk
+    std::vector<std::wstring> matches;    // glaido-core.exe, and/or an app id
+    std::wstring note;                    // why, when it is not obvious
+};
+
+std::wstring DefaultDropFolder() {
+    PWSTR localAppData = nullptr;
+    std::wstring base;
+    if (SUCCEEDED(SHGetKnownFolderPath(kFolderIdLocalAppData, 0, nullptr,
+                                       &localAppData)) &&
+        localAppData) {
+        base = localAppData;
+    }
+    if (localAppData) {
+        CoTaskMemFree(localAppData);
+    }
+    if (base.empty()) {
+        wchar_t fromEnv[MAX_PATH * 2] = {};
+        if (GetEnvironmentVariableW(L"LOCALAPPDATA", fromEnv,
+                                    ARRAYSIZE(fromEnv))) {
+            base = fromEnv;
+        }
+    }
+    if (base.empty()) {
+        return std::wstring();
+    }
+    if (base.back() != L'\\') {
+        base += L'\\';
+    }
+    return base + kFolderLeafName;
+}
+
+std::wstring DropFolderPath() {
+    PCWSTR setting = Wh_GetStringSetting(L"dropFolder");
+    std::wstring chosen = setting ? TrimCopy(setting) : std::wstring();
+    if (setting) {
+        Wh_FreeStringSetting(setting);
+    }
+    if (!chosen.empty()) {
+        chosen = ExpandEnv(chosen);
+        while (!chosen.empty() && chosen.back() == L'\\') {
+            chosen.pop_back();
+        }
+        bool absolute = (chosen.size() >= 3 && chosen[1] == L':' &&
+                         chosen[2] == L'\\') ||
+                        (chosen.size() >= 2 && chosen[0] == L'\\' &&
+                         chosen[1] == L'\\');
+        if (absolute) {
+            return chosen;
+        }
+        Wh_Log(L"'%s' is not a full path, falling back to the default folder",
+               chosen.c_str());
+    }
+    return DefaultDropFolder();
+}
+
+bool LooksLikeExeName(const std::wstring& name) {
+    return name.size() > 4 && name.compare(name.size() - 4, 4, L".exe") == 0;
+}
+
+// Electron and Squirrel apps ship a shortcut to a shared Update.exe and name
+// the real executable in the arguments, so the shortcut's own target is useless
+// for matching.
+bool LooksLikeLauncherStub(const std::wstring& exeName) {
+    std::wstring lower = ToLowerCopy(exeName);
+    return lower == L"update.exe" || lower == L"squirrel.exe" ||
+           lower == L"stub.exe";
+}
+
+std::wstring ExeNameFromStubArguments(const std::wstring& arguments) {
+    static PCWSTR kFlags[] = {L"--processstart", L"--process-start",
+                              L"-processstart", L"--processstartandwait"};
+    std::wstring lower = ToLowerCopy(arguments);
+    for (PCWSTR flag : kFlags) {
+        size_t at = lower.find(flag);
+        if (at == std::wstring::npos) {
+            continue;
+        }
+        size_t cursor = at + wcslen(flag);
+        while (cursor < arguments.size() &&
+               (arguments[cursor] == L' ' || arguments[cursor] == L'=')) {
+            cursor++;
+        }
+        bool quoted = cursor < arguments.size() && arguments[cursor] == L'"';
+        if (quoted) {
+            cursor++;
+        }
+        size_t end = cursor;
+        while (end < arguments.size() &&
+               !(quoted ? arguments[end] == L'"' : arguments[end] == L' ')) {
+            end++;
+        }
+        std::wstring name = TrimCopy(arguments.substr(cursor, end - cursor));
+        if (!name.empty()) {
+            return ToLowerCopy(BaseName(name));
+        }
+    }
+    return std::wstring();
+}
+
+// Looks a property up by its canonical name, so the key does not have to be
+// written down here. Only the resolver process calls this.
+bool PropertyKeyByName(PCWSTR name, PROPERTYKEY* key) {
+    using FromName_t = HRESULT(WINAPI*)(PCWSTR, PROPERTYKEY*);
+    static FromName_t fromName = []() -> FromName_t {
+        HMODULE propsys = LoadLibraryExW(L"propsys.dll", nullptr,
+                                         LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!propsys) {
+            return nullptr;
+        }
+        return (FromName_t)GetProcAddress(propsys, "PSGetPropertyKeyFromName");
+    }();
+    return fromName && SUCCEEDED(fromName(name, key));
+}
+
+std::wstring ShellItemString(IShellItem2* item, const PROPERTYKEY& key) {
+    PWSTR value = nullptr;
+    std::wstring result;
+    if (SUCCEEDED(item->GetString(key, &value)) && value) {
+        result = TrimCopy(value);
+        CoTaskMemFree(value);
+    }
+    return result;
+}
+
+// A shortcut dragged out of shell:AppsFolder - the way the readme tells the
+// user to make one - has no file target at all. What it does have is an
+// AppUserModelId and, for an ordinary desktop app, a link back to the real
+// executable. Collect whichever of the two Windows will part with: an
+// executable name is the sturdier match, and the app id covers Store apps and
+// anything that renames its own process.
+void AddShellMatches(IShellLinkW* link, ResolvedApp* out) {
+    PIDLIST_ABSOLUTE idList = nullptr;
+    if (FAILED(link->GetIDList(&idList)) || !idList) {
+        return;
+    }
+
+    IShellItem2* item = nullptr;
+    if (SUCCEEDED(SHCreateItemFromIDList(idList, kIidShellItem2,
+                                         (void**)&item)) &&
+        item) {
+        PROPERTYKEY targetKey;
+        if (PropertyKeyByName(L"System.Link.TargetParsingPath", &targetKey)) {
+            std::wstring target = ShellItemString(item, targetKey);
+            std::wstring exeName = ToLowerCopy(BaseName(target));
+            if (LooksLikeExeName(exeName)) {
+                if (LooksLikeLauncherStub(exeName)) {
+                    wchar_t arguments[2048] = {};
+                    link->GetArguments(arguments, ARRAYSIZE(arguments));
+                    std::wstring real = ExeNameFromStubArguments(arguments);
+                    if (!real.empty()) {
+                        exeName = real;
+                        out->note = L"via the " + ToLowerCopy(BaseName(target)) +
+                                    L" launcher";
+                    }
                 }
-                UpdateForForeground(GetForegroundWindow());
-                UpdateTrayIcon();
-                WriteStatusFile();
-                return 0;
+                out->matches.push_back(exeName);
             }
-            break;
+        }
+
+        std::wstring aumid =
+            ToLowerCopy(ShellItemString(item, kPkeyAppUserModelId));
+        if (!aumid.empty()) {
+            out->matches.push_back(aumid);
+        }
+
+        item->Release();
     }
-    return DefWindowProcW(hwnd, message, wParam, lParam);
+
+    ILFree(idList);
 }
 
-DWORD WINAPI UiThreadProc(LPVOID) {
-    // The shortcut reading below is COM, and this is the thread that does it.
-    HRESULT comInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-
-    Gdiplus::GdiplusStartupInput gdiplusStartupInput;
-    Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput, nullptr);
-
-    WNDCLASSEXW windowClass = {sizeof(windowClass)};
-    windowClass.lpfnWndProc = HostWndProc;
-    windowClass.hInstance = g_hInst;
-    windowClass.lpszClassName = L"WH_WindowAnimationBlocker";
-    RegisterClassExW(&windowClass);
-
-    // Not message-only: the tray menu has to be able to take the foreground.
-    g_hostWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"WH_WindowAnimationBlocker",
-                                L"", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr,
-                                g_hInst, nullptr);
-    if (!g_hostWnd) {
-        Wh_Log(L"CreateWindowEx for the host window failed (%u)",
-               GetLastError());
-        SetEvent(g_readyEvent);
-        if (SUCCEEDED(comInit)) {
-            CoUninitialize();
-        }
-        return 1;
-    }
-    g_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
-
-    if (Wh_GetIntSetting(L"folderHotkey") != 0) {
-        if (RegisterHotKey(g_hostWnd, kFolderHotkeyId,
-                           MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT,
-                           'P')) {
-            Wh_Log(L"Ctrl+Alt+Shift+P will open the apps folder");
-        } else {
-            // Almost always something else already owns the combination.
-            Wh_Log(L"Could not register Ctrl+Alt+Shift+P (%u)", GetLastError());
-        }
+bool ResolveShortcut(const std::wstring& fullPath, ResolvedApp* out) {
+    IShellLinkW* link = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                                kIidShellLinkW, (void**)&link)) ||
+        !link) {
+        return false;
     }
 
-    RecoverGlobalAnimation();
+    bool resolved = false;
+    IPersistFile* file = nullptr;
+    if (SUCCEEDED(link->QueryInterface(kIidPersistFile, (void**)&file)) &&
+        file) {
+        if (SUCCEEDED(file->Load(fullPath.c_str(), STGM_READ))) {
+            wchar_t target[MAX_PATH * 2] = {};
+            // SLGP_RAWPATH: resolving would hit the network for a shortcut whose
+            // target has moved, and the raw path is what we want anyway.
+            link->GetPath(target, ARRAYSIZE(target), nullptr, SLGP_RAWPATH);
 
-    bool folderWasCreated = false;
-    const bool folderReady = PrepareDropFolder(&folderWasCreated);
-    Wh_Log(L"Drop app shortcuts into: %s", g_dropFolder.c_str());
-    ReloadEntries();
-
-    StartHooks();
-    SweepAllWindows();
-    UpdateForForeground(GetForegroundWindow());
-    UpdateTrayIcon();
-    WriteStatusFile();
-    SetTimer(g_hostWnd, kSweepTimerId, kSweepIntervalMs, nullptr);
-
-    // Signalled before anything is shown: WhTool_ModInit waits on this, and
-    // ShellExecute is not always quick.
-    SetEvent(g_readyEvent);
-
-    // Shown when the folder has just been made, which is the one moment it is
-    // certain nobody knows where it is.
-    if (FolderOpenRequestedBySetting()) {
-        Wh_Log(L"Opening the folder: the setting asked for it");
-        OpenDropFolder();
-    } else if (folderReady && folderWasCreated) {
-        Wh_Log(L"Opening the folder: it has just been created");
-        OpenDropFolder();
-    }
-
-    MSG msg;
-    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        if (msg.hwnd == nullptr && msg.message == WM_APP_QUIT) {
-            PostQuitMessage(0);
-            continue;
-        }
-        if (msg.hwnd == nullptr && msg.message == WM_APP_SETTINGS) {
-            LoadSettings();
-            PrepareDropFolder();
-            ReloadEntries();
-            // The list may have shrunk, so everything is handed back before
-            // being re-applied from the new list.
-            ReleaseAllWindows();
-            SweepAllWindows();
-            UpdateForForeground(GetForegroundWindow());
-            UpdateTrayIcon();
-            if (FolderOpenRequestedBySetting()) {
-                OpenDropFolder();
+            std::wstring exeName = ToLowerCopy(BaseName(target));
+            if (!exeName.empty() && LooksLikeLauncherStub(exeName)) {
+                wchar_t arguments[2048] = {};
+                link->GetArguments(arguments, ARRAYSIZE(arguments));
+                std::wstring real = ExeNameFromStubArguments(arguments);
+                if (!real.empty()) {
+                    out->matches.push_back(real);
+                    out->note = L"via the " + exeName + L" launcher";
+                }
             }
-            continue;
+            if (out->matches.empty() && !exeName.empty()) {
+                out->matches.push_back(exeName);
+            }
+
+            // Ask the shell as well, even when the file target worked: a
+            // shortcut made by dragging from shell:AppsFolder has no target,
+            // and one that does have a target may still name a different
+            // executable than the one that ends up running.
+            AddShellMatches(link, out);
+
+            std::sort(out->matches.begin(), out->matches.end());
+            out->matches.erase(
+                std::unique(out->matches.begin(), out->matches.end()),
+                out->matches.end());
+            resolved = !out->matches.empty();
         }
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+        file->Release();
     }
 
-    KillTimer(g_hostWnd, kSweepTimerId);
-    UnregisterHotKey(g_hostWnd, kFolderHotkeyId);
-    StopHooks();
-    RemoveTrayIcon();
-    ReleaseAllWindows();
-    RestoreGlobalAnimation();
+    link->Release();
+    return resolved;
+}
 
-    if (g_trayIcon) {
-        DestroyIcon(g_trayIcon);
-        g_trayIcon = nullptr;
+////////////////////////////////////////////////////////////////////////////////
+// The resolver: one process watches the folder for everybody else
+
+HANDLE g_workerThread;
+HANDLE g_workerWakeEvent;
+HANDLE g_workerExitEvent;
+constexpr int kHotkeyId = 0x5741;  // 'WA'
+
+void WriteDropFolderReadme(const std::wstring& folder) {
+    std::wstring path = folder + L"\\How to use this folder.txt";
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        return;
     }
-    if (g_hostWnd) {
-        DestroyWindow(g_hostWnd);
-        g_hostWnd = nullptr;
+
+    static const char kText[] =
+        "Window Animation Blocker\r\n"
+        "========================\r\n"
+        "\r\n"
+        "Put a shortcut to an app in this folder and that app stops animating\r\n"
+        "when its windows open and close. Delete the shortcut and it animates\r\n"
+        "again. Changes are picked up within a few seconds - the app does not\r\n"
+        "need restarting.\r\n"
+        "\r\n"
+        "The quickest way to add one:\r\n"
+        "\r\n"
+        "  1. Open an Explorer window.\r\n"
+        "  2. Type  shell:AppsFolder  in the address bar and press Enter.\r\n"
+        "     That is Windows' own list of everything installed.\r\n"
+        "  3. Drag an app from there into this folder. Explorer makes the\r\n"
+        "     shortcut for you.\r\n"
+        "\r\n"
+        "A shortcut from the Start menu or the desktop works just as well.\r\n"
+        "\r\n"
+        "_status.txt, next to this file, is rewritten every time the folder\r\n"
+        "changes. It lists what was read, what each shortcut resolved to, and\r\n"
+        "which of those apps are running right now. If an app still animates,\r\n"
+        "read that file first.\r\n"
+        "\r\n"
+        "Minimising, restoring, maximising and snapping are left alone on\r\n"
+        "purpose. Only the open and close animation is suppressed.\r\n";
+
+    HANDLE handle = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return;
     }
-    if (g_gdiplusToken) {
-        Gdiplus::GdiplusShutdown(g_gdiplusToken);
-        g_gdiplusToken = 0;
+    DWORD written = 0;
+    WriteFile(handle, kText, (DWORD)(sizeof(kText) - 1), &written, nullptr);
+    CloseHandle(handle);
+}
+
+// Returns true if the folder had to be created, which is the one reliable sign
+// that this is the first run.
+bool PrepareDropFolder(const std::wstring& folder) {
+    if (folder.empty()) {
+        return false;
     }
-    if (SUCCEEDED(comInit)) {
-        CoUninitialize();
+    bool existed = GetFileAttributesW(folder.c_str()) != INVALID_FILE_ATTRIBUTES;
+    if (!existed) {
+        int result = SHCreateDirectoryExW(nullptr, folder.c_str(), nullptr);
+        if (result != ERROR_SUCCESS && result != ERROR_ALREADY_EXISTS &&
+            result != ERROR_FILE_EXISTS) {
+            Wh_Log(L"could not create '%s' (%d)", folder.c_str(), result);
+            return false;
+        }
+        Wh_Log(L"created '%s'", folder.c_str());
     }
+    WriteDropFolderReadme(folder);
+    return !existed;
+}
+
+void OpenDropFolder(const std::wstring& folder) {
+    if (folder.empty()) {
+        return;
+    }
+    PrepareDropFolder(folder);
+    ShellExecuteW(nullptr, L"open", folder.c_str(), nullptr, nullptr,
+                  SW_SHOWNORMAL);
+}
+
+std::vector<std::wstring> RunningProcessNames() {
+    std::vector<std::wstring> names;
+
+    using CreateSnapshot_t = HANDLE(WINAPI*)(DWORD, DWORD);
+    using ProcessWalk_t = BOOL(WINAPI*)(HANDLE, LPPROCESSENTRY32W);
+
+    HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+    if (!kernel) {
+        return names;
+    }
+    auto createSnapshot =
+        (CreateSnapshot_t)GetProcAddress(kernel, "CreateToolhelp32Snapshot");
+    auto first = (ProcessWalk_t)GetProcAddress(kernel, "Process32FirstW");
+    auto next = (ProcessWalk_t)GetProcAddress(kernel, "Process32NextW");
+    if (!createSnapshot || !first || !next) {
+        return names;
+    }
+
+    HANDLE snapshot = createSnapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return names;
+    }
+
+    PROCESSENTRY32W entry = {};
+    entry.dwSize = sizeof(entry);
+    if (first(snapshot, &entry)) {
+        do {
+            names.push_back(ToLowerCopy(entry.szExeFile));
+        } while (next(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+
+    std::sort(names.begin(), names.end());
+    names.erase(std::unique(names.begin(), names.end()), names.end());
+    return names;
+}
+
+
+void WriteStatusFile(const std::wstring& folder,
+                     const std::vector<ResolvedApp>& apps,
+                     const std::vector<std::wstring>& unreadable,
+                     const std::vector<std::wstring>& typed) {
+    if (folder.empty()) {
+        return;
+    }
+
+    std::vector<std::wstring> running = RunningProcessNames();
+    auto isRunning = [&running](const std::wstring& name) {
+        return std::binary_search(running.begin(), running.end(), name);
+    };
+
+    std::wstring text;
+    text += L"Window Animation Blocker - what the mod can currently see\r\n";
+    text += L"=========================================================\r\n\r\n";
+    text += L"Rewritten every time this folder changes. If an app still\r\n";
+    text += L"animates, this file says why.\r\n\r\n";
+    text += L"Watching: " + folder + L"\r\n\r\n";
+
+    if (apps.empty() && typed.empty()) {
+        text += L"No apps are being blocked, because nothing was found.\r\n\r\n";
+        text += L"Drop a shortcut to an app into this folder. Open an Explorer\r\n";
+        text += L"window, type  shell:AppsFolder  in the address bar, and drag\r\n";
+        text += L"an app from there into here.\r\n";
+    } else {
+        text += L"Shortcuts read from this folder: " +
+                std::to_wstring(apps.size()) + L"\r\n\r\n";
+        for (const auto& app : apps) {
+            text += L"  " + app.shortcutName;
+            if (!app.note.empty()) {
+                text += L"   (" + app.note + L")";
+            }
+            text += L"\r\n";
+            for (const auto& match : app.matches) {
+                text += L"      matches " + match;
+                if (!LooksLikeExeName(match)) {
+                    text += L"   (an app id, not an executable)";
+                } else if (isRunning(match)) {
+                    text += L"   - running right now";
+                } else {
+                    text += L"   - not running";
+                }
+                text += L"\r\n";
+            }
+            text += L"\r\n";
+        }
+
+        if (!typed.empty()) {
+            text += L"Typed into the settings: " + std::to_wstring(typed.size()) +
+                    L"\r\n";
+            for (const auto& name : typed) {
+                text += L"  " + name + L"\r\n";
+            }
+            text += L"\r\n";
+        }
+    }
+
+    if (!unreadable.empty()) {
+        text += L"Could not be read: " + std::to_wstring(unreadable.size()) +
+                L"\r\n";
+        for (const auto& name : unreadable) {
+            text += L"  " + name + L"\r\n";
+        }
+        text += L"\r\nThose files are in the folder but Windows would not tell\r\n";
+        text += L"the mod what they point at. A plain shortcut made by dragging\r\n";
+        text += L"from shell:AppsFolder normally works; a .url file or an\r\n";
+        text += L"installer stub may not.\r\n\r\n";
+    }
+
+    text += L"How the blocking works\r\n";
+    text += L"----------------------\r\n";
+    text += L"The mod runs inside each app you picked and suppresses the open\r\n";
+    text += L"and close animation at the moment the window appears or goes\r\n";
+    text += L"away. Nothing system-wide is changed, so the Start menu, the\r\n";
+    text += L"taskbar and every app you did not pick keep their animations,\r\n";
+    text += L"and so do minimise, restore, maximise and snap on the apps you\r\n";
+    text += L"did pick.\r\n\r\n";
+    text += L"An app has to be matched by one of the names above. If every\r\n";
+    text += L"executable listed for a shortcut says 'not running' while the app\r\n";
+    text += L"is clearly open, then it starts the real program under a name\r\n";
+    text += L"Windows did not disclose. Find that name in Task Manager, under\r\n";
+    text += L"Details, and put it in the 'Extra apps' setting.\r\n";
+
+    // Creating the file is itself a change to this folder, so avoid making
+    // one when there is nothing new to say.
+    static std::wstring lastWritten;
+    if (text == lastWritten) {
+        return;
+    }
+    lastWritten = text;
+
+    std::wstring path = folder + L"\\_status.txt";
+    HANDLE handle = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                                nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                                nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        Wh_Log(L"could not write '%s' (%u)", path.c_str(), GetLastError());
+        return;
+    }
+    // A BOM, so Notepad reads it as UTF-16 rather than mojibake.
+    static const unsigned char kBom[] = {0xFF, 0xFE};
+    DWORD written = 0;
+    WriteFile(handle, kBom, sizeof(kBom), &written, nullptr);
+    WriteFile(handle, text.data(), (DWORD)(text.size() * sizeof(wchar_t)),
+              &written, nullptr);
+    CloseHandle(handle);
+}
+
+// Reads the folder, resolves every shortcut, and publishes the result for the
+// other processes. Returns the folder it looked at.
+std::wstring ScanAndPublish() {
+    std::wstring folder = DropFolderPath();
+    if (folder.empty()) {
+        Wh_Log(L"no folder to watch");
+        return folder;
+    }
+
+    std::vector<ResolvedApp> apps;
+    std::vector<std::wstring> unreadable;
+
+    std::wstring pattern = folder + L"\\*.lnk";
+    WIN32_FIND_DATAW found = {};
+    HANDLE search = FindFirstFileW(pattern.c_str(), &found);
+    if (search != INVALID_HANDLE_VALUE) {
+        do {
+            if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                continue;
+            }
+            ResolvedApp app;
+            app.shortcutName = found.cFileName;
+            if (ResolveShortcut(folder + L"\\" + found.cFileName, &app)) {
+                for (const auto& match : app.matches) {
+                    Wh_Log(L"'%s' matches '%s'", app.shortcutName.c_str(),
+                           match.c_str());
+                }
+                apps.push_back(app);
+            } else {
+                Wh_Log(L"could not resolve '%s'", app.shortcutName.c_str());
+                unreadable.push_back(app.shortcutName);
+            }
+        } while (FindNextFileW(search, &found));
+        FindClose(search);
+    }
+
+    std::wstring published;
+    for (const auto& app : apps) {
+        for (const auto& match : app.matches) {
+            published += match;
+            published += L'\n';
+        }
+    }
+
+    if (published.size() >= kNamesChars - 1) {
+        Wh_Log(L"the list of apps is too long to publish in full");
+        published.resize(kNamesChars - 2);
+        published.resize(published.rfind(L'\n') + 1);
+    }
+
+    wchar_t previous[kNamesChars] = {};
+    Wh_GetStringValue(kResolvedValueName, previous, ARRAYSIZE(previous));
+    bool changed = published != previous;
+    if (changed) {
+        // Kept in Windhawk's storage as well, so a process that starts before
+        // this thread has run still finds the list.
+        Wh_SetStringValue(kResolvedValueName, published.c_str());
+    }
+
+    // The section starts empty every boot, so the first pass always writes it
+    // even when nothing has changed since last time.
+    static bool publishedOnce = false;
+    if (changed || !publishedOnce) {
+        publishedOnce = true;
+        PublishNames(published);
+        Wh_Log(L"published %d app(s) to every process", (int)apps.size());
+    }
+
+    std::vector<std::wstring> typed;
+    PCWSTR setting = Wh_GetStringSetting(L"apps");
+    if (setting) {
+        std::wstring text(setting);
+        for (auto& ch : text) {
+            if (ch == L'\r') {
+                ch = L'\n';
+            }
+        }
+        typed = SplitOn(text, L'\n');
+        Wh_FreeStringSetting(setting);
+    }
+
+    WriteStatusFile(folder, apps, unreadable, typed);
+    return folder;
+}
+
+DWORD WINAPI ResolverThread(LPVOID) {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
+    std::wstring folder = DropFolderPath();
+    bool justCreated = PrepareDropFolder(folder);
+    ScanAndPublish();
+
+    if (justCreated) {
+        // Nothing has been dropped in yet, so show the user where it is.
+        OpenDropFolder(folder);
+    } else if (Wh_GetIntSetting(L"openFolder")) {
+        OpenDropFolder(folder);
+    }
+
+    bool hotkeyRegistered = false;
+    if (Wh_GetIntSetting(L"folderHotkey")) {
+        hotkeyRegistered = RegisterHotKey(nullptr, kHotkeyId,
+                                          MOD_CONTROL | MOD_ALT | MOD_SHIFT,
+                                          'P') != FALSE;
+        if (!hotkeyRegistered) {
+            Wh_Log(L"Ctrl+Alt+Shift+P is taken by something else");
+        }
+    }
+
+    HANDLE watch = INVALID_HANDLE_VALUE;
+    std::wstring watchedFolder;
+    auto startWatching = [&]() {
+        if (watch != INVALID_HANDLE_VALUE) {
+            FindCloseChangeNotification(watch);
+            watch = INVALID_HANDLE_VALUE;
+        }
+        watchedFolder = folder;
+        if (!folder.empty()) {
+            // File names only. Watching writes as well would be woken by
+            // _status.txt, which this mod writes into this very folder, and
+            // the rescan would write it again - an endless loop. A shortcut
+            // being added, deleted or renamed is a name change, and an edited
+            // target is caught by the timeout below.
+            watch = FindFirstChangeNotificationW(folder.c_str(), FALSE,
+                                                 FILE_NOTIFY_CHANGE_FILE_NAME);
+        }
+    };
+    startWatching();
+
+    for (;;) {
+        HANDLE waitOn[3];
+        DWORD count = 0;
+        waitOn[count++] = g_workerExitEvent;
+        waitOn[count++] = g_workerWakeEvent;
+        if (watch != INVALID_HANDLE_VALUE) {
+            waitOn[count++] = watch;
+        }
+
+        // The hotkey arrives as a thread message, so the wait has to include
+        // the message queue.
+        DWORD result = MsgWaitForMultipleObjects(count, waitOn, FALSE, 30000,
+                                                 QS_ALLINPUT);
+
+        if (result == WAIT_OBJECT_0) {
+            break;
+        }
+
+        bool rescan = false;
+
+        if (result == WAIT_OBJECT_0 + 1) {
+            // Settings changed.
+            folder = DropFolderPath();
+            if (folder != watchedFolder) {
+                PrepareDropFolder(folder);
+                startWatching();
+            }
+            if (Wh_GetIntSetting(L"openFolder")) {
+                OpenDropFolder(folder);
+            }
+            rescan = true;
+        } else if (count == 3 && result == WAIT_OBJECT_0 + 2) {
+            FindNextChangeNotification(watch);
+            rescan = true;
+        } else if (result == WAIT_TIMEOUT) {
+            // A safety net, in case a change notification was missed or the
+            // folder was deleted and remade.
+            rescan = true;
+        } else if (result == WAIT_OBJECT_0 + count) {
+            MSG message;
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                if (message.message == WM_HOTKEY &&
+                    message.wParam == kHotkeyId) {
+                    OpenDropFolder(folder);
+                }
+            }
+        } else {
+            break;
+        }
+
+        if (rescan) {
+            // Explorer makes a shortcut in two steps, so give it a moment to
+            // finish writing before reading it.
+            if (WaitForSingleObject(g_workerExitEvent, 300) == WAIT_OBJECT_0) {
+                break;
+            }
+            ScanAndPublish();
+        }
+    }
+
+    if (hotkeyRegistered) {
+        UnregisterHotKey(nullptr, kHotkeyId);
+    }
+    if (watch != INVALID_HANDLE_VALUE) {
+        FindCloseChangeNotification(watch);
+    }
+    CoUninitialize();
     return 0;
 }
 
-BOOL WhTool_ModInit() {
-    g_hInst = GetModuleHandleW(nullptr);
-    LoadSettings();
-
-    g_readyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!g_readyEvent) {
-        return FALSE;
-    }
-    g_uiThread = CreateThread(nullptr, 0, UiThreadProc, nullptr, 0, &g_uiThreadId);
-    if (!g_uiThread) {
-        CloseHandle(g_readyEvent);
-        g_readyEvent = nullptr;
-        return FALSE;
-    }
-    WaitForSingleObject(g_readyEvent, 5000);
-    return TRUE;
-}
-
-void WhTool_ModSettingsChanged() {
-    if (g_uiThreadId) {
-        PostThreadMessageW(g_uiThreadId, WM_APP_SETTINGS, 0, 0);
-    }
-}
-
-void WhTool_ModUninit() {
-    if (g_uiThreadId) {
-        PostThreadMessageW(g_uiThreadId, WM_APP_QUIT, 0, 0);
-    }
-    if (g_uiThread) {
-        if (WaitForSingleObject(g_uiThread, 5000) != WAIT_OBJECT_0) {
-            Wh_Log(L"UI thread did not exit in time");
-            // Last resort, but leaving the user's animations switched off
-            // would be worse than a forced exit.
-            RestoreGlobalAnimation();
-            ExitProcess(1);
-        }
-        CloseHandle(g_uiThread);
-        g_uiThread = nullptr;
-        g_uiThreadId = 0;
-    }
-    if (g_readyEvent) {
-        CloseHandle(g_readyEvent);
-        g_readyEvent = nullptr;
-    }
-}
-
 ////////////////////////////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////////////////////
-// Windhawk tool mod implementation for mods which don't need to inject to other
-// processes or hook other functions. Context:
-// https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-dedicated-process
-//
-// The mod will load and run in a dedicated windhawk.exe process.
-//
-// Paste the code below as part of the mod code, and use these callbacks:
-// * WhTool_ModInit
-// * WhTool_ModSettingsChanged
-// * WhTool_ModUninit
-//
-// Currently, other callbacks are not supported.
-
-bool g_isToolModProcessLauncher;
-HANDLE g_toolModProcessMutex;
-
-// How long a starting tool process waits for the previous one to let go.
-// Windhawk starts the replacement before the old process has finished its
-// uninit, so on every update the new one finds the mutex still held and, left
-// to the stock behaviour, gives up for good - the old one then exits and
-// nothing is running at all. Measured, the handover needs about 200ms.
-constexpr DWORD kToolModHandoverTimeoutMs = 3000;
-
-void WINAPI EntryPoint_Hook() {
-    Wh_Log(L">");
-    ExitThread(0);
-}
+// Windhawk entry points
 
 BOOL Wh_ModInit() {
-    DWORD sessionId;
-    if (ProcessIdToSessionId(GetCurrentProcessId(), &sessionId) &&
-        sessionId == 0) {
-        return FALSE;
-    }
+    InitializeCriticalSection(&g_decisionLock);
 
-    bool isExcluded = false;
-    bool isToolModProcess = false;
-    bool isCurrentToolModProcess = false;
-    int argc;
-    LPWSTR* argv = CommandLineToArgvW(GetCommandLine(), &argc);
-    if (!argv) {
-        Wh_Log(L"CommandLineToArgvW failed");
-        return FALSE;
-    }
+    g_ownExeName = OwnExeName();
+    g_ownAumid = OwnAppUserModelId();
 
-    for (int i = 1; i < argc; i++) {
-        if (wcscmp(argv[i], L"-service") == 0 ||
-            wcscmp(argv[i], L"-service-start") == 0 ||
-            wcscmp(argv[i], L"-service-stop") == 0) {
-            isExcluded = true;
-            break;
-        }
-    }
+    // Explorer is the one process that is always there, always has COM running,
+    // and is allowed to read the user's folders, so it does the resolving for
+    // everybody.
+    g_isResolverProcess = (g_ownExeName == L"explorer.exe");
 
-    for (int i = 1; i < argc - 1; i++) {
-        if (wcscmp(argv[i], L"-tool-mod") == 0) {
-            isToolModProcess = true;
-            if (wcscmp(argv[i + 1], WH_MOD_ID) == 0) {
-                isCurrentToolModProcess = true;
-            }
-            break;
-        }
-    }
+    OpenSharedState();
+    ReloadFromWindhawk();
 
-    LocalFree(argv);
+    // The hooks go in everywhere, because Wh_SetFunctionHook only works during
+    // init and the list of apps can change afterwards. Each hook checks
+    // ShouldBlockHere() first, which is a plain read unless the list changed.
+    Wh_SetFunctionHook((void*)ShowWindow, (void*)ShowWindow_Hook,
+                       (void**)&ShowWindow_Original);
+    Wh_SetFunctionHook((void*)SetWindowPos, (void*)SetWindowPos_Hook,
+                       (void**)&SetWindowPos_Original);
+    Wh_SetFunctionHook((void*)DestroyWindow, (void*)DestroyWindow_Hook,
+                       (void**)&DestroyWindow_Original);
+    Wh_SetFunctionHook((void*)AnimateWindow, (void*)AnimateWindow_Hook,
+                       (void**)&AnimateWindow_Original);
 
-    if (isExcluded) {
-        return FALSE;
-    }
-
-    if (isCurrentToolModProcess) {
-        g_toolModProcessMutex =
-            CreateMutex(nullptr, TRUE, L"windhawk-tool-mod_" WH_MOD_ID);
-        if (!g_toolModProcessMutex) {
-            Wh_Log(L"CreateMutex failed");
-            ExitProcess(1);
-        }
-
-        if (GetLastError() == ERROR_ALREADY_EXISTS) {
-            // Usually the previous instance on its way out rather than a
-            // genuine second copy, so wait for it before giving up. Owning an
-            // abandoned mutex counts too: that is the previous process having
-            // died without releasing it.
-            DWORD waited = WaitForSingleObject(g_toolModProcessMutex,
-                                               kToolModHandoverTimeoutMs);
-            if (waited != WAIT_OBJECT_0 && waited != WAIT_ABANDONED) {
-                Wh_Log(L"Tool mod already running (%s)", WH_MOD_ID);
-                ExitProcess(1);
-            }
-            Wh_Log(L"Took over from the previous instance");
-        }
-
-        if (!WhTool_ModInit()) {
-            ExitProcess(1);
-        }
-
-        IMAGE_DOS_HEADER* dosHeader =
-            (IMAGE_DOS_HEADER*)GetModuleHandle(nullptr);
-        IMAGE_NT_HEADERS* ntHeaders =
-            (IMAGE_NT_HEADERS*)((BYTE*)dosHeader + dosHeader->e_lfanew);
-
-        DWORD entryPointRVA = ntHeaders->OptionalHeader.AddressOfEntryPoint;
-        void* entryPoint = (BYTE*)dosHeader + entryPointRVA;
-
-        Wh_SetFunctionHook(entryPoint, (void*)EntryPoint_Hook, nullptr);
-        return TRUE;
-    }
-
-    if (isToolModProcess) {
-        return FALSE;
-    }
-
-    g_isToolModProcessLauncher = true;
     return TRUE;
 }
 
 void Wh_ModAfterInit() {
-    if (!g_isToolModProcessLauncher) {
+    if (!g_isResolverProcess) {
         return;
     }
-
-    WCHAR currentProcessPath[MAX_PATH];
-    switch (GetModuleFileName(nullptr, currentProcessPath,
-                              ARRAYSIZE(currentProcessPath))) {
-        case 0:
-        case ARRAYSIZE(currentProcessPath):
-            Wh_Log(L"GetModuleFileName failed");
-            return;
-    }
-
-    WCHAR
-    commandLine[MAX_PATH + 2 +
-                (sizeof(L" -tool-mod \"" WH_MOD_ID "\"") / sizeof(WCHAR)) - 1];
-    swprintf_s(commandLine, L"\"%s\" -tool-mod \"%s\"", currentProcessPath,
-               WH_MOD_ID);
-
-    HMODULE kernelModule = GetModuleHandle(L"kernelbase.dll");
-    if (!kernelModule) {
-        kernelModule = GetModuleHandle(L"kernel32.dll");
-        if (!kernelModule) {
-            Wh_Log(L"No kernelbase.dll/kernel32.dll");
-            return;
-        }
-    }
-
-    using CreateProcessInternalW_t = BOOL(WINAPI*)(
-        HANDLE hUserToken, LPCWSTR lpApplicationName, LPWSTR lpCommandLine,
-        LPSECURITY_ATTRIBUTES lpProcessAttributes,
-        LPSECURITY_ATTRIBUTES lpThreadAttributes, WINBOOL bInheritHandles,
-        DWORD dwCreationFlags, LPVOID lpEnvironment, LPCWSTR lpCurrentDirectory,
-        LPSTARTUPINFOW lpStartupInfo,
-        LPPROCESS_INFORMATION lpProcessInformation,
-        PHANDLE hRestrictedUserToken);
-    CreateProcessInternalW_t pCreateProcessInternalW =
-        (CreateProcessInternalW_t)GetProcAddress(kernelModule,
-                                                 "CreateProcessInternalW");
-    if (!pCreateProcessInternalW) {
-        Wh_Log(L"No CreateProcessInternalW");
+    g_workerWakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_workerExitEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_workerWakeEvent || !g_workerExitEvent) {
         return;
     }
-
-    STARTUPINFO si{
-        .cb = sizeof(STARTUPINFO),
-        .dwFlags = STARTF_FORCEOFFFEEDBACK,
-    };
-    PROCESS_INFORMATION pi;
-    if (!pCreateProcessInternalW(nullptr, currentProcessPath, commandLine,
-                                 nullptr, nullptr, FALSE, NORMAL_PRIORITY_CLASS,
-                                 nullptr, nullptr, &si, &pi, nullptr)) {
-        Wh_Log(L"CreateProcess failed");
-        return;
-    }
-
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
+    g_workerThread = CreateThread(nullptr, 0, ResolverThread, nullptr, 0,
+                                  nullptr);
 }
 
 void Wh_ModSettingsChanged() {
-    if (g_isToolModProcessLauncher) {
-        return;
+    ReloadFromWindhawk();
+    if (g_workerWakeEvent) {
+        SetEvent(g_workerWakeEvent);
     }
-
-    WhTool_ModSettingsChanged();
 }
 
 void Wh_ModUninit() {
-    if (g_isToolModProcessLauncher) {
-        return;
+    if (g_workerExitEvent) {
+        SetEvent(g_workerExitEvent);
     }
-
-    WhTool_ModUninit();
-    ExitProcess(0);
+    if (g_workerThread) {
+        WaitForSingleObject(g_workerThread, 5000);
+        CloseHandle(g_workerThread);
+        g_workerThread = nullptr;
+    }
+    if (g_workerWakeEvent) {
+        CloseHandle(g_workerWakeEvent);
+        g_workerWakeEvent = nullptr;
+    }
+    if (g_workerExitEvent) {
+        CloseHandle(g_workerExitEvent);
+        g_workerExitEvent = nullptr;
+    }
+    CloseSharedState();
+    DeleteCriticalSection(&g_decisionLock);
 }
