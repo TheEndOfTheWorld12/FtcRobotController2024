@@ -2,7 +2,7 @@
 // @id              window-animation-blocker
 // @name            Window Animation Blocker
 // @description     Stop chosen apps animating when their windows open, close, minimise or restore - pick them in Explorer, no typing
-// @version         2.6
+// @version         2.7
 // @author          aariv
 // @include         windhawk.exe
 // @architecture    x86
@@ -337,6 +337,12 @@ bool g_dropFolderWasConfigured = false;
 bool g_globalAnimationSuppressed = false;
 bool g_originalAnimationCaptured = false;
 int g_originalMinAnimate = 1;
+// Windows has more than one animation switch, and MinAnimate turned out to be
+// the wrong one: with it off, the logs showed suppression active and the open
+// and close animations carried on regardless. MinAnimate is the old
+// minimise/maximise setting. SPI_SETCLIENTAREAANIMATION is what the Windows 11
+// Accessibility "Animation effects" toggle drives, so both are taken now.
+BOOL g_originalClientAreaAnimation = TRUE;
 
 std::wstring ProcessImagePath(DWORD pid) {
     if (!pid) {
@@ -514,19 +520,34 @@ void ReleaseAllWindows() {
 // unlike the attribute above there is no question about whether Windows
 // honours it.
 
-bool ReadGlobalAnimation(int* minAnimate) {
+bool ReadGlobalAnimation(int* minAnimate, BOOL* clientArea) {
     ANIMATIONINFO info = {sizeof(info), 0};
-    if (!SystemParametersInfoW(SPI_GETANIMATION, sizeof(info), &info, 0)) {
-        return false;
+    bool any = false;
+    if (SystemParametersInfoW(SPI_GETANIMATION, sizeof(info), &info, 0)) {
+        *minAnimate = info.iMinAnimate;
+        any = true;
     }
-    *minAnimate = info.iMinAnimate;
-    return true;
+    BOOL value = TRUE;
+    if (SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &value, 0)) {
+        *clientArea = value;
+        any = true;
+    }
+    return any;
 }
 
-bool WriteGlobalAnimation(int minAnimate) {
+bool WriteGlobalAnimation(int minAnimate, BOOL clientArea) {
     ANIMATIONINFO info = {sizeof(info), minAnimate};
-    return SystemParametersInfoW(SPI_SETANIMATION, sizeof(info), &info,
-                                 SPIF_SENDCHANGE) != FALSE;
+    bool okMin = SystemParametersInfoW(SPI_SETANIMATION, sizeof(info), &info,
+                                       SPIF_SENDCHANGE) != FALSE;
+    // pvParam carries the value itself for this one, not a pointer to it.
+    bool okClient =
+        SystemParametersInfoW(SPI_SETCLIENTAREAANIMATION, 0,
+                              (PVOID)(INT_PTR)clientArea, SPIF_SENDCHANGE) !=
+        FALSE;
+    if (!okClient) {
+        Wh_Log(L"SPI_SETCLIENTAREAANIMATION failed (%u)", GetLastError());
+    }
+    return okMin || okClient;
 }
 
 void SetGlobalSuppressed(bool suppressed) {
@@ -538,13 +559,14 @@ void SetGlobalSuppressed(bool suppressed) {
         // Read the user's own value the first time, so turning this off puts
         // back what they had rather than what this mod assumes they had.
         if (!g_originalAnimationCaptured) {
-            if (!ReadGlobalAnimation(&g_originalMinAnimate)) {
-                Wh_Log(L"Could not read the global animation setting");
+            if (!ReadGlobalAnimation(&g_originalMinAnimate,
+                                     &g_originalClientAreaAnimation)) {
+                Wh_Log(L"Could not read the global animation settings");
                 return;
             }
             g_originalAnimationCaptured = true;
         }
-        if (WriteGlobalAnimation(0)) {
+        if (WriteGlobalAnimation(0, FALSE)) {
             g_globalAnimationSuppressed = true;
             // Recorded on disk as well. If this process is terminated outright
             // rather than unloaded, nothing here gets to run, and the user is
@@ -553,15 +575,20 @@ void SetGlobalSuppressed(bool suppressed) {
             // working. RecoverGlobalAnimation puts it back on next start.
             Wh_SetIntValue(L"globalSuppressed", 1);
             Wh_SetIntValue(L"globalOriginal", g_originalMinAnimate);
-            Wh_Log(L"Global animation off (original was %d)",
-                   g_originalMinAnimate);
+            Wh_SetIntValue(L"globalOriginalClientArea",
+                           g_originalClientAreaAnimation ? 1 : 0);
+            Wh_Log(L"Animations off (MinAnimate was %d, ClientArea was %d)",
+                   g_originalMinAnimate,
+                   g_originalClientAreaAnimation ? 1 : 0);
         }
     } else {
         if (WriteGlobalAnimation(
-                g_originalAnimationCaptured ? g_originalMinAnimate : 1)) {
+                g_originalAnimationCaptured ? g_originalMinAnimate : 1,
+                g_originalAnimationCaptured ? g_originalClientAreaAnimation
+                                            : TRUE)) {
             g_globalAnimationSuppressed = false;
             Wh_SetIntValue(L"globalSuppressed", 0);
-            Wh_Log(L"Global animation restored");
+            Wh_Log(L"Animations restored");
         }
     }
 }
@@ -578,9 +605,11 @@ void RecoverGlobalAnimation() {
         return;
     }
     const int original = Wh_GetIntValue(L"globalOriginal", 1);
-    Wh_Log(L"Last run left the global animation off; restoring it to %d",
-           original);
-    if (WriteGlobalAnimation(original)) {
+    const BOOL originalClient =
+        Wh_GetIntValue(L"globalOriginalClientArea", 1) != 0 ? TRUE : FALSE;
+    Wh_Log(L"Last run left animations off; restoring %d / %d", original,
+           originalClient ? 1 : 0);
+    if (WriteGlobalAnimation(original, originalClient)) {
         Wh_SetIntValue(L"globalSuppressed", 0);
     }
 }
@@ -722,7 +751,20 @@ std::wstring DefaultDropFolder() {
 // Reads a .lnk for both the things that can identify an app. A shortcut to a
 // Store app has no target path at all, only an AppUserModelId, which is
 // exactly why both are read rather than one.
-bool ResolveShortcut(const std::wstring& path, BlockEntry* out) {
+// Resolving an AppsFolder shortcut is not just reading its target. A Store
+// app's shortcut has no target path at all, and a shortcut made with
+// right-click > Create shortcut (the "- Shortcut" suffix) can point at another
+// shortcut rather than at a program. Both were failing, which is why two of
+// the three apps dropped in the folder resolved to nothing.
+//
+// So this walks every route: the target, the Squirrel --processStart argument,
+// the icon, the link's AppUserModelId property, and finally the shell item the
+// link points at, whose parsing name is the AppUserModelId for a Store app and
+// the Start-menu .lnk path for a Win32 one - which is then followed.
+bool ResolveShortcut(const std::wstring& path, BlockEntry* out, int depth = 0) {
+    if (depth > 2) {
+        return false;  // a shortcut chain that loops, or is silly
+    }
     IShellLinkW* link = nullptr;
     if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
                                 IID_PPV_ARGS(&link))) ||
@@ -732,7 +774,13 @@ bool ResolveShortcut(const std::wstring& path, BlockEntry* out) {
     bool ok = false;
     IPersistFile* file = nullptr;
     if (SUCCEEDED(link->QueryInterface(IID_PPV_ARGS(&file))) && file) {
-        if (SUCCEEDED(file->Load(path.c_str(), STGM_READ))) {
+        const HRESULT loaded = file->Load(path.c_str(), STGM_READ);
+        if (FAILED(loaded)) {
+            // Worth separating from "read it but found nothing": a OneDrive
+            // file that is still cloud-only fails right here.
+            Wh_Log(L"  Load('%s') failed: 0x%08X", BaseName(path).c_str(),
+                   (unsigned int)loaded);
+        } else {
             std::vector<std::wstring> candidates;
             auto addCandidate = [&candidates](const std::wstring& raw) {
                 std::wstring name = ToLowerCopy(BaseName(ExpandEnv(TrimCopy(raw))));
@@ -746,27 +794,34 @@ bool ResolveShortcut(const std::wstring& path, BlockEntry* out) {
                 }
             };
 
+            std::wstring chase;  // another .lnk to follow, if that is all there is
+
             wchar_t target[MAX_PATH * 2] = {};
             if (SUCCEEDED(link->GetPath(target, ARRAYSIZE(target), nullptr,
                                         SLGP_RAWPATH)) &&
                 target[0]) {
-                // Matched on the file name, so the entry survives an update
-                // moving the program into a new version folder.
-                addCandidate(target);
+                const std::wstring lowerTarget = ToLowerCopy(target);
+                if (lowerTarget.size() > 4 &&
+                    lowerTarget.compare(lowerTarget.size() - 4, 4, L".lnk") == 0) {
+                    chase = ExpandEnv(target);
+                } else {
+                    // Matched on the file name, so the entry survives an
+                    // update moving the program into a new version folder.
+                    addCandidate(target);
+                }
             }
 
             // Squirrel, which is what most Electron apps ship with, points the
             // shortcut at a shared Update.exe and names the real program in
-            // "--processStart Whatever.exe". Without this the entry matches a
-            // stub that never owns a window.
+            // "--processStart Whatever.exe".
             wchar_t args[2048] = {};
             if (SUCCEEDED(link->GetArguments(args, ARRAYSIZE(args))) && args[0]) {
                 std::wstring text = args;
                 std::wstring lowerArgs = ToLowerCopy(text);
                 size_t at = lowerArgs.find(L"--processstart");
                 if (at != std::wstring::npos) {
-                    size_t from = lowerArgs.find_first_not_of(L" \t", 
-                        lowerArgs.find_first_of(L" \t", at));
+                    size_t from = lowerArgs.find_first_not_of(
+                        L" \t", lowerArgs.find_first_of(L" \t", at));
                     if (from != std::wstring::npos) {
                         size_t to = text[from] == L'"'
                                         ? text.find(L'"', from + 1)
@@ -780,13 +835,66 @@ bool ResolveShortcut(const std::wstring& path, BlockEntry* out) {
             }
 
             // The icon very often points at the real program even when the
-            // target does not, so it is worth a look as a last candidate.
+            // target does not.
             wchar_t icon[MAX_PATH * 2] = {};
             int iconIndex = 0;
             if (SUCCEEDED(link->GetIconLocation(icon, ARRAYSIZE(icon),
                                                 &iconIndex)) &&
                 icon[0]) {
                 addCandidate(icon);
+            }
+
+            IPropertyStore* store = nullptr;
+            if (SUCCEEDED(link->QueryInterface(IID_PPV_ARGS(&store))) && store) {
+                PROPVARIANT value;
+                PropVariantInit(&value);
+                if (SUCCEEDED(store->GetValue(kPkeyAppUserModelId, &value)) &&
+                    value.vt == VT_LPWSTR && value.pwszVal &&
+                    value.pwszVal[0]) {
+                    out->aumid = ToLowerCopy(value.pwszVal);
+                    ok = true;
+                }
+                PropVariantClear(&value);
+                store->Release();
+            }
+
+            // Last and most useful route: ask the shell what the link points
+            // at. For a Store app the parsing name *is* the AppUserModelId;
+            // for a Win32 app in AppsFolder it is the Start-menu .lnk.
+            if (candidates.empty() && out->aumid.empty()) {
+                PIDLIST_ABSOLUTE pidl = nullptr;
+                if (SUCCEEDED(link->GetIDList(&pidl)) && pidl) {
+                    IShellItem* item = nullptr;
+                    if (SUCCEEDED(SHCreateItemFromIDList(pidl,
+                                                         IID_PPV_ARGS(&item))) &&
+                        item) {
+                        PWSTR parsing = nullptr;
+                        if (SUCCEEDED(item->GetDisplayName(
+                                SIGDN_DESKTOPABSOLUTEPARSING, &parsing)) &&
+                            parsing) {
+                            std::wstring text = parsing;
+                            std::wstring lower = ToLowerCopy(text);
+                            Wh_Log(L"  '%s' points at '%s'",
+                                   BaseName(path).c_str(), text.c_str());
+                            if (lower.size() > 4 &&
+                                lower.compare(lower.size() - 4, 4, L".lnk") == 0) {
+                                chase = text;
+                            } else if (lower.size() > 4 &&
+                                       lower.compare(lower.size() - 4, 4,
+                                                     L".exe") == 0) {
+                                addCandidate(text);
+                            } else if (lower.find(L'!') != std::wstring::npos) {
+                                // An AppUserModelId, which is what an
+                                // AppsFolder item for a Store app parses to.
+                                out->aumid = lower;
+                                ok = true;
+                            }
+                            CoTaskMemFree(parsing);
+                        }
+                        item->Release();
+                    }
+                    ILFree(pidl);
+                }
             }
 
             // Drop the shared stubs, but only if something better turned up.
@@ -801,27 +909,26 @@ bool ResolveShortcut(const std::wstring& path, BlockEntry* out) {
                     out->note = L"launcher stub ignored";
                 }
                 out->exeNames = std::move(real);
-            } else {
-                if (!candidates.empty()) {
-                    out->note = L"only a shared launcher stub was found";
-                }
+            } else if (!candidates.empty()) {
+                out->note = L"only a shared launcher stub was found";
                 out->exeNames = std::move(candidates);
             }
             if (!out->exeNames.empty()) {
                 ok = true;
             }
-            IPropertyStore* store = nullptr;
-            if (SUCCEEDED(link->QueryInterface(IID_PPV_ARGS(&store))) && store) {
-                PROPVARIANT value;
-                PropVariantInit(&value);
-                if (SUCCEEDED(store->GetValue(kPkeyAppUserModelId, &value)) &&
-                    value.vt == VT_LPWSTR && value.pwszVal &&
-                    value.pwszVal[0]) {
-                    out->aumid = ToLowerCopy(value.pwszVal);
-                    ok = true;
-                }
-                PropVariantClear(&value);
-                store->Release();
+
+            // Nothing of our own, but it points at another shortcut: follow it.
+            if (!ok && !chase.empty()) {
+                file->Release();
+                link->Release();
+                Wh_Log(L"  following '%s' -> '%s'", BaseName(path).c_str(),
+                       chase.c_str());
+                return ResolveShortcut(chase, out, depth + 1);
+            }
+            if (!ok) {
+                Wh_Log(L"  '%s': read fine, but no program, app id or further "
+                       L"shortcut in it",
+                       BaseName(path).c_str());
             }
         }
         file->Release();
@@ -1072,9 +1179,27 @@ std::wstring BuildStatusText() {
     text += stamp;
     text += L"\r\n\r\nMethod: ";
     text += MethodName(method);
-    text += L"\r\nGlobal animation setting: ";
-    text += globalOff ? L"OFF right now (this mod is suppressing it)"
-                      : L"left alone right now";
+    text += L"\r\nSuppression active right now: ";
+    text += globalOff ? L"yes" : L"no";
+    {
+        // Read live rather than from what this mod believes it wrote, so a
+        // setting that refuses to change is visible here.
+        int minAnimate = -1;
+        BOOL clientArea = -1;
+        ANIMATIONINFO info = {sizeof(info), 0};
+        if (SystemParametersInfoW(SPI_GETANIMATION, sizeof(info), &info, 0)) {
+            minAnimate = info.iMinAnimate;
+        }
+        BOOL value = TRUE;
+        if (SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &value, 0)) {
+            clientArea = value;
+        }
+        text += L"\r\n  Minimise/maximise animation (MinAnimate): ";
+        text += minAnimate < 0 ? L"unreadable"
+                               : (minAnimate ? L"ON" : L"off");
+        text += L"\r\n  Window animations (ClientAreaAnimation): ";
+        text += clientArea < 0 ? L"unreadable" : (clientArea ? L"ON" : L"off");
+    }
     text += L"\r\nFolder: ";
     text += folder;
     text += L"\r\n\r\n";
