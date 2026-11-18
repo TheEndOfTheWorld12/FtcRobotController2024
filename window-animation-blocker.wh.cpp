@@ -2,7 +2,7 @@
 // @id              window-animation-blocker
 // @name            Window Animation Blocker
 // @description     Stop chosen apps animating when their windows open, close, minimise or restore - pick them in Explorer, no typing
-// @version         2.7
+// @version         2.8
 // @author          aariv
 // @include         windhawk.exe
 // @architecture    x86
@@ -883,9 +883,18 @@ bool ResolveShortcut(const std::wstring& path, BlockEntry* out, int depth = 0) {
                                        lower.compare(lower.size() - 4, 4,
                                                      L".exe") == 0) {
                                 addCandidate(text);
-                            } else if (lower.find(L'!') != std::wstring::npos) {
-                                // An AppUserModelId, which is what an
-                                // AppsFolder item for a Store app parses to.
+                            } else if (text.find(L'\\') == std::wstring::npos &&
+                                       text.find(L'/') == std::wstring::npos &&
+                                       !text.empty()) {
+                                // An AppUserModelId. The test used to require
+                                // a '!', which only Store apps have:
+                                // PackageFamilyName!AppId. A desktop app sets
+                                // its own, and those are plain dotted strings
+                                // - "Grammarly.Desktop",
+                                // "zoom.us.Zoom Video Meetings" - so the '!'
+                                // test threw away exactly the two apps it was
+                                // meant to resolve. Anything with no path
+                                // separator in it is an id, not a file.
                                 out->aumid = lower;
                                 ok = true;
                             }
@@ -1236,6 +1245,10 @@ std::wstring BuildStatusText() {
                 matched = matched || open;
                 text += L"      matches app id: " + entry.aumid +
                         (open ? L"   <-- RUNNING NOW\r\n" : L"   (not running)\r\n");
+            }
+            if (entry.exeNames.empty() && !entry.aumid.empty()) {
+                text += L"      (no executable name for this one - matched on "
+                        L"the app id only)\r\n";
             }
             if (!entry.note.empty()) {
                 text += L"      note: " + entry.note + L"\r\n";
